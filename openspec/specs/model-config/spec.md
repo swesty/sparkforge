@@ -36,18 +36,29 @@ to `intermediate_size`; if neither exists parsing MUST fail. `n_shared_experts` 
 - **WHEN** `configs/qwen3-30b-a3b.json` is parsed
 - **THEN** the spec is MoE with 128 experts, top-8, expert width 768
 
-### Requirement: Weight format comes from quantization_config, and unknown schemes are rejected
+### Requirement: Weight format is detected from quantization_config
 
 With no `quantization_config` the weight format SHALL be BF16. `quant_method` `nvfp4`, or
-`modelopt` with `quant_algo` `NVFP4`, SHALL map to NVFP4. `gptq` or `awq` with 4 bits SHALL map to
-W4A16 with the given positive `group_size` (default 128). Parsing MUST fail for a `group_size` of
-zero or less (per-channel scales), for `modelopt` with any other `quant_algo`, and for any other
-`quant_method`. An explicit format override (CLI `--format`) SHALL replace detection entirely, so
-an unrecognized `quantization_config` is not an error when an override is given.
+`modelopt` with `quant_algo` `NVFP4`, SHALL map to NVFP4. `gptq` or `awq` with 4 bits and a
+positive `group_size` (default 128) SHALL map to W4A16 with that group.
+
+#### Scenario: AWQ
+- **WHEN** `quantization_config` is `{"quant_method": "awq", "bits": 4, "group_size": 128}`
+- **THEN** the weight format is W4A16 with group 128
+
+### Requirement: Unknown or unsupported quantization is rejected
+
+Parsing MUST fail for a GPTQ/AWQ `group_size` of zero or less (per-channel scales), for `modelopt`
+with any `quant_algo` other than NVFP4, and for any other `quant_method`.
 
 #### Scenario: Per-channel GPTQ
 - **WHEN** `quantization_config` is `{"quant_method": "gptq", "bits": 4, "group_size": -1}`
 - **THEN** parsing fails and the message suggests `--format`
+
+### Requirement: An explicit format override replaces detection
+
+An explicit format override (CLI `--format`) SHALL replace detection entirely, so an unrecognized
+`quantization_config` is not an error when an override is given.
 
 #### Scenario: Override wins
 - **WHEN** `quantization_config` names modelopt FP8 and the caller passes BF16 as the format

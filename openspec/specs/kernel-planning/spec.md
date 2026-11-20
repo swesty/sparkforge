@@ -51,11 +51,17 @@ shared-memory need; codegen then leaves it `planned` (see kernel-codegen).
 ### Requirement: Prefill tiles are chosen by a legal-configuration search
 
 For each single-copy linear at the planned prompt length, the planner SHALL search BM in {64, 128},
-BN in {64, 128, 256}, BK in {32, 64} and stages in {2, 3, 4}, discard any configuration whose
-multi-buffered BF16 tiles exceed the shared-memory limit, whose thread count exceeds 1024, that
-fits zero CTAs per SM, or whose BK does not divide K, and keep the highest score (wave and padding
-efficiency, tile intensity, pipelining). MoE expert linears SHALL be planned at M = prompt tokens
-* experts per token / experts.
+BN in {64, 128, 256}, BK in {32, 64} and stages in {2, 3, 4}; discard any configuration whose
+multi-buffered BF16 tiles exceed the shared-memory limit, whose thread count exceeds 1024, that fits
+zero CTAs per SM, or whose BK does not divide K; and keep the highest score.
+
+#### Scenario: Llama prefill tile
+- **WHEN** Llama 3.1 8B is planned with a 2048-token prompt
+- **THEN** `qkv_proj` gets a 128x128x32 tile with 3 stages and 49152 B of shared memory
+
+### Requirement: MoE expert tiles use the average tokens per expert
+
+MoE expert linears SHALL be tiled at M = prompt tokens * experts per token / experts (at least 1).
 
 #### Scenario: MoE grouped GEMM M
 - **WHEN** Qwen3-30B-A3B is planned with a 2048-token prompt
