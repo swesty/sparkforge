@@ -126,3 +126,13 @@ fn only_generated_gemvs_get_cuda_source() {
     assert_eq!(status("gemv_lm_head"), "generated");
     assert!(src.contains("gemv_lm_head("));
 }
+
+#[test]
+fn tile_choice_weighs_wave_efficiency_not_just_intensity() {
+    // 128x128 has the higher (capped) intensity, but for M=128, N=2048 it makes only 16 tiles for
+    // 48 SMs; the scored search must prefer the 64x64 tile that keeps more SMs busy.
+    let p = load("configs/qwen3-30b-a3b.json");
+    let t = p.gemm.iter().find(|t| t.linear == "expert_down").unwrap();
+    assert_eq!((t.m, t.n, t.bm, t.bn), (128, 2048, 64, 64), "{t:?}");
+    assert!(t.wave_efficiency > 16.0 / 48.0, "{t:?}");
+}
