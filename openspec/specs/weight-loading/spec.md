@@ -159,3 +159,12 @@ time and GB/s. It MUST exit non-zero if any check fails.
 #### Scenario: Llama 3.1 8B
 - **WHEN** `verify-weights` runs on the Llama 3.1 8B BF16 checkpoint on a GB10
 - **THEN** every check passes and the report shows load time and GB/s for every linear
+
+### Requirement: Hybrid and mixed-precision checkpoints are refused
+
+Binding MUST fail, before any GPU work, for a hybrid-layout or mixed-precision checkpoint until
+the mixed-format loader exists, naming the architecture.
+
+#### Scenario: Flash Next checkpoint
+- **WHEN** `sparkforge weights` opens a Qwen3.8 Flash Next checkpoint
+- **THEN** it fails stating that hybrid or mixed-precision checkpoints do not load yet
