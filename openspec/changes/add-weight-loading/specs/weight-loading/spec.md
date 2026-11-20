@@ -9,18 +9,49 @@ weight readable by the generated kernels on GB10.
 
 ### Requirement: Checkpoints are discovered and every byte range is checked
 
-Opening a checkpoint directory SHALL use `model.safetensors.index.json` when present (every shard
-it names MUST exist) and `model.safetensors` otherwise. Each shard's header SHALL be parsed and
-every tensor's byte range MUST lie inside the file and match its dtype and shape; otherwise opening
-fails naming the shard and tensor.
-
-#### Scenario: Sharded checkpoint
-- **WHEN** a directory holds an index and four shards
-- **THEN** every tensor in the index resolves to a byte range inside its shard
+Opening a checkpoint directory SHALL use `model.safetensors.index.json` when present and
+`model.safetensors` otherwise. Each tensor's offsets MUST lie inside its shard's data section,
+checked without overflow before forming file positions, and its byte count MUST match its dtype and
+shape; otherwise opening fails naming the shard and tensor.
 
 #### Scenario: Truncated shard
 - **WHEN** a tensor's byte range ends past the end of its shard
 - **THEN** opening fails naming the shard and the tensor
+
+#### Scenario: Wrapping offsets
+- **WHEN** a tensor's offsets are near 2^64 so that adding the data start would wrap into the header
+- **THEN** opening fails instead of accepting header bytes as tensor data
+
+### Requirement: Index entries match their shards
+
+Every index entry MUST name the shard whose header holds that tensor, every tensor in a shard header
+MUST be listed in the index, and every shard the index names MUST exist.
+
+#### Scenario: Sharded checkpoint
+- **WHEN** a directory holds an index and four shards
+- **THEN** every tensor in the index resolves to a byte range inside the shard it names
+
+#### Scenario: Swapped index entries
+- **WHEN** the index assigns a tensor to the other shard
+- **THEN** opening fails naming the tensor and the declared shard
+
+### Requirement: Tensors tile each shard's data section exactly
+
+The non-empty tensors of a shard MUST cover its data section exactly, with no overlapping ranges and
+no unaccounted bytes; empty tensors are allowed.
+
+#### Scenario: Aliased projection
+- **WHEN** `up_proj` is given the same byte range as `gate_proj`
+- **THEN** opening fails reporting the overlap
+
+### Requirement: A shard that changes after opening is an error
+
+Tensor reads SHALL be fallible positioned reads; a shard whose size changed since it was opened MUST
+produce an error rather than terminating the process.
+
+#### Scenario: Truncated after validation
+- **WHEN** a shard is truncated after the checkpoint was opened and before a tensor is read
+- **THEN** the read fails stating that the shard changed size
 
 ### Requirement: Every tensor the plan needs is present with the planned shape and dtype
 
@@ -73,12 +104,17 @@ about 35% below device memory once warm. The load report SHALL state the bytes c
 
 ### Requirement: Loads never exhaust host memory
 
-On Linux, a load SHALL be refused before allocating if the bytes it would copy exceed
-`MemAvailable` minus 4 GiB.
+On Linux, a load SHALL be refused before allocating if the bytes it would copy, plus its bounded
+staging buffer and, when verifying, the reference computation's scratch, exceed `MemAvailable`
+minus 4 GiB. Neither uploads nor references SHALL hold a whole tensor in host memory.
 
 #### Scenario: Too large to copy
-- **WHEN** the bytes to copy exceed `MemAvailable` minus 4 GiB
+- **WHEN** the bytes to copy plus overhead exceed `MemAvailable` minus 4 GiB
 - **THEN** loading fails before any GPU allocation, stating both numbers
+
+#### Scenario: Wide vocabulary
+- **WHEN** `verify-weights` checks Llama 3.1 8B's `lm_head` (1.05 GB of weights)
+- **THEN** the process's peak host memory stays bounded (measured 225 MB) instead of scaling with the tensor
 
 ### Requirement: Loaded weights are verified on the GPU
 

@@ -17,6 +17,14 @@
 - [x] 3.3 MemAvailable guard before any allocation; unit test of the guard arithmetic (`cargo test`)
 - [x] 3.4 Positioned reads for bulk loads (Llama 3.1 8B 40.5 s -> 10.3 s on spark-5)
 
+## 3b. codex-review cycle 1
+
+- [x] 3b.1 Overflow-checked offsets validated against the data section; header-length and shape overflow are errors (`cargo test`)
+- [x] 3b.2 Index entries must match shard headers, both directions (`cargo test`: swapped and missing entries)
+- [x] 3b.3 Non-empty tensors must tile each data section exactly (`cargo test`: aliased and gapped ranges, empty tensor allowed)
+- [x] 3b.4 Drop mmap; fallible positioned reads with a shard-size check (`cargo test`: truncation after open is an error)
+- [x] 3b.5 Bounded staging and streaming f64 reference; guard budgets both (`cargo test`; Llama 3.1 8B verify peaks at 225 MB host RSS on GB10)
+
 ## 4. Verification on GB10
 
 - [x] 4.1 `verify-weights` subcommand: f64 reference GEMVs for first/last layer and lm_head, timing across all layers, load report

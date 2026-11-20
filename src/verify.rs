@@ -366,10 +366,6 @@ pub struct WeightReport {
     pub bytes_copied: u64,
 }
 
-fn bf16_bytes_to_f64(b: &[u8]) -> Vec<f64> {
-    b.chunks_exact(2).map(|c| bf2f(u16::from_le_bytes([c[0], c[1]])) as f64).collect()
-}
-
 /// GEMVs on real checkpoint weights against an f64 reference, timed across all layers.
 pub fn verify_weights(
     p: &Plan,
@@ -384,7 +380,7 @@ pub fn verify_weights(
     let s = e.stream.clone();
     let mut rng = Rng(seed | 1);
     let last = p.model.layers.saturating_sub(1);
-    let dw = upload(&s, ck, b)?;
+    let dw = upload(&s, ck, b, true)?;
     let mut rep = WeightReport { rows: vec![], load_secs: dw.load_secs, bytes_copied: dw.bytes_copied };
     {
         for linear in ["qkv_proj", "o_proj", "gate_up_proj", "down_proj", "lm_head"] {
@@ -401,20 +397,8 @@ pub fn verify_weights(
                 let w = dw.linears[&bl.key()].ptr;
                 unsafe { s.launch_builder(f).arg(&w).arg(&dx).arg(&mut dy).launch(cfg(k.grid, k.block, k.dyn_smem))? };
                 let got = to_f32(&s.memcpy_dtov(&dy)?);
-                let rows: Vec<f64> = bl.parts.iter().flat_map(|name| bf16_bytes_to_f64(ck.bytes(&ck.tensors[name]))).collect();
-                let mut r = vec![0f64; n];
-                let chunk = n.div_ceil(16);
-                std::thread::scope(|sc| {
-                    for (ci, out) in r.chunks_mut(chunk).enumerate() {
-                        let (rows, xf) = (&rows, &xf);
-                        sc.spawn(move || {
-                            for (j, o) in out.iter_mut().enumerate() {
-                                let row = (ci * chunk + j) * kk;
-                                *o = (0..kk).map(|c| rows[row + c] * xf[c]).sum();
-                            }
-                        });
-                    }
-                });
+                // Streams the weights from the checkpoint in bounded chunks (no full f64 copy).
+                let r = crate::weights::reference_gemv(ck, bl, &xf)?;
                 let case = match bl.layer { Some(i) => format!("layer {i}"), None => "-".into() };
                 rep.rows.push(WeightRow { linear: linear.into(), case, err: Some(max_err(&got, &r)), us: None, gbs: None });
             }

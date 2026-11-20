@@ -166,3 +166,137 @@ fn memory_guard_keeps_four_gib_free() {
     assert!(err.contains("MemAvailable is 14.00 GiB"), "{err}");
     assert_eq!(HEADROOM_BYTES, 4 * gib);
 }
+
+/// Writes a safetensors file from an explicit header (for malformed-metadata cases).
+fn write_raw(path: &PathBuf, header: serde_json::Value, data_len: usize, header_len_override: Option<u64>) {
+    let mut h = serde_json::to_vec(&header).unwrap();
+    while h.len() % 8 != 0 {
+        h.push(b' ');
+    }
+    let mut out = header_len_override.unwrap_or(h.len() as u64).to_le_bytes().to_vec();
+    out.extend(h);
+    out.extend((0..data_len).map(|i| (i % 251) as u8));
+    std::fs::write(path, out).unwrap();
+}
+
+fn sharded(name: &str) -> (PathBuf, Vec<(String, Vec<usize>, &'static str)>, Vec<(String, Vec<usize>, &'static str)>) {
+    let d = dir(name);
+    let ts = bf16(tensors(false));
+    let (a, b) = ts.split_at(ts.len() / 2);
+    write_shard(&d.join("model-00001-of-00002.safetensors"), a, 0);
+    write_shard(&d.join("model-00002-of-00002.safetensors"), b, 0);
+    (d, a.to_vec(), b.to_vec())
+}
+
+fn write_index(d: &PathBuf, map: serde_json::Map<String, serde_json::Value>) {
+    std::fs::write(d.join("model.safetensors.index.json"), serde_json::json!({"weight_map": map}).to_string()).unwrap();
+}
+
+#[test]
+fn index_entries_must_name_the_shard_that_holds_the_tensor() {
+    let (d, a, b) = sharded("swap");
+    let mut map = serde_json::Map::new();
+    for (n, _, _) in &a { map.insert(n.clone(), "model-00001-of-00002.safetensors".into()); }
+    for (n, _, _) in &b { map.insert(n.clone(), "model-00002-of-00002.safetensors".into()); }
+    // Swap one assignment from each shard.
+    map.insert(a[0].0.clone(), "model-00002-of-00002.safetensors".into());
+    map.insert(b[0].0.clone(), "model-00001-of-00002.safetensors".into());
+    write_index(&d, map);
+    let err = Checkpoint::open(&d).err().expect("must fail").to_string();
+    assert!(err.contains("index lists") && (err.contains(&a[0].0) || err.contains(&b[0].0)), "{err}");
+}
+
+#[test]
+fn index_entry_without_a_tensor_is_rejected() {
+    let (d, a, b) = sharded("ghost");
+    let mut map = serde_json::Map::new();
+    for (n, _, _) in a.iter().chain(&b) {
+        let f = if a.iter().any(|t| &t.0 == n) { "model-00001-of-00002.safetensors" } else { "model-00002-of-00002.safetensors" };
+        map.insert(n.clone(), f.into());
+    }
+    map.insert("model.layers.9.mlp.down_proj.weight".into(), "model-00001-of-00002.safetensors".into());
+    write_index(&d, map);
+    let err = Checkpoint::open(&d).err().expect("must fail").to_string();
+    assert!(err.contains("model.layers.9.mlp.down_proj.weight") && err.contains("no such tensor"), "{err}");
+}
+
+#[test]
+fn wrapping_offsets_overflowing_header_and_shape_are_errors_not_header_reads() {
+    let d = dir("wrap");
+    let p = d.join("model.safetensors");
+    // Offsets that would wrap into the header if added to the data start unchecked.
+    write_raw(&p, serde_json::json!({"model.norm.weight": {"dtype": "BF16", "shape": [16],
+        "data_offsets": [18446744073709551552u64, 18446744073709551584u64]}}), 32, None);
+    let err = Checkpoint::open(&d).err().expect("wrapped offsets must fail").to_string();
+    assert!(err.contains("outside the file"), "{err}");
+    // A header length that would overflow 8 + N.
+    write_raw(&p, serde_json::json!({}), 0, Some(u64::MAX));
+    assert!(Checkpoint::open(&d).is_err());
+    // A shape whose byte count overflows u64.
+    write_raw(&p, serde_json::json!({"x": {"dtype": "BF16", "shape": [4294967296u64, 4294967296u64], "data_offsets": [0, 0]}}), 0, None);
+    let err = Checkpoint::open(&d).err().expect("overflowing shape must fail").to_string();
+    assert!(err.contains("overflows"), "{err}");
+}
+
+#[test]
+fn overlapping_or_gapped_tensor_ranges_are_rejected() {
+    let d = dir("overlap");
+    let p = d.join("model.safetensors");
+    // up_proj points at gate_proj's bytes; up_proj's own bytes are left unaccounted.
+    write_raw(&p, serde_json::json!({
+        "g": {"dtype": "BF16", "shape": [32, 16], "data_offsets": [0, 1024]},
+        "u": {"dtype": "BF16", "shape": [32, 16], "data_offsets": [0, 1024]}}), 2048, None);
+    let err = Checkpoint::open(&d).err().expect("overlap must fail").to_string();
+    assert!(err.contains("overlaps"), "{err}");
+    // A hole between two tensors.
+    write_raw(&p, serde_json::json!({
+        "g": {"dtype": "BF16", "shape": [32, 16], "data_offsets": [0, 1024]},
+        "u": {"dtype": "BF16", "shape": [32, 16], "data_offsets": [1040, 2064]}}), 2064, None);
+    let err = Checkpoint::open(&d).err().expect("gap must fail").to_string();
+    assert!(err.contains("unaccounted"), "{err}");
+    // Empty tensors take no space and are fine.
+    write_raw(&p, serde_json::json!({
+        "g": {"dtype": "BF16", "shape": [32, 16], "data_offsets": [0, 1024]},
+        "e": {"dtype": "BF16", "shape": [0], "data_offsets": [1024, 1024]}}), 1024, None);
+    assert!(Checkpoint::open(&d).is_ok());
+}
+
+#[test]
+fn truncating_a_shard_after_open_is_an_error_not_a_crash() {
+    let d = single("truncate-after", bf16(tensors(false)));
+    let ck = Checkpoint::open(&d).unwrap();
+    std::fs::OpenOptions::new().write(true).open(d.join("model.safetensors")).unwrap().set_len(0).unwrap();
+    let t = &ck.tensors["model.layers.0.self_attn.o_proj.weight"];
+    let mut buf = vec![];
+    let err = ck.read_into(t, &mut buf).unwrap_err().to_string();
+    assert!(err.contains("changed size"), "{err}");
+}
+
+#[test]
+fn streaming_reference_matches_a_naive_gemv_on_fused_parts() {
+    let d = single("reference", bf16(tensors(false)));
+    let ck = Checkpoint::open(&d).unwrap();
+    let b = bind(&ck, &spec(false)).unwrap();
+    let qkv = b.linears.iter().find(|l| l.key() == "layers.0.qkv_proj").unwrap();
+    let x: Vec<f64> = (0..qkv.k).map(|i| (i as f64 - 7.5) / 8.0).collect();
+    let got = sparkforge::weights::reference_gemv(&ck, qkv, &x).unwrap();
+    let mut want = vec![];
+    let mut buf = vec![];
+    for name in &qkv.parts {
+        ck.read_into(&ck.tensors[name], &mut buf).unwrap();
+        for row in buf.chunks_exact(qkv.k * 2) {
+            want.push(row.chunks_exact(2).zip(&x).map(|(c, xv)| f32::from_bits((u16::from_le_bytes([c[0], c[1]]) as u32) << 16) as f64 * xv).sum::<f64>());
+        }
+    }
+    assert_eq!(got.len(), qkv.n);
+    assert_eq!(got, want);
+}
+
+#[test]
+fn memory_guard_budgets_staging_and_verification_scratch() {
+    use sparkforge::weights::{load_overhead_bytes, REF_CHUNK_BYTES, REF_THREADS, STAGING_BYTES};
+    let d = single("overhead", bf16(tensors(false)));
+    let b = bind(&Checkpoint::open(&d).unwrap(), &spec(false)).unwrap();
+    assert_eq!(load_overhead_bytes(&b, false), STAGING_BYTES);
+    assert_eq!(load_overhead_bytes(&b, true), STAGING_BYTES + (REF_THREADS * REF_CHUNK_BYTES) as u64 + 64 * 8);
+}

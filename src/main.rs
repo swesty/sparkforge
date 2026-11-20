@@ -141,7 +141,7 @@ fn main() -> Result<()> {
         Cmd::Weights { dir } => {
             let t0 = std::time::Instant::now();
             let (p, ck, b) = open_checkpoint(&dir)?;
-            let bytes: usize = ck.shards.iter().map(|s| s.map.len()).sum();
+            let bytes: u64 = ck.shards.iter().map(|s| s.len).sum();
             println!("{}: {} shard(s), {} tensors, {:.2} GiB, opened and validated in {:.2} s",
                 p.model.arch, ck.shards.len(), ck.tensors.len(), bytes as f64 / (1u64 << 30) as f64, t0.elapsed().as_secs_f64());
             println!("bound {} linears ({} fused) and {} other tensors; {} unexpected tensor(s){}",

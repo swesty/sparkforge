@@ -20,10 +20,13 @@ virtual address (including a file mapping) is a valid GPU address.
 
 ## Decisions
 
-1. **Parse the safetensors header ourselves** (8-byte little-endian length, then JSON) with the
-   existing `serde_json`, and map files with `memmap2`. The format is small and stable; a parser
-   we own lets us check every byte range against the file length. Alternative: the `safetensors`
-   crate. Rejected only to avoid a second JSON stack for a 30-line parser.
+1. **Parse the safetensors header ourselves and read only with positioned reads.** The header is an
+   8-byte little-endian length and JSON (parsed with the existing `serde_json`). Every offset is
+   checked against the data section with overflow-checked arithmetic before it becomes a file
+   position; the non-empty tensors must tile the data section exactly; index entries must match the
+   shard headers. No memory mapping: after decision 2 the mapping bought nothing, and a mapped file
+   that another process truncates turns a read into SIGBUS, while `pread` returns an error. Each
+   read also re-checks the shard's size. (The first revision used `memmap2`; codex-review cycle 1.)
 2. **Copy into GPU memory; do not read the file mapping in place.** GB10 reports Addressing Mode ATS,
    so kernels *can* dereference the mmap address directly (no pinning, no copy). This was built
    (commit "safetensors loader with mapped (ATS) and copied GPU binding" in this change) and
@@ -50,11 +53,14 @@ virtual address (including a file mapping) is a valid GPU address.
    generated from the `ModelSpec`; anything missing is an error naming the tensor and the expected
    shape; anything present but unused is listed as unexpected (some checkpoints carry extra
    buffers) without failing.
-7. **Bulk loads use positioned reads, not the mapping.** Copying straight out of the mmap faulted it
+7. **Bulk loads use positioned reads in bounded pieces.** Copying straight out of an mmap faulted it
    in a few pages at a time: 13.98 GiB took 40.5-41.8 s (~0.35 GB/s) while `dd` read a shard at
-   1.6 GB/s. `madvise(MADV_SEQUENTIAL)` made it slower (47.9 s). Reading each tensor with `pread`
-   into a reused buffer and copying that brought the load to 10.3-10.8 s (~1.36 GB/s). The mapping
-   is still used for header parsing and for the reference computations in `verify-weights`.
+   1.6 GB/s; `madvise(MADV_SEQUENTIAL)` made it slower (47.9 s). Reading with `pread` brought the
+   load to 10.3-10.8 s with a whole-tensor buffer and 12.5 s with the final 64 MiB staging buffer.
+8. **Host memory is bounded and budgeted.** Uploads stage at most 64 MiB; the f64 reference streams
+   4 MiB chunks per thread (16 threads). The guard admits a load only if copied bytes plus that
+   overhead leave 4 GiB of `MemAvailable`. `verify-weights` on Llama 3.1 8B peaks at 225 MB of host
+   RSS (it previously built a 4.2 GB f64 copy of `lm_head`).
 
 ## Risks / Trade-offs
 
