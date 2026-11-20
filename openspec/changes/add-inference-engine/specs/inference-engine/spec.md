@@ -41,7 +41,17 @@ re-instantiating the graph, and a steady-state decode step MUST NOT launch kerne
 
 #### Scenario: Decode step launch count
 - **WHEN** the engine decodes 256 tokens after warm-up
-- **THEN** each step issues one graph launch per step shape it uses, and the reported kernels-per-step matches the step program
+- **THEN** each step reports one graph submission per step shape it uses, zero individual host kernel launches, and executed kernel nodes equal to the step program's kernel count
+
+### Requirement: Prompt ingestion advances state by exactly the prompt length
+
+Prefill SHALL consume a prompt of any length, including a final chunk shorter than the planned
+chunk size, and MUST advance KV, indexer, recurrent and token-history state by exactly the number of
+real prompt tokens; padded positions MUST NOT change any state.
+
+#### Scenario: One token past a full chunk
+- **WHEN** the prompt is 16,385 tokens long and the chunk size is 16,384
+- **THEN** the committed length is 16,385 and the first generated token matches token-by-token ingestion
 
 ### Requirement: Overlapped launches do not change results
 
@@ -110,13 +120,28 @@ acceptance, only the accepted prefix SHALL become visible to later steps.
 
 ### Requirement: Speculative writes never destroy committed state
 
-A verify step's provisional writes MUST NOT overwrite any KV, indexer or raw-key entry that remains
-live after the step, whatever number of drafts is accepted. Circular buffers SHALL reserve room for
-a full verify block beyond their live window.
+A verify step's provisional writes MUST NOT overwrite any entry that remains live after the step,
+and MUST stay inside their allocations at every committed length up to the context limit. Every
+buffer that verify writes SHALL reserve room for a full verify block beyond its live contents, and
+the memory budget SHALL include that room.
 
 #### Scenario: Partial acceptance across a ring wrap
 - **WHEN** a full raw-key ring receives a 5-position verify block across its wrap point and 2 positions are accepted
 - **THEN** the next step's keys, selected positions and logits equal sequential decode
+
+#### Scenario: Verify at the context limit
+- **WHEN** MTP k=4 verifies with one to four positions left before the context limit
+- **THEN** every write stays inside its allocation, nothing past the limit is committed, and the tokens match sequential decode
+
+### Requirement: Token-history lookups follow the committed prefix
+
+Any lookup keyed by preceding tokens, such as the PLE n-gram embedding, SHALL derive its history
+from the committed tokens plus the causal portion of the current block, so a rejected draft never
+appears in a later lookup.
+
+#### Scenario: Rejected draft in the n-gram window
+- **WHEN** 2 of 4 drafts are accepted and the next token's n-gram row differs depending on whether the last rejected or the last accepted draft precedes it
+- **THEN** the lookup uses the accepted history and the logits equal sequential decode
 
 ### Requirement: Correctness is gated before speed is claimed
 
