@@ -45,7 +45,7 @@ None in this change. Each of the following lands as its own change against its o
 ## Impact
 
 - **Code:** a new `src/engine/` module (step program, arenas, graph capture, sampler, speculative decoding), a `generate` subcommand, and the use of `plan.rs` and `codegen.rs` output through the existing kernel manifest.
-- **Dependencies:** HF `tokenizers` (tokenization) and `minijinja` (chat template) when the CLI takes chat input.
+- **Dependencies:** HF `tokenizers` for plain-text prompts, from the first milestone. `minijinja` for the chat template comes with the later `serving-api` change.
 - **Hardware:** full-model runs need about 76 GiB (PLE table on disk) to about 104 GiB (resident) of one GB10. On spark-5, each full-model run stops the experimental Flash Next serving lane, with the user's approval before every stop, and restarts it afterwards. Kernel-level work runs beside the fleet engine.
 
 ## Non-goals

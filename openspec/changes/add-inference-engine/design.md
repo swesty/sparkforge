@@ -47,7 +47,7 @@ See proposal.md (Why). The numbers below come from the research recorded in the 
 3. **One CUDA Graph per step shape, with a device-side step header.**
    - Step shapes: decode M=1; draft M=1 (run k times); verify M=k+1; prefill chunk of C tokens.
    - Per-step scalars (position, sequence length, token ids, RNG offset) live in a device "step header", updated by one memcpy node at the head of each graph, so the graphs are never re-instantiated.
-   - Every kernel uses programmatic dependent launch (PDL) and issues its weight loads before `griddepcontrol.wait`.
+   - Every kernel uses programmatic dependent launch (PDL). Before `griddepcontrol.wait`, a kernel may load only data its predecessor doesn't produce, meaning weights at fixed addresses. Anything whose address or content depends on the predecessor comes after the wait: the routed expert ids and weights, activations, the step header and KV. In MoE, the grouped gate/up kernel can prefetch the shared expert's weights before the wait, but it must wait before reading the router's top-k and loading the routed experts. The PDL-versus-serialized check in tasks.md (group 3) enforces this rule.
    - *Alternative:* per-kernel launches. Rejected: about 900 launches at 2–4 µs each [obs launch-bound kernels in `verify --bench`] would cost 1–3 ms per ~30 ms step.
 
 4. **Arenas sized by the plan; weights copied, experts repacked.**
@@ -82,17 +82,20 @@ See proposal.md (Why). The numbers below come from the research recorded in the 
    - MTP drafts k tokens with the checkpoint's MTP layer, and one M=k+1 verify pass scores them.
    - Rejection sampling keeps the target distribution. Greedy is a special case, so output is identical with and without MTP.
    - Recurrent state is snapshotted after each verify position and rolled back to the last accepted one. That costs up to about 0.45 GB of state writes per step [inf], about 3% of a step.
+   - **Committed KV length.** The step header holds the number of committed positions. Verify appends KV for all k+1 positions, and acceptance then sets the committed length to the last accepted position. Attention, the sparse indexer, its compressed cache and the raw-key ring all bound their reads by the committed length, and the next step overwrites the rejected slots. Rolling back KV is therefore one scalar write, not a copy.
+   - **Shape-invariant target math.** Greedy exactness is guaranteed by construction rather than by tolerance. Every kernel that runs in both decode (M=1) and verify (M=k+1) computes each position with the same reduction partition and accumulation order: the same split-K slices and the same reduce order, with expert combines in a fixed expert-id order. A position's logits are then bitwise identical in both shapes, and near ties can't flip. Ties go to the lowest token id. The price is that verify kernels can't regroup the K dimension across positions for speed.
    - k is fixed first; adaptive k comes later.
-   - *Alternative:* recompute the rejected suffix. Rejected: it rereads every weight.
+   - *Alternative to snapshots:* recompute the rejected suffix. Rejected: it rereads every weight.
+   - *Alternative to shape invariance:* accept tolerance-level differences and re-verify near-tie positions with an M=1 pass. Rejected: it adds a data-dependent extra pass to a captured graph, and it still needs a tie threshold to be chosen.
 
 8. **Byte reductions are options, not defaults.**
    - MXFP8 HC weights save 0.64 GB/token; the fleet's experiment kept logits within noise.
    - A truncated-vocabulary draft head saves about 2.2 GB per MTP step.
-   - Both are off by default and gated by the logprob check (see spec).
+   - Both are off by default. A target-numerics option (MXFP8 HC) must pass the precision gate on the reference set (decision 9). Top-1 agreement must stay within the fleet band, and the mean and 99th-percentile absolute logprob difference may exceed the checkpoint-precision engine's own figures by at most 10%. Otherwise it reports FAIL and stays off. The baseline is the checkpoint-precision engine, not zero, because the reference engine itself differs from sparkforge by kernel rounding. A draft-only option (truncated head) can't change greedy output, so it reports acceptance instead.
 
 9. **Correctness gates.**
    - **Per-layer golden diff:** activations dumped teacher-forced from a 4-layer side engine of the fleet stack, compared with the engine's per-layer output.
-   - **Teacher-forced top-1 agreement:** against the fleet engine, within its own measured noise band (96.5–97.1%) [obs].
+   - **Teacher-forced reference check:** against the fleet engine, on a fixed reference set checked into the repo as token ids: the 4 fleet A/B prompts plus 16 chat transcripts, 256 target tokens each. It reports top-1 agreement, which must fall within the fleet's own measured noise band (96.5–97.1%) [obs], and the mean and 99th-percentile absolute logprob difference of the reference tokens. The checkpoint-precision run's logprob figures become the baseline for the precision gate (decision 8).
    - **Llama first:** SHA-755 proves the runtime on Llama 3.1 8B BF16, which has a simple Hugging Face reference, before Flash Next.
    - *Alternative:* a full scalar Rust reference of GDN, QSA, HC and PLE. Rejected for now: costly, and part of the math is still unread in the fork's source.
 

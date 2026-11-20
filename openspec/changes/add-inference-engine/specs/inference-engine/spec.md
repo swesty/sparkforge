@@ -43,14 +43,36 @@ re-instantiating the graph, and a steady-state decode step MUST NOT launch kerne
 - **WHEN** the engine decodes 256 tokens after warm-up
 - **THEN** each step issues one graph launch per step shape it uses, and the reported kernels-per-step matches the step program
 
+### Requirement: Overlapped launches do not change results
+
+Overlapping a kernel with its predecessor (programmatic dependent launch) MUST NOT change any
+output. A kernel MAY read before the dependency wait only data its predecessor does not produce,
+such as weights at fixed addresses; data-dependent reads, including weights selected by routing,
+MUST come after the wait.
+
+#### Scenario: Changing expert routes
+- **WHEN** consecutive tokens route to different experts and the step runs with overlapped launches and then serialized
+- **THEN** the logits of every step are bitwise identical between the two runs
+
 ### Requirement: Greedy output is identical with and without speculation
 
 With temperature 0, the token sequence produced with speculative decoding enabled MUST equal the
-sequence produced with it disabled, for any number of draft tokens and any draft-head option.
+sequence produced with it disabled, for any number of draft tokens and any draft-head option. Ties
+between equal logits SHALL resolve to the lowest token id.
 
 #### Scenario: MTP on and off
 - **WHEN** the same prompt is generated greedily with MTP disabled and with MTP k=4
 - **THEN** the two token sequences are identical
+
+### Requirement: Target logits do not depend on step shape
+
+For a given position and context, the target model's logits computed in a multi-token verify step
+MUST be bitwise identical to those computed in a single-token decode step, so that rounding cannot
+reorder near-tied tokens between the two shapes.
+
+#### Scenario: Near tie
+- **WHEN** a position's two highest logits differ by less than one unit in the last place
+- **THEN** decode and verify produce bitwise-identical logits there and select the same token
 
 ### Requirement: Speculative sampling preserves the target distribution
 
@@ -65,12 +87,17 @@ sampling. Draft-only approximations MUST NOT change the target probabilities.
 ### Requirement: Rejected drafts roll back all recurrent state
 
 After a verify step accepts j of k draft tokens, every recurrent state (linear-attention state and
-convolution state) and every KV entry MUST equal what non-speculative decoding would hold after the
-same accepted tokens.
+convolution state) MUST equal what non-speculative decoding would hold after the same accepted
+tokens. The engine SHALL keep a committed KV length, and every KV reader, including the sparse
+attention indexer and its caches, MUST ignore positions at or beyond it.
 
 #### Scenario: Partial acceptance
 - **WHEN** a verify step accepts 2 of 4 drafts
-- **THEN** the next step's recurrent and KV state matches a non-speculative run over the same tokens within kernel tolerance
+- **THEN** the next step's recurrent state matches a non-speculative run over the same tokens within kernel tolerance
+
+#### Scenario: Rejected KV suffix
+- **WHEN** a verify step appended KV for 4 drafts and accepted 2
+- **THEN** the next step's attention and indexer select the same positions as non-speculative decoding and never a rejected one
 
 ### Requirement: Correctness is gated before speed is claimed
 
@@ -84,13 +111,28 @@ band, before any tok/s result for it is recorded as a milestone.
 
 ### Requirement: Numerics-changing options are opt-in and gated
 
-An option that changes numerics or draft quality, such as lower-precision copies of checkpoint
-weights or a truncated draft head, MUST be off by default. Enabling one MUST report its effect on
-tok/s, on top-1 agreement with the reference engine and, for draft options, on acceptance rate.
+An option that changes target numerics, such as lower-precision copies of checkpoint weights, MUST
+be off by default and SHALL pass a gate on a fixed reference set: top-1 agreement within the
+reference engine's noise band, and mean and 99th-percentile absolute logprob difference at most 10%
+above the checkpoint-precision engine's. A failing option MUST report FAIL and stay off.
 
 #### Scenario: MXFP8 HyperConnection weights
 - **WHEN** the user enables the MXFP8 HyperConnection weight option
-- **THEN** the run reports tok/s and top-1 agreement with and without the option
+- **THEN** the run reports tok/s, top-1 agreement and the logprob figures, with a PASS or FAIL verdict
+
+#### Scenario: Logprobs drift with top-1 unchanged
+- **WHEN** an option keeps every top-1 choice but its 99th-percentile logprob difference exceeds the limit
+- **THEN** the gate reports FAIL and the option is not applied
+
+### Requirement: Draft-only options report acceptance
+
+An option that changes only the draft model, such as a truncated draft vocabulary, MUST be off by
+default and MUST report tok/s and per-draft acceptance with and without it; greedy output stays
+identical by the speculation requirement.
+
+#### Scenario: Truncated draft head
+- **WHEN** the truncated draft head is enabled
+- **THEN** the run reports tok/s and acceptance with and without it, and greedy output is unchanged
 
 ### Requirement: Full-model runs on a shared node do not displace a serving engine silently
 

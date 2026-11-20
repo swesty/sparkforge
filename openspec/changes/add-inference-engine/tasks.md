@@ -5,43 +5,53 @@ This change covers the engine itself. Linear plan: "Qwen3.8 Flash Next engine pl
 - the mixed-format loader (M1, SHA-767, after the loader hardening in SHA-765);
 - the decode kernel families (M2): SHA-756, SHA-768, SHA-769, SHA-770, SHA-771, SHA-772, SHA-758, SHA-747, SHA-749;
 - the prefill kernels (M7): SHA-776, SHA-751, SHA-759, SHA-777, SHA-778, SHA-757;
-- tokenizer, template and serving API (M8): SHA-779, SHA-780.
+- chat template, reasoning and tool parsers, and the serving API (M8): SHA-779, SHA-780.
 
-Each new or changed kernel in those changes carries its own `sparkforge verify --bench` task on a GB10.
+Plain-text tokenization lives in this change (task 1.4), because `generate` needs it from the first milestone. Each new or changed kernel in those changes carries its own `sparkforge verify --bench` task on a GB10.
 
 ## 1. Runtime proving ground on Llama 3.1 8B (SHA-755)
 
 - [ ] 1.1 Step program built from plan + manifest for a dense model, with arena allocation behind the memory budget. Verify: `cargo test` builds the program for both example configs, and its kernel list matches the manifest.
 - [ ] 1.2 One CUDA Graph per decode step, with a device step header updated by a memcpy node. Verify: on a GB10, 256 decode steps of Llama 3.1 8B issue one graph launch each, and the text matches non-graph execution.
-- [ ] 1.3 Greedy and temperature sampling (Philox) in the `lm_head` epilogue. Verify: greedy output matches an argmax over full logits for 256 steps; `verify --bench` on the fused kernel on a GB10.
-- [ ] 1.4 `sparkforge generate` prints text, decode tok/s, time to first token and the ceiling. Verify: Llama 3.1 8B on a GB10, with the tok/s recorded in the PR against the planner ceiling (12.2 tok/s at 32K, 15.1 at 4K).
+- [ ] 1.3 Greedy and temperature sampling (Philox) in the `lm_head` epilogue, with ties broken toward the lowest token id. Verify: greedy output matches an argmax over full logits for 256 steps, including a constructed exact tie; `verify --bench` on the fused kernel on a GB10.
+- [ ] 1.4 Plain-text prompt encoding and output decoding from the checkpoint's `tokenizer.json` (HF `tokenizers` crate), with no chat template. Verify: `cargo test` round-trips text and matches the Hugging Face tokenizer's ids for 20 fixed strings (ids checked in as fixtures).
+- [ ] 1.5 `sparkforge generate --prompt "<text>"` prints decoded text, decode tok/s, time to first token and the ceiling. Verify: Llama 3.1 8B on a GB10 with a plain-text prompt, with the tok/s recorded in the PR against the planner ceiling (12.2 tok/s at 32K, 15.1 at 4K).
 
 ## 2. Flash Next engine, batch 1, no speculation (M3–M4: SHA-773, SHA-774)
 
 - [ ] 2.1 Step program for the Flash Next layer schedule (36 GDN + 12 QSA, HC, MoE, PLE at layer 2). Verify: `cargo test` checks the step program's per-step bytes equal the planner's 7.34 GB ±1%.
 - [ ] 2.2 Engine memory budget covering weights, KV, GDN state, snapshots, activations and workspaces. Verify: `cargo test` covers the refusal arithmetic; on spark-5 with the fleet lane running, the engine refuses with the budget message and leaves the lane untouched.
 - [ ] 2.3 Per-layer golden diff against activations dumped teacher-forced from the fleet stack. Verify: per-layer max and mean error, and final-layer top-1 agreement, recorded in the PR.
-- [ ] 2.4 Teacher-forced top-1 agreement check against the fleet engine. Verify: agreement within 96.5–97.1% on the reference prompts.
+- [ ] 2.4 Teacher-forced reference check against the fleet engine on the fixed reference set (design decision 9), reporting top-1 agreement and the mean and 99th-percentile absolute logprob difference. Verify: top-1 agreement within 96.5–97.1%, with the logprob figures recorded as the checkpoint-precision baseline.
 - [ ] 2.5 End-to-end greedy decode with a graph per step. Verify: tok/s at 4K, 32K and 128K context on a GB10 (spark-5 lane stopped with operator approval), at least 28 tok/s against the 33 tok/s ceiling.
 
-## 3. Fusions and launch count (M5: SHA-750)
+## 3. Fusions, PDL and launch count (M5: SHA-750)
 
 - [ ] 3.1 Report kernels per step from the step program, and launches per step from the runtime. Verify: `generate --stats` prints both, and they match.
-- [ ] 3.2 Adopt the fused kernels (F1, F2, F4–F7, F9, F11) and PDL in the step program as each kernel change lands. Verify: launches per step at most 370; tok/s before and after recorded on a GB10; `verify --bench` for each fused kernel.
+- [ ] 3.2 PDL in every kernel, with pre-wait loads limited to producer-independent weights (design decision 3). Verify: a decode sequence whose expert routes change every token gives bitwise-identical logits with PDL on and with serialized launches, on a GB10.
+- [ ] 3.3 Adopt the fused kernels (F1, F2, F4–F7, F9, F11) in the step program as each kernel change lands. Verify: launches per step at most 370; tok/s before and after recorded on a GB10; `verify --bench` for each fused kernel.
 
 ## 4. MTP speculative decoding (M6: SHA-753, SHA-775)
 
 - [ ] 4.1 Draft (M=1, k times) and verify (M=k+1) step graphs, with rejection sampling. Verify: `cargo test` checks the acceptance logic against a reference implementation on fixed probabilities.
-- [ ] 4.2 Snapshot recurrent and convolution state per verify position, and roll back to the last accepted one. Verify: after partial acceptance, state matches a non-speculative run over the same tokens within kernel tolerance, on a GB10.
-- [ ] 4.3 Greedy output identical with MTP off and with MTP k=4. Verify: the 4 A/B prompts at 256 tokens produce identical token ids.
-- [ ] 4.4 Measure MTP decode. Verify: tok/s and per-draft acceptance on the A/B prompts against the fleet's ~50 tok/s on the same GB10, plus the distinct experts per verify step.
+- [ ] 4.2 Shape-invariant target computation: every kernel used by verify computes each position with the same reduction partition and order as the M=1 decode kernel (design decision 7). Verify: over 512 positions, verify-step logits are bitwise identical to decode-step logits, including a constructed near-tie position, on a GB10.
+- [ ] 4.3 Snapshot recurrent and convolution state per verify position, and roll back to the last accepted one. Verify: after partial acceptance, state matches a non-speculative run over the same tokens within kernel tolerance, on a GB10.
+- [ ] 4.4 Committed KV length in the step header: attention, the sparse indexer and its compressed cache read only up to it, and rejected positions are overwritten by the next step. Verify: force 2-of-4 acceptance and check that the next step's selected positions and logits equal non-speculative decoding, on a GB10.
+- [ ] 4.5 Greedy output identical with MTP off and with MTP k=4. Verify: the 4 A/B prompts at 256 tokens produce identical token ids.
+- [ ] 4.6 Measure MTP decode. Verify: tok/s and per-draft acceptance on the A/B prompts against the fleet's ~50 tok/s on the same GB10, plus the distinct experts per verify step.
 
-## 5. Opt-in byte reductions (M9: SHA-781)
+## 5. Prefill chunk graph (M7)
 
-- [ ] 5.1 MXFP8 HyperConnection weight option, off by default. Verify: tok/s and top-1 agreement with and without it, on a GB10.
-- [ ] 5.2 Truncated-vocabulary draft head option, off by default. Verify: tok/s and acceptance with and without it; greedy output still identical with MTP on and off.
+- [ ] 5.1 Prefill chunk step graphs (chunk size from the plan, 16K by default) built from the M7 prefill kernels, with the KV, indexer and recurrent state handed to decode. Verify: logits at the last prompt position equal token-by-token ingestion within kernel tolerance, and greedy continuations match, on a GB10.
+- [ ] 5.2 Measure prefill. Verify: `generate` on a 16K-token plain-text prompt reports time to first token below 4.89 s and prefill tok/s against the fleet's 3,060, on a GB10.
+
+## 6. Opt-in byte reductions (M9: SHA-781)
+
+- [ ] 6.1 Precision gate: a run on the reference set (design decision 9) passes only if top-1 agreement stays within the fleet band and the mean and 99th-percentile absolute logprob difference exceed the checkpoint-precision baseline from task 2.4 by at most 10%. Otherwise the option reports FAIL and stays off. Verify: `cargo test` rejects a synthetic case with unchanged top-1 and out-of-tolerance logprobs.
+- [ ] 6.2 MXFP8 HyperConnection weight option, off by default and subject to the gate. Verify: tok/s and the gate result with and without it, on a GB10.
+- [ ] 6.3 Truncated-vocabulary draft head option, off by default. Verify: tok/s and acceptance with and without it; greedy output still identical with MTP on and off.
 
 ## Workflow follow-up
 
-- Archive this change with `openspec archive add-inference-engine` once tasks 1–4 are done. Task 5 and later milestones can move to a follow-up change.
-- The `serving-api` change (tokenizer, chat template, OpenAI endpoints) is proposed separately at M8.
+- Archive this change with `openspec archive add-inference-engine` only when every task above is done, including the prefill chunk graph (group 5) and the 16K time-to-first-token check.
+- The `serving-api` change (chat template, reasoning and tool parsers, OpenAI endpoints) is proposed separately at M8.
