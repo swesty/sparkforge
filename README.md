@@ -65,6 +65,7 @@ Planned (configs chosen, bodies TODO): prefill `mma.sync` GEMMs per linear, grou
 cargo build --release
 ./target/release/sparkforge plan configs/llama-3.1-8b.json
 ./target/release/sparkforge plan configs/qwen3-30b-a3b.json --format nvfp4 --ctx 65536
+./target/release/sparkforge plan configs/qwen3.8-flash-next-nvfp4.json   # hybrid: 34 op classes, 7.34 GB/token (planned only)
 ./target/release/sparkforge emit /path/to/model/config.json --out build      # -> build/<hash>/{model.cu,gemm_tiles.cuh,plan.json,manifest.json}
 
 # On a Spark:
@@ -109,7 +110,11 @@ no CUDA graph.
 
 - Rejected at parse time: `rope_scaling` other than `llama3` (yarn, dynamic, linear, longrope); MLA attention
   (`kv_lora_rank`, DeepSeek V2/V3); GPTQ/AWQ with per-channel scales (`group_size: -1`); modelopt quant
-  algorithms other than NVFP4; any other `quant_method`. `--format` overrides the quantization check.
+  algorithms other than NVFP4 and MIXED_PRECISION; any other `quant_method`; hybrid linear-attention models other
+  than `qwen4_exp`; partial rotary on dense models. `--format` overrides the quantization check.
+- Planned, not generated: Qwen3.8 Flash Next (`qwen4_exp`). `plan` derives its op classes and byte budget; `emit`
+  lists every op as planned, and `verify`, `weights` and `verify-weights` refuse it until its kernels and the
+  mixed-format loader exist.
 - Flagged in `plan` notes, output wrong until implemented: Qwen3 per-head q/k RMSNorm (`q_norm`/`k_norm`),
   q/k/v projection bias (Qwen2, `attention_bias: true`).
 - Also ignored today: sliding-window attention (Mistral v0.1) and DeepSeek-style dense-first layers.

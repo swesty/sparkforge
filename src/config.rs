@@ -1,6 +1,13 @@
 //! Hugging Face `config.json` -> normalized ModelSpec.
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, ensure, Context, Result};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
+
+#[derive(Debug, Deserialize)]
+struct RawLayerQuant {
+    quant_algo: String,
+    group_size: Option<u32>,
+}
 
 #[derive(Debug, Deserialize)]
 struct RawQuant {
@@ -9,12 +16,15 @@ struct RawQuant {
     bits: Option<u32>,
     /// GPTQ uses -1 for per-channel scales, so this must be signed.
     group_size: Option<i64>,
+    /// ModelOpt `MIXED_PRECISION`: module path -> that module's scheme.
+    quantized_layers: Option<BTreeMap<String, RawLayerQuant>>,
 }
 
 #[derive(Debug, Deserialize)]
 struct RawConfig {
     #[serde(default)]
     architectures: Vec<String>,
+    model_type: Option<String>,
     hidden_size: u32,
     intermediate_size: Option<u32>,
     num_hidden_layers: u32,
@@ -24,8 +34,7 @@ struct RawConfig {
     vocab_size: u32,
     #[serde(default = "default_eps")]
     rms_norm_eps: f64,
-    #[serde(default = "default_theta")]
-    rope_theta: f64,
+    rope_theta: Option<f64>,
     max_position_embeddings: Option<u32>,
     #[serde(default)]
     tie_word_embeddings: bool,
@@ -35,14 +44,50 @@ struct RawConfig {
     num_experts_per_tok: Option<u32>,
     moe_intermediate_size: Option<u32>,
     n_shared_experts: Option<u32>,
+    shared_expert_intermediate_size: Option<u32>,
     quantization_config: Option<RawQuant>,
     rope_scaling: Option<serde_json::Value>,
+    /// Newer HF configs put `rope_theta`, `rope_type` and partial-rotary fields here.
+    rope_parameters: Option<serde_json::Value>,
+    partial_rotary_factor: Option<f64>,
     attention_bias: Option<bool>,
     /// Present only on MLA models (DeepSeek V2/V3), which this engine does not plan.
     kv_lora_rank: Option<u32>,
+    /// Per-layer attention kind on hybrid models (`linear_attention` / `full_attention`).
+    layer_types: Option<Vec<String>>,
 }
 fn default_eps() -> f64 { 1e-6 }
-fn default_theta() -> f64 { 10_000.0 }
+
+/// Fields only the `qwen4_exp` (Qwen3.8 Flash Next) hybrid carries. All are required for it.
+#[derive(Debug, Deserialize)]
+struct RawHybrid {
+    full_attention_interval: Option<u32>,
+    // Gated DeltaNet (linear attention)
+    linear_num_key_heads: Option<u32>,
+    linear_num_value_heads: Option<u32>,
+    linear_key_head_dim: Option<u32>,
+    linear_value_head_dim: Option<u32>,
+    linear_conv_kernel_dim: Option<u32>,
+    // Sparse full attention (QSA) and its indexer
+    output_gate_type: Option<String>,
+    indexer_n_heads: Option<u32>,
+    indexer_head_dim: Option<u32>,
+    indexer_kv_heads: Option<u32>,
+    indexer_compress_ratio: Option<u32>,
+    indexer_budget: Option<u32>,
+    // HyperConnection residual
+    hc_count: Option<u32>,
+    hc_lowrank: Option<u32>,
+    // Per-layer n-gram embedding
+    ple_layer_ids: Option<Vec<u32>>,
+    ple_embed_dim: Option<u32>,
+    ple_conv_kernel_size: Option<u32>,
+    ngram_size: Option<u32>,
+    heads_per_ngram: Option<u32>,
+    ngram_vocab_size_base: Option<u64>,
+    // Multi-token prediction draft layers
+    mtp_num_hidden_layers: Option<u32>,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize)]
 pub enum WeightFormat {
@@ -51,6 +96,11 @@ pub enum WeightFormat {
     W4A16 { group: u32 },
     /// NVFP4: e2m1 weights + e4m3 scale per 16 elements (+ fp32 tensor scale).
     Nvfp4,
+    /// NVFP4 storage used weight-only (ModelOpt `W4A16_NVFP4`): same bytes as NVFP4, but the
+    /// activations stay BF16 in every phase (no static activation scale to quantize them with).
+    Nvfp4WeightOnly,
+    /// MXFP8: e4m3 weights + a power-of-two (UE8M0) scale per 32 elements.
+    Mxfp8,
 }
 
 impl WeightFormat {
@@ -59,9 +109,23 @@ impl WeightFormat {
         match self {
             WeightFormat::Bf16 => 2.0,
             WeightFormat::W4A16 { group } => 0.5 + 2.0 / *group as f64,
-            WeightFormat::Nvfp4 => 0.5 + 1.0 / 16.0,
+            WeightFormat::Nvfp4 | WeightFormat::Nvfp4WeightOnly => 0.5 + 1.0 / 16.0,
+            WeightFormat::Mxfp8 => 1.0 + 1.0 / 32.0,
         }
     }
+}
+
+/// Per-module weight formats from a ModelOpt `MIXED_PRECISION` checkpoint. Modules absent from
+/// the map are BF16 (or F32 for norms and state parameters).
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct FormatMap {
+    pub modules: BTreeMap<String, WeightFormat>,
+}
+
+impl FormatMap {
+    pub fn is_empty(&self) -> bool { self.modules.is_empty() }
+    /// Format of the module at exactly `path`, if the map lists it.
+    pub fn get(&self, path: &str) -> Option<WeightFormat> { self.modules.get(path).copied() }
 }
 
 /// RoPE frequency scaling. Only Llama 3's scheme is implemented; others are rejected at parse time.
@@ -76,6 +140,106 @@ pub struct Moe {
     pub experts_per_tok: u32,
     pub expert_intermediate: u32,
     pub shared_experts: u32,
+    /// Total width of the shared expert(s); 0 without shared experts.
+    pub shared_intermediate: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum LayerKind {
+    /// Gated DeltaNet: recurrent linear attention with a fixed-size state.
+    LinearAttention,
+    /// Sparse full attention (QSA): each query reads indexer-selected positions.
+    FullAttention,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct Gdn {
+    pub key_heads: u32,
+    pub value_heads: u32,
+    pub key_head_dim: u32,
+    pub value_head_dim: u32,
+    pub conv_kernel: u32,
+}
+
+impl Gdn {
+    /// `in_proj_qkv` output: q and k (key heads) plus v (value heads).
+    pub fn qkv_dim(&self) -> u32 { 2 * self.key_heads * self.key_head_dim + self.value_heads * self.value_head_dim }
+    pub fn value_dim(&self) -> u32 { self.value_heads * self.value_head_dim }
+    /// FP32 recurrent state: one key_dim x value_dim matrix per value head.
+    pub fn state_bytes(&self) -> u64 { self.value_heads as u64 * self.key_head_dim as u64 * self.value_head_dim as u64 * 4 }
+    /// BF16 conv1d state: the previous `conv_kernel - 1` inputs of every `in_proj_qkv` channel.
+    pub fn conv_state_bytes(&self) -> u64 { self.qkv_dim() as u64 * (self.conv_kernel as u64 - 1) * 2 }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct Qsa {
+    /// `q_proj` also emits a per-element output gate (sigmoid), doubling its rows.
+    pub output_gate: bool,
+    pub indexer_heads: u32,
+    pub indexer_head_dim: u32,
+    pub indexer_kv_heads: u32,
+    pub compress_ratio: u32,
+    pub budget: u32,
+}
+
+impl Qsa {
+    /// Positions one query attends to: `budget` selected positions plus the trailing tokens of a
+    /// compression group that is not complete yet.
+    pub fn selected_positions(&self) -> u32 { self.budget + self.compress_ratio - 1 }
+    /// `index_qk_proj` output: indexer queries plus indexer keys.
+    pub fn index_qk_dim(&self) -> u32 { (self.indexer_heads + self.indexer_kv_heads) * self.indexer_head_dim }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct HyperConnection {
+    /// Residual streams; the residual state is `streams * hidden` wide.
+    pub streams: u32,
+    /// Width of each mixer's low-rank projection.
+    pub lowrank: u32,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct Ple {
+    pub layer_ids: Vec<u32>,
+    pub embed_dim: u32,
+    pub conv_kernel: u32,
+    pub ngram_size: u32,
+    pub heads_per_ngram: u32,
+    pub vocab_base: u64,
+}
+
+impl Ple {
+    /// One head set per n-gram order 2..=ngram_size.
+    pub fn heads(&self) -> u32 { (self.ngram_size - 1) * self.heads_per_ngram }
+    pub fn head_dim(&self) -> u32 { self.embed_dim / self.heads() }
+    /// Table rows, `heads * vocab_base`. The checkpoint's per-head tables are prime-sized near
+    /// `vocab_base`, so the true count differs by a few parts per million.
+    pub fn table_rows(&self) -> u64 { self.heads() as u64 * self.vocab_base }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct Mrope {
+    pub partial_rotary_factor: f64,
+    pub sections: Vec<u32>,
+    pub interleaved: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct Hybrid {
+    pub schedule: Vec<LayerKind>,
+    pub gdn: Gdn,
+    pub qsa: Qsa,
+    pub hc: HyperConnection,
+    pub ple: Ple,
+    pub mrope: Mrope,
+    pub mtp_layers: u32,
+}
+
+impl Hybrid {
+    pub fn count(&self, k: LayerKind) -> u32 { self.schedule.iter().filter(|&&x| x == k).count() as u32 }
+    /// Mixers per token: one before attention and one before the MLP in every layer, plus a final
+    /// mixer (without injection) before `lm_head`.
+    pub fn hc_mixers(&self) -> u32 { 2 * self.schedule.len() as u32 + 1 }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -94,11 +258,16 @@ pub struct ModelSpec {
     pub max_pos: u32,
     pub tie_embeddings: bool,
     pub moe: Option<Moe>,
+    /// Format of every weight not listed in `formats` (all weights when `formats` is empty).
     pub weights: WeightFormat,
+    /// Per-module formats of a mixed-precision checkpoint.
+    pub formats: FormatMap,
     /// Per-head RMSNorm on q and k before RoPE (Qwen3). Not generated yet.
     pub qk_norm: bool,
     /// Bias on the q/k/v projections (Qwen2, some Llama variants). Not generated yet.
     pub qkv_bias: bool,
+    /// Hybrid linear/sparse-attention layout (Qwen3.8 Flash Next). Planned, not generated.
+    pub hybrid: Option<Hybrid>,
 }
 
 fn parse_rope_scaling(v: &Option<serde_json::Value>) -> Result<Option<RopeScaling>> {
@@ -117,23 +286,138 @@ fn parse_rope_scaling(v: &Option<serde_json::Value>) -> Result<Option<RopeScalin
     }
 }
 
-fn detect_format(q: &Option<RawQuant>) -> Result<WeightFormat> {
-    let Some(q) = q else { return Ok(WeightFormat::Bf16) };
+/// One `MIXED_PRECISION` entry. Group sizes are fixed by each scheme, so any other size is an error.
+fn layer_format(module: &str, q: &RawLayerQuant) -> Result<WeightFormat> {
+    let (fmt, group) = match q.quant_algo.as_str() {
+        "NVFP4" => (WeightFormat::Nvfp4, 16),
+        "W4A16_NVFP4" => (WeightFormat::Nvfp4WeightOnly, 16),
+        "MXFP8" => (WeightFormat::Mxfp8, 32),
+        other => bail!("module {module}: quant_algo {other:?} is not supported in MIXED_PRECISION (NVFP4, W4A16_NVFP4, MXFP8)"),
+    };
+    if let Some(g) = q.group_size {
+        ensure!(g == group, "module {module}: {} with group_size {g} is not supported (expected {group})", q.quant_algo);
+    }
+    Ok(fmt)
+}
+
+fn detect_format(q: &Option<RawQuant>) -> Result<(WeightFormat, FormatMap)> {
+    let Some(q) = q else { return Ok((WeightFormat::Bf16, FormatMap::default())) };
     let method = q.quant_method.as_deref().unwrap_or("");
+    let uniform = |f| Ok((f, FormatMap::default()));
     match (method, q.quant_algo.as_deref(), q.bits) {
-        ("nvfp4", _, _) | ("modelopt", Some("NVFP4"), _) => Ok(WeightFormat::Nvfp4),
-        ("modelopt", algo, _) => bail!("modelopt quant_algo {algo:?} is not supported (only NVFP4); pass --format to override"),
+        ("nvfp4", _, _) | ("modelopt", Some("NVFP4"), _) => uniform(WeightFormat::Nvfp4),
+        ("modelopt", Some("MIXED_PRECISION"), _) => {
+            let layers = q.quantized_layers.as_ref().filter(|m| !m.is_empty())
+                .context("modelopt MIXED_PRECISION without a quantized_layers map; pass --format to override")?;
+            let mut map = FormatMap::default();
+            for (module, lq) in layers {
+                map.modules.insert(module.clone(), layer_format(module, lq)?);
+            }
+            Ok((WeightFormat::Bf16, map))
+        }
+        ("modelopt", algo, _) => bail!("modelopt quant_algo {algo:?} is not supported (NVFP4 or MIXED_PRECISION); pass --format to override"),
         ("gptq" | "awq", _, Some(4)) => match q.group_size.unwrap_or(128) {
-            g if g > 0 => Ok(WeightFormat::W4A16 { group: g as u32 }),
+            g if g > 0 => uniform(WeightFormat::W4A16 { group: g as u32 }),
             g => bail!("{method} group_size {g} (per-channel scales) is not supported; pass --format to override"),
         },
         _ => bail!("quantization_config {method:?} (bits {:?}) is not supported; pass --format to override", q.bits),
     }
 }
 
+/// Multimodal configs nest the language model under `text_config`. Its fields win; the top level
+/// supplies what only it carries (the checkpoint's quantization and architecture names).
+fn text_config(v: serde_json::Value) -> Result<serde_json::Value> {
+    let serde_json::Value::Object(mut top) = v else { bail!("config.json is not a JSON object") };
+    let Some(tc) = top.remove("text_config") else { return Ok(serde_json::Value::Object(top)) };
+    let serde_json::Value::Object(mut text) = tc else { bail!("text_config is not a JSON object") };
+    for k in ["quantization_config", "architectures"] {
+        if let Some(x) = top.remove(k) {
+            text.entry(k).or_insert(x);
+        }
+    }
+    Ok(serde_json::Value::Object(text))
+}
+
+fn need<T>(v: Option<T>, field: &str) -> Result<T> {
+    v.with_context(|| format!("qwen4_exp config is missing {field}"))
+}
+
+fn parse_hybrid(r: &RawConfig, body: &serde_json::Value, head_dim: u32, partial_rotary: Option<f64>) -> Result<Option<Hybrid>> {
+    let Some(types) = &r.layer_types else { return Ok(None) };
+    let schedule = types.iter().map(|t| match t.as_str() {
+        "linear_attention" => Ok(LayerKind::LinearAttention),
+        "full_attention" => Ok(LayerKind::FullAttention),
+        other => bail!("layer type {other:?} is not supported (linear_attention, full_attention)"),
+    }).collect::<Result<Vec<_>>>()?;
+    if schedule.iter().all(|&k| k == LayerKind::FullAttention) {
+        return Ok(None);
+    }
+    let model_type = r.model_type.as_deref().unwrap_or("unknown");
+    ensure!(model_type == "qwen4_exp_text" || model_type == "qwen4_exp",
+        "hybrid linear-attention model {model_type:?} is not supported (only qwen4_exp, Qwen3.8 Flash Next)");
+    ensure!(schedule.len() as u32 == r.num_hidden_layers,
+        "layer_types has {} entries but num_hidden_layers is {}", schedule.len(), r.num_hidden_layers);
+    let h: RawHybrid = serde_json::from_value(body.clone()).context("parsing qwen4_exp fields")?;
+    if let Some(n) = h.full_attention_interval {
+        for (i, k) in schedule.iter().enumerate() {
+            let want = if (i as u32 + 1) % n == 0 { LayerKind::FullAttention } else { LayerKind::LinearAttention };
+            ensure!(*k == want, "layer {i} is {k:?}, but full_attention_interval {n} puts {want:?} there");
+        }
+    }
+    let rp = r.rope_parameters.as_ref();
+    let factor = need(partial_rotary, "partial_rotary_factor")?;
+    let sections: Vec<u32> = rp.and_then(|p| p.get("mrope_section")).and_then(|s| serde_json::from_value(s.clone()).ok())
+        .context("qwen4_exp config is missing rope_parameters.mrope_section")?;
+    let rotary = (head_dim as f64 * factor).round() as u32;
+    ensure!(2 * sections.iter().sum::<u32>() == rotary,
+        "mrope_section {sections:?} covers {} dims, but partial_rotary_factor {factor} rotates {rotary} of {head_dim}", 2 * sections.iter().sum::<u32>());
+    let ple = Ple {
+        layer_ids: need(h.ple_layer_ids, "ple_layer_ids")?,
+        embed_dim: need(h.ple_embed_dim, "ple_embed_dim")?,
+        conv_kernel: need(h.ple_conv_kernel_size, "ple_conv_kernel_size")?,
+        ngram_size: need(h.ngram_size, "ngram_size")?,
+        heads_per_ngram: need(h.heads_per_ngram, "heads_per_ngram")?,
+        vocab_base: need(h.ngram_vocab_size_base, "ngram_vocab_size_base")?,
+    };
+    ensure!(ple.ngram_size >= 2 && ple.embed_dim % ple.heads() == 0,
+        "PLE embed_dim {} is not divisible into {} heads (orders 2..={})", ple.embed_dim, ple.heads(), ple.ngram_size);
+    for &l in &ple.layer_ids {
+        ensure!(l < r.num_hidden_layers, "ple_layer_ids names layer {l}, but there are {}", r.num_hidden_layers);
+    }
+    let gate = need(h.output_gate_type, "output_gate_type")?;
+    ensure!(gate == "sigmoid", "output_gate_type {gate:?} is not supported (sigmoid)");
+    Ok(Some(Hybrid {
+        schedule,
+        gdn: Gdn {
+            key_heads: need(h.linear_num_key_heads, "linear_num_key_heads")?,
+            value_heads: need(h.linear_num_value_heads, "linear_num_value_heads")?,
+            key_head_dim: need(h.linear_key_head_dim, "linear_key_head_dim")?,
+            value_head_dim: need(h.linear_value_head_dim, "linear_value_head_dim")?,
+            conv_kernel: need(h.linear_conv_kernel_dim, "linear_conv_kernel_dim")?,
+        },
+        qsa: Qsa {
+            output_gate: true,
+            indexer_heads: need(h.indexer_n_heads, "indexer_n_heads")?,
+            indexer_head_dim: need(h.indexer_head_dim, "indexer_head_dim")?,
+            indexer_kv_heads: need(h.indexer_kv_heads, "indexer_kv_heads")?,
+            compress_ratio: need(h.indexer_compress_ratio, "indexer_compress_ratio")?,
+            budget: need(h.indexer_budget, "indexer_budget")?,
+        },
+        hc: HyperConnection { streams: need(h.hc_count, "hc_count")?, lowrank: need(h.hc_lowrank, "hc_lowrank")? },
+        ple,
+        mrope: Mrope {
+            partial_rotary_factor: factor,
+            sections,
+            interleaved: rp.and_then(|p| p.get("mrope_interleaved")).and_then(|b| b.as_bool()).unwrap_or(false),
+        },
+        mtp_layers: h.mtp_num_hidden_layers.unwrap_or(0),
+    }))
+}
+
 impl ModelSpec {
     pub fn from_json(text: &str, override_fmt: Option<WeightFormat>) -> Result<Self> {
-        let r: RawConfig = serde_json::from_str(text).context("parsing config.json")?;
+        let body = text_config(serde_json::from_str(text).context("parsing config.json")?)?;
+        let r: RawConfig = serde_json::from_value(body.clone()).context("parsing config.json")?;
         let kv_heads = r.num_key_value_heads.unwrap_or(r.num_attention_heads);
         let head_dim = r.head_dim.unwrap_or(r.hidden_size / r.num_attention_heads);
         if r.kv_lora_rank.is_some() {
@@ -142,26 +426,45 @@ impl ModelSpec {
         if r.num_attention_heads % kv_heads != 0 {
             bail!("heads ({}) not divisible by kv_heads ({})", r.num_attention_heads, kv_heads);
         }
+        let rp = r.rope_parameters.as_ref();
+        let partial_rotary = r.partial_rotary_factor
+            .or_else(|| rp.and_then(|p| p.get("partial_rotary_factor")).and_then(|x| x.as_f64()));
+        let hybrid = parse_hybrid(&r, &body, head_dim, partial_rotary)?;
+        if hybrid.is_none() {
+            if let Some(f) = partial_rotary.filter(|&f| f != 1.0) {
+                bail!("partial_rotary_factor {f} is not supported: the generated RoPE rotates the whole head");
+            }
+        }
         let moe = match (r.num_experts, r.num_experts_per_tok) {
-            (Some(e), Some(k)) if e > 1 => Some(Moe {
-                num_experts: e,
-                experts_per_tok: k,
-                expert_intermediate: r.moe_intermediate_size.or(r.intermediate_size)
-                    .context("MoE model without moe_intermediate_size")?,
-                shared_experts: r.n_shared_experts.unwrap_or(0),
-            }),
+            (Some(e), Some(k)) if e > 1 => {
+                let expert_intermediate = r.moe_intermediate_size.or(r.intermediate_size)
+                    .context("MoE model without moe_intermediate_size")?;
+                let shared_intermediate = r.shared_expert_intermediate_size
+                    .unwrap_or(r.n_shared_experts.unwrap_or(0) * expert_intermediate);
+                Some(Moe {
+                    num_experts: e,
+                    experts_per_tok: k,
+                    expert_intermediate,
+                    shared_experts: r.n_shared_experts.unwrap_or(u32::from(shared_intermediate > 0)),
+                    shared_intermediate,
+                })
+            }
             _ => None,
         };
-        // An explicit --format wins, so an unrecognized quantization_config is not fatal then.
-        let weights = match override_fmt {
-            Some(f) => f,
+        // An explicit --format wins, so an unrecognized quantization_config is not fatal then. It
+        // replaces detection entirely, including a mixed-precision map.
+        let (weights, formats) = match override_fmt {
+            Some(f) => (f, FormatMap::default()),
             None => detect_format(&r.quantization_config)?,
         };
         let arch = r.architectures.first().cloned().unwrap_or_else(|| "unknown".into());
+        let rope_theta = r.rope_theta
+            .or_else(|| rp.and_then(|p| p.get("rope_theta")).and_then(|x| x.as_f64()))
+            .unwrap_or(10_000.0);
         Ok(ModelSpec {
             qk_norm: arch.starts_with("Qwen3"),
             qkv_bias: r.attention_bias.unwrap_or(arch.starts_with("Qwen2")),
-            rope_scaling: parse_rope_scaling(&r.rope_scaling)?,
+            rope_scaling: parse_rope_scaling(if r.rope_scaling.is_some() { &r.rope_scaling } else { &r.rope_parameters })?,
             arch,
             hidden: r.hidden_size,
             intermediate: r.intermediate_size.unwrap_or(4 * r.hidden_size),
@@ -171,11 +474,13 @@ impl ModelSpec {
             head_dim,
             vocab: r.vocab_size,
             rms_eps: r.rms_norm_eps,
-            rope_theta: r.rope_theta,
+            rope_theta,
             max_pos: r.max_position_embeddings.unwrap_or(8192),
             tie_embeddings: r.tie_word_embeddings,
             moe,
             weights,
+            formats,
+            hybrid,
         })
     }
 
