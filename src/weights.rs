@@ -633,7 +633,7 @@ pub fn admit(lock_path: &Path, need: u64, mem: impl Fn() -> Option<u64>) -> Resu
 }
 
 /// Root-provisioned directory holding the node-wide admission lock (a deploy step on each GB10):
-/// `install -d -m 0755 -o root /run/sparkforge && install -m 0666 -o root /dev/null
+/// `install -d -m 0755 -o root /run/sparkforge && install -m 0644 -o root /dev/null
 /// /run/sparkforge/admission.lock`. `/run` is tmpfs, so a boot-time unit recreates it.
 pub const NODE_LOCK_DIR: &str = "/run/sparkforge";
 const NODE_LOCK_NAME: &str = "admission.lock";
