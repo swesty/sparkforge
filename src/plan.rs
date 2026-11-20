@@ -204,13 +204,21 @@ impl<'a> Formats<'a> {
         self.find(|k| k.starts_with("mtp.") && k.ends_with(&format!(".{rel}"))).unwrap_or(self.m.weights)
     }
 
-    /// Format of a once-per-model language-model module whose path ends with `suffix`.
+    /// Format of a once-per-model language-model module whose path ends with the module path
+    /// `suffix` (matched on a `.` boundary, so `aux_ple.key_proj` is not `ple.key_proj`).
     pub fn model(&self, suffix: &str) -> WeightFormat {
         let text = |k: &str| {
             let r = strip_text_prefix(k);
             !(k.starts_with("mtp.") || r.starts_with("visual") || r.starts_with("vision") || r.starts_with("audio"))
         };
-        self.find(|k| text(k) && k.ends_with(suffix)).unwrap_or(self.m.weights)
+        let dotted = format!(".{suffix}");
+        self.find(|k| text(k) && (k == suffix || k.ends_with(&dotted))).unwrap_or(self.m.weights)
+    }
+
+    /// Format of the output head, matched only at its model-level paths (`lm_head`,
+    /// `model.lm_head`, ...), never by suffix inside a layer.
+    pub fn head(&self) -> WeightFormat {
+        self.find(|k| TEXT_PREFIXES.iter().any(|p| k.strip_prefix(p) == Some("lm_head"))).unwrap_or(self.m.weights)
     }
 
     pub fn unused(&self) -> Vec<String> {
@@ -387,7 +395,7 @@ fn mtp_weight_bytes(m: &ModelSpec, h: &Hybrid, f: &Formats) -> f64 {
     let res = (h.hc.streams * m.hidden) as f64;
     let e = m.moe.as_ref();
     let b = |rel: &str| f.mtp(rel).bytes_per_elem();
-    let attn = (m.q_dim() * 2) as f64 * hd * b("self_attn.q_proj") + 2.0 * m.kv_dim() as f64 * hd * b("self_attn.k_proj")
+    let attn = (m.q_dim() * 2) as f64 * hd * b("self_attn.q_proj") + m.kv_dim() as f64 * hd * (b("self_attn.k_proj") + b("self_attn.v_proj"))
         + h.qsa.index_qk_dim() as f64 * hd * b("self_attn.indexer.index_qk_proj") + hd * m.q_dim() as f64 * b("self_attn.o_proj");
     let experts = e.map_or(0.0, |e| e.num_experts as f64 * 3.0 * e.expert_intermediate as f64 * hd * b("mlp.experts"));
     let shared = e.map_or(0.0, |e| 3.0 * e.shared_intermediate as f64 * hd * b("mlp.shared_expert.gate_proj") + e.num_experts as f64 * hd * 2.0);
@@ -522,7 +530,7 @@ pub fn build(m: &ModelSpec, t: &Target, o: &PlanOpts) -> Plan {
         None => linears(m),
     };
     let lm = Linear { name: "lm_head".into(), n: m.vocab, k: m.hidden, copies: 1, active: 1,
-        format: if m.hybrid.is_some() { formats.model("lm_head") } else { WeightFormat::Bf16 }, per_token: 1 };
+        format: if m.hybrid.is_some() { formats.head() } else { WeightFormat::Bf16 }, per_token: 1 };
     let emb = m.vocab as f64 * m.hidden as f64 * 2.0;
     let usable = t.usable_mem_gib * (1u64 << 30) as f64;
     let mut ops: Vec<OpClass> = vec![];

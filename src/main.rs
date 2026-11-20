@@ -190,6 +190,8 @@ fn main() -> Result<()> {
             use sparkforge::verify;
             let p = build(&c)?;
             let g = codegen::generate(&p);
+            // Before any CUDA call, so a planned-only model says so even without a GPU.
+            codegen::require_generated(&g, &p.model.arch)?;
             let e = sparkforge::runtime::Engine::load(&g, &cuda_include)?;
             let rows = verify::run(&p, &g, &e, &verify::Opts { bench, seed })?;
             println!("{:<28} {:<26} {:>10} {:>5} {:>10} {:>8}", "kernel", "case", "max err", "ok", "us", "GB/s");

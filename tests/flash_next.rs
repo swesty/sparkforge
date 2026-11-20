@@ -363,3 +363,71 @@ fn formats_the_planner_cannot_honor_are_rejected() {
     ql(&mut v).insert("mtp.layers.48.mlp.experts".into(), json!({"quant_algo": "NVFP4", "group_size": 16}));
     assert!(format!("{:#}", spec_of(&v).unwrap_err()).contains("one MTP layer"));
 }
+
+// ---- SHA-783: codex-review round 3 follow-ups on the qwen4_exp plan ----
+
+#[test]
+fn a_planned_only_model_is_refused_before_any_cuda_call() {
+    // `require_generated` is host-only; `verify` calls it before creating the CUDA engine.
+    let g = codegen::generate(&plan_of(&spec_of(&raw()).unwrap()));
+    let err = format!("{:#}", codegen::require_generated(&g, "Qwen4ExpForConditionalGeneration").unwrap_err());
+    assert!(err.contains("Qwen4ExpForConditionalGeneration") && err.contains("no kernels are generated"), "{err}");
+    let llama = ModelSpec::from_json(&std::fs::read_to_string("configs/llama-3.1-8b.json").unwrap(), None).unwrap();
+    assert!(codegen::require_generated(&codegen::generate(&plan_of(&llama)), "llama").is_ok());
+}
+
+#[test]
+fn only_the_model_level_lm_head_sets_the_head_format() {
+    let base = plan_of(&spec_of(&raw()).unwrap());
+    let mut v = raw();
+    ql(&mut v).insert("model.language_model.layers.0.aux_lm_head".into(), json!({"quant_algo": "NVFP4", "group_size": 16}));
+    let p = plan_of(&spec_of(&v).unwrap());
+    let head = p.ops.iter().find(|o| o.name == "lm_head").unwrap();
+    assert_eq!(head.format, Some(WeightFormat::Bf16));
+    assert_eq!((p.budget.weight_gib, p.budget.decode_bytes_per_token_gb), (base.budget.weight_gib, base.budget.decode_bytes_per_token_gb));
+    assert!(p.notes.iter().any(|n| n.contains("not used by the plan") && n.contains("aux_lm_head")), "{:#?}", p.notes);
+    // A real head entry is honored.
+    let mut v = raw();
+    ql(&mut v).insert("lm_head".into(), json!({"quant_algo": "MXFP8", "group_size": 32}));
+    let p = plan_of(&spec_of(&v).unwrap());
+    assert_eq!(p.ops.iter().find(|o| o.name == "lm_head").unwrap().format, Some(WeightFormat::Mxfp8));
+}
+
+#[test]
+fn mtp_key_and_value_projections_are_priced_separately() {
+    let base = plan_of(&spec_of(&raw()).unwrap());
+    let mut v = raw();
+    ql(&mut v).insert("mtp.layers.0.self_attn.v_proj".into(), json!({"quant_algo": "MXFP8", "group_size": 32}));
+    let p = plan_of(&spec_of(&v).unwrap());
+    // v_proj is 512 x 2560: BF16 (2 B) -> MXFP8 (1.03125 B) saves 1,269,760 B; k_proj stays BF16.
+    let delta = (base.budget.weight_gib - p.budget.weight_gib) * (1u64 << 30) as f64;
+    assert!((delta - 512.0 * 2560.0 * (2.0 - 1.03125)).abs() < 1.0, "{delta}");
+    assert!(!p.notes.iter().any(|n| n.contains("not used by the plan")), "the v_proj entry is consumed: {:#?}", p.notes);
+}
+
+#[test]
+fn the_top_level_model_type_identifies_qwen4_exp() {
+    let mut v = raw();
+    v["text_config"].as_object_mut().unwrap().remove("model_type");
+    let p = plan_of(&spec_of(&v).unwrap());
+    assert!(p.model.hybrid.is_some());
+    assert!(codegen::generate(&p).kernels.iter().all(|k| k.status == "planned"));
+}
+
+#[test]
+fn moe_top_k_must_be_between_one_and_the_expert_count() {
+    for k in [0, 513] {
+        let mut v = raw();
+        v["text_config"]["num_experts_per_tok"] = json!(k);
+        assert!(format!("{:#}", spec_of(&v).unwrap_err()).contains("num_experts_per_tok"), "top-k {k}");
+    }
+}
+
+#[test]
+fn a_format_override_can_skip_a_malformed_layer_map() {
+    let cfg = json!({"hidden_size": 2048, "num_hidden_layers": 2, "num_attention_heads": 16, "vocab_size": 1000,
+        "quantization_config": {"quant_method": "modelopt", "quant_algo": "MIXED_PRECISION", "quantized_layers": {"layers.0.self_attn.o_proj": null}}});
+    let s = ModelSpec::from_json(&cfg.to_string(), Some(WeightFormat::Bf16)).unwrap();
+    assert_eq!((s.weights, s.formats.is_empty(), s.declared_mixed), (WeightFormat::Bf16, true, true));
+    assert!(format!("{:#}", spec_of(&cfg).unwrap_err()).contains("layers.0.self_attn.o_proj"));
+}

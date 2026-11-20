@@ -457,3 +457,17 @@ fn a_fifo_shard_fails_promptly_instead_of_hanging() {
     let err = rx.recv_timeout(std::time::Duration::from_secs(5)).expect("opening a FIFO shard must not block").expect("must fail");
     assert!(err.contains("not a regular file"), "{err}");
 }
+
+#[test]
+fn a_format_override_does_not_let_a_mixed_precision_checkpoint_load() {
+    // SHA-783: --format lets `plan` run on a MIXED_PRECISION config, but the checkpoint itself is
+    // still mixed precision, so binding refuses it.
+    let cfg = CFG.replace("TIE", "false").replace("\"vocab_size\": 64,",
+        "\"vocab_size\": 64, \"quantization_config\": {\"quant_method\": \"modelopt\", \"quant_algo\": \"MIXED_PRECISION\", \"quantized_layers\": {\"model.layers.0.self_attn.o_proj\": {\"quant_algo\": \"MXFP8\", \"group_size\": 32}}},");
+    assert!(ModelSpec::from_json(&cfg, None).is_err(), "dense mixed precision needs --format");
+    let s = ModelSpec::from_json(&cfg, Some(WeightFormat::Bf16)).unwrap();
+    assert!(s.declared_mixed && s.formats.is_empty());
+    let d = single("mixed-override", bf16(tensors(false)));
+    let err = bind(&Checkpoint::open(&d).unwrap(), &s).err().expect("binding must refuse").to_string();
+    assert!(err.contains("mixed-precision"), "{err}");
+}

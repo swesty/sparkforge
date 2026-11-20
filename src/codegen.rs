@@ -296,6 +296,14 @@ fn fill(t: &str, kv: &[(&str, String)]) -> String {
     s
 }
 
+/// Fails, naming the model, when nothing in `g` is generated. Callers check this before creating
+/// a CUDA context, so a planned-only model reports the reason even on a host without a GPU.
+pub fn require_generated(g: &Generated, arch: &str) -> anyhow::Result<()> {
+    anyhow::ensure!(g.kernels.iter().any(|k| k.status == "generated"),
+        "{arch}: no kernels are generated for this model yet (its op classes are planned; see `sparkforge plan`)");
+    Ok(())
+}
+
 pub fn generate(p: &Plan) -> Generated {
     let m = &p.model;
     let mut kernels = vec![];
