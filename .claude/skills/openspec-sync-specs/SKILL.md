@@ -53,13 +53,14 @@ This is an **agent-driven** operation - you will read delta specs and directly e
 
    a. **Read the delta spec** to understand the intended changes
 
-   b. **Read the main spec** at `openspec/specs/<capability>/spec.md` (may not exist yet)
+   b. **Read the main spec** at `<planningHome.root>/openspec/specs/<capability>/spec.md` (may not exist yet). Take `planningHome.root` from the status JSON above so a change selected from another store updates that store's specs, never the current directory's
 
    c. **Apply changes intelligently**:
 
       **ADDED Requirements:**
       - If requirement doesn't exist in main spec → add it
-      - If requirement already exists → update it to match (treat as implicit MODIFIED)
+      - If a requirement with that name already exists and its text and scenarios already match the delta → leave it unchanged (the addition was already applied, so re-syncing is a no-op)
+      - If it exists with different content → do not overwrite it; show both versions and ask the user how to reconcile (a later change may have edited it)
 
       **MODIFIED Requirements:**
       - Find the requirement in main spec
@@ -76,7 +77,7 @@ This is an **agent-driven** operation - you will read delta specs and directly e
       - Find the FROM requirement, rename to TO
 
    d. **Create new main spec** if capability doesn't exist yet:
-      - Create `openspec/specs/<capability>/spec.md`
+      - Create `<planningHome.root>/openspec/specs/<capability>/spec.md`
       - Add Purpose section (can be brief, mark as TBD)
       - Add Requirements section with the ADDED requirements
 

@@ -66,7 +66,7 @@ When ready to implement, run /opsx:apply
         - `resolvedOutputPath`: Resolved path or pattern to write the artifact
         - `dependencies`: Completed artifacts to read for context
       - Read any completed dependency files for context
-      - Create the artifact file using `template` as the structure and write it to `resolvedOutputPath`
+      - Create the artifact file using `template` as the structure and write it to `resolvedOutputPath`. If `resolvedOutputPath` is a glob (the `specs` artifact returns `<changeRoot>/specs/**/*.md`), never write to that literal path: write one delta spec per capability the change touches, at `<changeRoot>/specs/<capability>/spec.md`
       - Apply `context` and `rules` as constraints - but do NOT copy them into the file
       - Show brief progress: "Created <artifact-id>"
 

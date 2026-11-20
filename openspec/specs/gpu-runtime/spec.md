@@ -34,7 +34,7 @@ kernel whose dynamic shared memory exceeds 48 KB it SHALL set
 otherwise fails.
 
 #### Scenario: Large activation vector
-- **WHEN** a GEMV with K greater than 24576 (more than 48 KB of staged activations) is loaded
+- **WHEN** a GEMV with K greater than 24576 and at most 50688 (more than 48 KB of staged activations, within the 101376 B limit) is loaded
 - **THEN** its function has the dynamic shared memory attribute set to 2*K bytes
 
 ### Requirement: The feature compiles without CUDA installed

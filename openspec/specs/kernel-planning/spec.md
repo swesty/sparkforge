@@ -36,11 +36,17 @@ active = experts per token, plus `shared_gate_up`/`shared_down` when shared expe
 
 Each decode GEMV SHALL use 8 warps per block and choose rows-per-warp as the first of 4, 2, 1 that
 divides N and still yields at least 4 blocks per SM (192 blocks); otherwise 1. The activation
-vector SHALL be staged in shared memory (2*K bytes).
+vector SHALL be staged in shared memory (2*K bytes). When 2*K exceeds the 101,376 B per-block limit
+(K above 50,688) the plan SHALL still record the GEMV but SHALL add a note naming it, its K and its
+shared-memory need; codegen then leaves it `planned` (see kernel-codegen).
 
 #### Scenario: lm_head
 - **WHEN** Llama 3.1 8B's `lm_head` (N = 128256) is planned
 - **THEN** it uses 4 rows per warp and a grid of 4008 blocks
+
+#### Scenario: Activation vector too large to stage
+- **WHEN** a dense config with `hidden_size` 16384 and no `intermediate_size` is planned (down_proj K = 65536)
+- **THEN** the plan notes that `gemv down_proj` needs 131072 B, above the 101376 B limit
 
 ### Requirement: Prefill tiles are chosen by a legal-configuration search
 
@@ -58,8 +64,13 @@ efficiency, tile intensity, pipelining). MoE expert linears SHALL be planned at 
 ### Requirement: Decode attention splits fill the GPU
 
 Decode attention SHALL use 8 warps per CTA, one CTA per (kv_head, split), with
-splits = ceil(2*48 / kv_heads) clamped to [1, ctx/256], and shared memory
+splits = ceil(2*48 / kv_heads) clamped to [1, max(1, floor(ctx/256))], so every context length,
+including those below 256 tokens, gets at least one split; and shared memory
 warps * group * (head_dim + 2) * 4 bytes.
+
+#### Scenario: Short contexts
+- **WHEN** Llama 3.1 8B (8 KV heads) is planned at contexts of 128, 255, 256 and 512 tokens
+- **THEN** it gets 1, 1, 1 and 2 splits
 
 #### Scenario: Grids for the examples
 - **WHEN** both examples are planned at a 32768-token context
@@ -81,8 +92,8 @@ cache at the planned context).
 
 The plan SHALL include a note when `qk_norm` or `qkv_bias` is set (output is wrong until the feature
 is generated), when head_dim is not a multiple of 32, when hidden is not a multiple of 8, when
-weights are NVFP4, when weights plus KV exceed one Spark, and the MoE tokens-per-expert used for
-grouped tiles.
+weights are NVFP4, when weights plus KV exceed one Spark, when a GEMV's staged activation vector
+exceeds the shared-memory limit, and the MoE tokens-per-expert used for grouped tiles.
 
 #### Scenario: Qwen3 note
 - **WHEN** Qwen3-30B-A3B is planned
