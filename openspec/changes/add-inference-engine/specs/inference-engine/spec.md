@@ -65,6 +65,25 @@ MUST come after the wait.
 - **WHEN** consecutive tokens route to different experts and the step runs with overlapped launches and then serialized
 - **THEN** the logits of every step are bitwise identical between the two runs
 
+### Requirement: Speculation runs only with a resident PLE table
+
+Speculative decoding SHALL run only when the PLE table is resident in GPU memory. When the memory
+budget keeps the table on disk, the engine MUST run non-speculative decode and report that
+speculation is disabled and why, instead of failing or staging table rows inside a step.
+
+#### Scenario: Resident table denied
+- **WHEN** a request selects MTP k=4 and the memory budget keeps the PLE table on disk
+- **THEN** the request completes with non-speculative decode and the run reports speculation as disabled because the table is on disk
+
+### Requirement: Streamed output keeps every step's tokens in order
+
+Each step's accepted tokens and count SHALL stay paired in a result slot that is not reused until
+the host has copied it, so output is complete and in order however late the host reads.
+
+#### Scenario: Delayed reader
+- **WHEN** the host reads results late while consecutive speculative steps accept different numbers of drafts
+- **THEN** the streamed tokens equal the tokens accepted, in order, with none dropped or duplicated
+
 ### Requirement: Greedy output is identical with and without speculation
 
 With temperature 0, the token sequence produced with speculative decoding enabled MUST equal the

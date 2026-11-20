@@ -44,7 +44,10 @@ Plain-text tokenization lives in this change (task 1.4), because `generate` need
 - [ ] 4.6 Context-limit headroom: every buffer verify writes (linear KV, MTP-layer KV, indexer caches, token history) holds k+1 provisional slots beyond the limit, counted in the memory budget. Verify: k=4 with 1, 2, 3 and 4 positions left before the limit keeps every write in bounds (checked by a bounds-checking debug build), commits nothing past the limit, and matches sequential decode, on a GB10.
 - [ ] 4.7 PLE token history follows the committed prefix and the causal part of the block. Verify: forced 2-of-4 acceptance where the accepted and rejected histories map to different n-gram rows gives the accepted row and logits equal to sequential decode, on a GB10.
 - [ ] 4.8 Greedy output identical with MTP off and with MTP k=4. Verify: the 4 A/B prompts at 256 tokens produce identical token ids.
-- [ ] 4.9 Measure MTP decode. Verify: tok/s and per-draft acceptance on the A/B prompts against the fleet's ~50 tok/s on the same GB10, plus the distinct experts per verify step.
+- [ ] 4.9 Speculation requires the resident PLE table. Verify: with the memory guard denying residency, an MTP k=4 request completes with non-speculative decode and reports why, on a GB10.
+- [ ] 4.10 Per-replay result slots for streaming. Verify: a deliberately delayed host reader receives complete, ordered tokens across consecutive steps that accept different numbers of drafts.
+- [ ] 4.11 Draft and verify PLE gathers depend on the draft nodes that produce their token ids. Verify: consecutive replays with different draft ids give verify logits bitwise identical to a serialized gather.
+- [ ] 4.12 Measure MTP decode. Verify: tok/s and per-draft acceptance on the A/B prompts against the fleet's ~50 tok/s on the same GB10, plus the distinct experts per verify step.
 
 ## 5. Prefill chunk graph (M7)
 
