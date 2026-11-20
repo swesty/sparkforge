@@ -48,7 +48,14 @@ virtual address (including a file mapping) is a valid GPU address.
    misaligned files in place.
 4. **Fused linears are packed once into a GPU allocation**, in the kernel's row order.
 5. **Memory guard on Linux** reads `MemAvailable` from `/proc/meminfo` and refuses when the bytes
-   to copy exceed `MemAvailable - 4 GiB`.
+   to copy exceed `MemAvailable - 4 GiB`. Admission is serialized: an advisory `flock` on
+   `$XDG_RUNTIME_DIR/sparkforge-gpu-admission.lock` (else a private `sparkforge-<uid>` temp
+   directory) is held from the `MemAvailable` reading until every allocation is made and filled,
+   so a concurrent load's reading already reflects this one (codex-review cycle 2). It coordinates
+   one user's sparkforge processes; other programs, such as a resident vLLM, are seen only through
+   `MemAvailable`. Measured on GB10: of two concurrent Llama 3.2 1B loads, the second printed that
+   it was waiting, then both passed. The post-load figure is sampled inside the upload while the
+   weights are resident.
 6. **Binding is name-based and explicit.** For each layer the expected tensor names and shapes are
    generated from the `ModelSpec`; anything missing is an error naming the tensor and the expected
    shape; anything present but unused is listed as unexpected (some checkpoints carry extra
@@ -61,6 +68,18 @@ virtual address (including a file mapping) is a valid GPU address.
    4 MiB chunks per thread (16 threads). The guard admits a load only if copied bytes plus that
    overhead leave 4 GiB of `MemAvailable`. `verify-weights` on Llama 3.1 8B peaks at 225 MB of host
    RSS (it previously built a 4.2 GB f64 copy of `lm_head`).
+
+9. **Untrusted checkpoints fail closed** (codex-review cycle 2). Index shard names must be plain
+   relative paths (no absolute paths or `..`), checked lexically so that Hugging Face cache
+   snapshots, whose shards are symlinks to `../../blobs/<hash>`, still open. Repeated keys in
+   `weight_map` or a shard header are errors (serde's maps would keep the last one). Shards are
+   opened with `O_NONBLOCK` and must be regular files, so a FIFO cannot hang `open`.
+10. **One checkpoint version per load.** Each shard's (dev, inode, length, mtime, ctime) is recorded
+   at open, re-checked after the header read, and re-checked after every read. A match after a read
+   means no write reached the file before those bytes were read, so a load cannot mix two versions.
+   Limitation: timestamps have filesystem granularity (Linux uses a coarse clock, a few ms), so a
+   write within the same tick as the open can go unseen. Hashing every tensor would close that gap
+   at the cost of a second pass over 14 GB and was not pursued.
 
 ## Risks / Trade-offs
 

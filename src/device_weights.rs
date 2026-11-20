@@ -3,7 +3,7 @@
 //! Every linear is copied into one GPU allocation; fused linears are packed in kernel row order
 //! (q|k|v, gate|up). Reading the memory-mapped file in place through ATS was measured and
 //! rejected: see openspec/changes/add-weight-loading/design.md, decision 2.
-use crate::weights::{check_headroom, load_overhead_bytes, mem_available, Binding, BoundLinear, Checkpoint, STAGING_BYTES};
+use crate::weights::{admission_lock_path, admit, load_overhead_bytes, mem_available, Binding, BoundLinear, Checkpoint, STAGING_BYTES};
 use anyhow::{Context, Result};
 use cudarc::driver::{CudaSlice, CudaStream, DevicePtr};
 use std::collections::HashMap;
@@ -22,6 +22,8 @@ pub struct DeviceWeights {
     pub linears: HashMap<String, DeviceTensor>,
     pub bytes_copied: u64,
     pub load_secs: f64,
+    /// `MemAvailable` sampled right after the copy, while every allocation above is live.
+    pub mem_available_after: Option<u64>,
 }
 
 /// Bytes the load will copy into GPU allocations.
@@ -35,11 +37,13 @@ pub fn bytes_to_copy(ck: &Checkpoint, b: &Binding) -> u64 {
 
 /// `verifying` adds the reference computation's scratch to the memory guard (see
 /// `weights::load_overhead_bytes`), so the guard covers the peak of the whole command.
+///
+/// Admission is serialized across sparkforge processes: the lock is held until every allocation
+/// is made and filled, so a concurrent load's guard sees this one's memory as used.
 pub fn upload(stream: &Arc<CudaStream>, ck: &Checkpoint, b: &Binding, verifying: bool) -> Result<DeviceWeights> {
-    let avail = mem_available().context("cannot read MemAvailable from /proc/meminfo; refusing to allocate without the memory guard")?;
-    check_headroom(bytes_to_copy(ck, b) + load_overhead_bytes(b, verifying), avail)?;
+    let _admission = admit(&admission_lock_path()?, bytes_to_copy(ck, b) + load_overhead_bytes(b, verifying), mem_available)?;
     let t0 = Instant::now();
-    let mut out = DeviceWeights { linears: HashMap::new(), bytes_copied: 0, load_secs: 0.0 };
+    let mut out = DeviceWeights { linears: HashMap::new(), bytes_copied: 0, load_secs: 0.0, mem_available_after: None };
     let mut buf = vec![0u8; STAGING_BYTES as usize];
     for l in &b.linears {
         let t = copy_linear(stream, ck, l, &mut buf).with_context(|| format!("copying {}", l.key()))?;
@@ -48,6 +52,7 @@ pub fn upload(stream: &Arc<CudaStream>, ck: &Checkpoint, b: &Binding, verifying:
     }
     stream.synchronize()?;
     out.load_secs = t0.elapsed().as_secs_f64();
+    out.mem_available_after = mem_available();
     Ok(out)
 }
 

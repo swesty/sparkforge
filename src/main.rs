@@ -157,8 +157,9 @@ fn main() -> Result<()> {
             let avail0 = sparkforge::weights::mem_available().unwrap_or(0);
             let rep = verify::verify_weights(&p, &g, &e, &ck, &b, seed)?;
             println!("{} ({} layers), MemAvailable at start {:.1} GiB", p.model.arch, p.model.layers, avail0 as f64 / (1u64 << 30) as f64);
-            println!("loaded {:.2} GiB into GPU memory in {:.2} s; MemAvailable after load {:.1} GiB", rep.bytes_copied as f64 / (1u64 << 30) as f64,
-                rep.load_secs, sparkforge::weights::mem_available().unwrap_or(0) as f64 / (1u64 << 30) as f64);
+            // Sampled inside the upload while the weights were resident, not here after they were freed.
+            println!("loaded {:.2} GiB into GPU memory in {:.2} s; MemAvailable with the weights resident {}", rep.bytes_copied as f64 / (1u64 << 30) as f64,
+                rep.load_secs, rep.mem_available_after_load.map_or("unknown".into(), |a| format!("{:.1} GiB", a as f64 / (1u64 << 30) as f64)));
             println!("{:<13} {:<16} {:>10} {:>5} {:>10} {:>8}", "linear", "case", "max err", "ok", "us", "GB/s");
             let mut fails = 0;
             for r in &rep.rows {

@@ -7,11 +7,17 @@
 //!
 //! Every read is a fallible positioned read. Nothing is memory-mapped: a mapped file that another
 //! process truncates turns a read into SIGBUS, while `pread` returns an error we can report.
+//!
+//! Untrusted-input rules (codex-review cycles 1 and 2): shard names from the index must stay inside
+//! the checkpoint directory; repeated JSON keys are errors, not last-one-wins; shards are opened
+//! without blocking and must be regular files; and a shard modified after it was opened fails the
+//! next read instead of mixing two versions of the checkpoint.
 use crate::config::{ModelSpec, WeightFormat};
 use anyhow::{bail, ensure, Context, Result};
-use std::collections::{BTreeMap, HashMap};
+use serde::de::{Deserializer, IgnoredAny, MapAccess, Visitor};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::File;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 /// Largest header we accept (the reference safetensors implementation uses the same 100 MB cap).
 const MAX_HEADER_BYTES: u64 = 100 << 20;
@@ -38,9 +44,130 @@ impl TensorInfo {
 
 pub struct Shard {
     pub path: PathBuf,
-    /// File length when opened; every read re-checks it so a rewritten shard is an error.
+    /// File length when opened.
     pub len: u64,
+    /// Identity and modification stamp when opened; every read re-checks it afterwards.
+    stamp: FileStamp,
     file: File,
+}
+
+/// What identifies one version of an open file. A write after open changes `ctime` (which no
+/// unprivileged call can set back) and usually `mtime`; truncation changes `len`.
+///
+/// Limitation: timestamps have the filesystem's granularity (on Linux, the kernel's coarse clock,
+/// a few ms), so a write landing in the same tick as the open can go unseen. Detection is
+/// best-effort against concurrent writers, not a cryptographic snapshot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FileStamp {
+    len: u64,
+    #[cfg(unix)]
+    id: (u64, u64, i64, i64, i64, i64),
+    #[cfg(not(unix))]
+    modified: Option<std::time::SystemTime>,
+}
+
+impl FileStamp {
+    fn of(file: &File) -> std::io::Result<Self> {
+        let m = file.metadata()?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            Ok(FileStamp { len: m.len(), id: (m.dev(), m.ino(), m.mtime(), m.mtime_nsec(), m.ctime(), m.ctime_nsec()) })
+        }
+        #[cfg(not(unix))]
+        {
+            Ok(FileStamp { len: m.len(), modified: m.modified().ok() })
+        }
+    }
+}
+
+/// Opens a shard without blocking (a FIFO with no writer would otherwise hang `open`) and requires
+/// the opened descriptor to be a regular file. Symlinks are followed: a Hugging Face cache snapshot
+/// links each shard to `../../blobs/<hash>`.
+fn open_shard(path: &Path) -> Result<File> {
+    let mut opts = std::fs::OpenOptions::new();
+    opts.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.custom_flags(libc::O_NONBLOCK);
+    }
+    let file = opts.open(path).with_context(|| format!("opening {}", path.display()))?;
+    let m = file.metadata().with_context(|| format!("inspecting {}", path.display()))?;
+    ensure!(m.file_type().is_file(), "{} is not a regular file", path.display());
+    Ok(file)
+}
+
+/// Index shard names must be plain relative paths inside the checkpoint directory: no absolute
+/// paths, no `..`, no drive prefixes. (Lexical only; symlinked shards are allowed, see `open_shard`.)
+fn check_shard_name(name: &str) -> Result<()> {
+    let p = Path::new(name);
+    ensure!(
+        !name.is_empty() && p.components().all(|c| matches!(c, Component::Normal(_))),
+        "index names shard {name:?}, which is not a plain relative path inside the checkpoint directory"
+    );
+    Ok(())
+}
+
+/// A JSON object whose keys must be unique. serde's map types keep the last of repeated keys, which
+/// would let a malformed file pass validation with a meaning that depends on the reader.
+struct UniqueMap<V>(Vec<(String, V)>);
+
+impl<'de, V: serde::Deserialize<'de>> serde::Deserialize<'de> for UniqueMap<V> {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
+        struct V_<V>(std::marker::PhantomData<V>);
+        impl<'de, V: serde::Deserialize<'de>> Visitor<'de> for V_<V> {
+            type Value = UniqueMap<V>;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("a JSON object with unique keys")
+            }
+            fn visit_map<A: MapAccess<'de>>(self, mut a: A) -> std::result::Result<Self::Value, A::Error> {
+                let mut seen = HashSet::new();
+                let mut out = vec![];
+                while let Some(k) = a.next_key::<String>()? {
+                    if !seen.insert(k.clone()) {
+                        return Err(serde::de::Error::custom(format!("duplicate key {k:?}")));
+                    }
+                    out.push((k, a.next_value()?));
+                }
+                Ok(UniqueMap(out))
+            }
+        }
+        d.deserialize_map(V_(std::marker::PhantomData))
+    }
+}
+
+/// A safetensors header: tensor entries plus an optional `__metadata__` object, keys unique.
+struct Header(Vec<(String, RawTensor)>);
+
+impl<'de> serde::Deserialize<'de> for Header {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
+        struct HV;
+        impl<'de> Visitor<'de> for HV {
+            type Value = Header;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("a safetensors header object")
+            }
+            fn visit_map<A: MapAccess<'de>>(self, mut a: A) -> std::result::Result<Header, A::Error> {
+                let mut seen = HashSet::new();
+                let mut out = vec![];
+                while let Some(k) = a.next_key::<String>()? {
+                    if !seen.insert(k.clone()) {
+                        return Err(serde::de::Error::custom(format!("duplicate tensor name {k:?}")));
+                    }
+                    if k == "__metadata__" {
+                        a.next_value::<IgnoredAny>()?;
+                    } else {
+                        // RawTensor's derived impl rejects repeated fields such as two `dtype`s.
+                        let t: RawTensor = a.next_value().map_err(|e| serde::de::Error::custom(format!("tensor {k}: {e}")))?;
+                        out.push((k, t));
+                    }
+                }
+                Ok(Header(out))
+            }
+        }
+        d.deserialize_map(HV)
+    }
 }
 
 pub struct Checkpoint {
@@ -96,11 +223,14 @@ impl Checkpoint {
         let index: Option<BTreeMap<String, String>> = if index_path.exists() {
             #[derive(serde::Deserialize)]
             struct Index {
-                weight_map: BTreeMap<String, String>,
+                weight_map: UniqueMap<String>,
             }
             let idx: Index = serde_json::from_str(&std::fs::read_to_string(&index_path)?)
                 .with_context(|| format!("parsing {}", index_path.display()))?;
-            Some(idx.weight_map)
+            for (_, shard) in &idx.weight_map.0 {
+                check_shard_name(shard)?;
+            }
+            Some(idx.weight_map.0.into_iter().collect())
         } else {
             None
         };
@@ -117,8 +247,9 @@ impl Checkpoint {
         for f in &shard_files {
             let path = dir.join(f);
             ensure!(path.exists(), "shard {} is missing", path.display());
-            let file = File::open(&path).with_context(|| format!("opening {}", path.display()))?;
-            let len = file.metadata()?.len();
+            let file = open_shard(&path)?;
+            let stamp = FileStamp::of(&file)?;
+            let len = stamp.len;
             let shard = ck.shards.len();
             for t in read_header(&path, &file, len, shard)? {
                 if let Some(m) = &index {
@@ -133,7 +264,10 @@ impl Checkpoint {
                 }
                 ck.tensors.insert(t.name.clone(), t);
             }
-            ck.shards.push(Shard { path, len, file });
+            // A write between the open and the header read would make the header disagree with the
+            // stamp every later read is checked against.
+            ensure!(FileStamp::of(&file)? == stamp, "{} changed while its header was being read", path.display());
+            ck.shards.push(Shard { path, len, stamp, file });
         }
         if let Some(m) = &index {
             for (name, declared) in m {
@@ -144,14 +278,23 @@ impl Checkpoint {
     }
 
     /// Reads `buf.len()` bytes of tensor `t` starting `off` bytes into it. Fails, rather than
-    /// faulting, if the range is outside the tensor or the shard changed size since it was opened.
+    /// faulting, if the range is outside the tensor or the shard was modified since it was opened.
+    ///
+    /// The stamp is checked *after* the read: if it still matches the one taken at open, no write
+    /// reached the file (to timestamp granularity) before these bytes were read, so every chunk of a
+    /// load comes from the version that was validated. A same-length rewrite between two chunks
+    /// fails the second chunk instead of silently mixing versions.
     pub fn read_range(&self, t: &TensorInfo, off: u64, buf: &mut [u8]) -> Result<()> {
         let end = off.checked_add(buf.len() as u64).context("read range overflows")?;
         ensure!(end <= t.len(), "read of {}..{end} is outside tensor {} ({} bytes)", off, t.name, t.len());
         let shard = &self.shards[t.shard];
-        let now = shard.file.metadata()?.len();
-        ensure!(now == shard.len, "{} changed size since it was opened ({} -> {now} bytes)", shard.path.display(), shard.len);
-        pread(&shard.file, buf, t.start + off).with_context(|| format!("reading {} from {}", t.name, shard.path.display()))
+        let before = FileStamp::of(&shard.file)?;
+        ensure!(before.len == shard.len, "{} changed size since it was opened ({} -> {} bytes)", shard.path.display(), shard.len, before.len);
+        pread(&shard.file, buf, t.start + off).with_context(|| format!("reading {} from {}", t.name, shard.path.display()))?;
+        let after = FileStamp::of(&shard.file)?;
+        ensure!(after.len == shard.len, "{} changed size since it was opened ({} -> {} bytes)", shard.path.display(), shard.len, after.len);
+        ensure!(after == shard.stamp, "{} was modified since it was opened; refusing to mix checkpoint versions", shard.path.display());
+        Ok(())
     }
 
     /// Reads a whole tensor into `buf` (resized to fit).
@@ -178,14 +321,9 @@ fn read_header(path: &Path, file: &File, file_len: u64, shard: usize) -> Result<
 /// absolute offsets, then requires the non-empty ranges to tile the data section exactly.
 fn parse_header(path: &Path, header: &[u8], data_start: u64, file_len: u64, shard: usize) -> Result<Vec<TensorInfo>> {
     let data_len = file_len - data_start;
-    let raw: BTreeMap<String, serde_json::Value> =
-        serde_json::from_slice(header).with_context(|| format!("{}: parsing header JSON", path.display()))?;
+    let raw: Header = serde_json::from_slice(header).with_context(|| format!("{}: parsing header JSON", path.display()))?;
     let mut out = vec![];
-    for (name, v) in raw {
-        if name == "__metadata__" {
-            continue;
-        }
-        let t: RawTensor = serde_json::from_value(v).with_context(|| format!("{}: tensor {name}", path.display()))?;
+    for (name, t) in raw.0 {
         let [b, e] = t.data_offsets;
         ensure!(b <= e && e <= data_len, "{}: tensor {name} byte range {b}..{e} lies outside the file's {data_len}-byte data section", path.display());
         let elem = dtype_size(&t.dtype).with_context(|| format!("{}: tensor {name} has unknown dtype {}", path.display(), t.dtype))?;
@@ -403,6 +541,71 @@ pub fn check_headroom(copy_bytes: u64, mem_available: u64) -> Result<()> {
         HEADROOM_BYTES as f64 / (1u64 << 30) as f64
     );
     Ok(())
+}
+
+/// Proof that this process passed the memory guard. Hold it until the admitted allocations are
+/// made: a second sparkforge load blocks in `admit` until then, so its `MemAvailable` reading
+/// already reflects this one. Without it, two loads started together could both read the same
+/// `MemAvailable` and both pass (codex-review cycle 2).
+pub struct Admission {
+    _lock: File,
+}
+
+/// Takes the cross-process admission lock at `lock_path` (blocking), then runs the memory guard
+/// against `mem()` for `need` bytes. The lock is an advisory `flock`, so it coordinates sparkforge
+/// processes that use the same path; other programs are seen only through `MemAvailable`.
+pub fn admit(lock_path: &Path, need: u64, mem: impl Fn() -> Option<u64>) -> Result<Admission> {
+    let mut opts = std::fs::OpenOptions::new();
+    opts.read(true).write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+    }
+    let lock = opts.open(lock_path).with_context(|| format!("opening the admission lock {}", lock_path.display()))?;
+    match lock.try_lock() {
+        Ok(()) => {}
+        Err(std::fs::TryLockError::WouldBlock) => {
+            eprintln!("waiting for another sparkforge load to finish allocating ({})", lock_path.display());
+            lock.lock().with_context(|| format!("locking {}", lock_path.display()))?;
+        }
+        Err(std::fs::TryLockError::Error(e)) => return Err(e).with_context(|| format!("locking {}", lock_path.display())),
+    }
+    let avail = mem().context("cannot read MemAvailable from /proc/meminfo; refusing to allocate without the memory guard")?;
+    check_headroom(need, avail)?;
+    Ok(Admission { _lock: lock })
+}
+
+/// Where sparkforge processes of this user meet: `$XDG_RUNTIME_DIR` (private, per user) when set,
+/// else a `sparkforge-<uid>` directory under the temp dir that must be ours and not group/other
+/// writable.
+pub fn admission_lock_path() -> Result<PathBuf> {
+    const NAME: &str = "sparkforge-gpu-admission.lock";
+    if let Some(d) = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from).filter(|d| d.is_dir()) {
+        return Ok(d.join(NAME));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+        let uid = unsafe { libc::geteuid() };
+        let d = std::env::temp_dir().join(format!("sparkforge-{uid}"));
+        match std::fs::DirBuilder::new().mode(0o700).create(&d) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(e).with_context(|| format!("creating {}", d.display())),
+        }
+        let m = std::fs::symlink_metadata(&d)?;
+        ensure!(
+            m.file_type().is_dir() && m.uid() == uid && m.mode() & 0o022 == 0,
+            "{} must be a directory owned by uid {uid} and not writable by others",
+            d.display()
+        );
+        Ok(d.join(NAME))
+    }
+    #[cfg(not(unix))]
+    {
+        Ok(std::env::temp_dir().join(NAME))
+    }
 }
 
 /// `MemAvailable` from /proc/meminfo in bytes (Linux only).

@@ -25,6 +25,16 @@
 - [x] 3b.4 Drop mmap; fallible positioned reads with a shard-size check (`cargo test`: truncation after open is an error)
 - [x] 3b.5 Bounded staging and streaming f64 reference; guard budgets both (`cargo test`; Llama 3.1 8B verify peaks at 225 MB host RSS on GB10)
 
+## 3c. codex-review cycle 2
+
+- [x] 3c.1 Test fixtures use fresh 0700 directories created with non-recursive `mkdir` (`cargo test`: planted directory and symlink are refused)
+- [x] 3c.2 Memory admission serialized across processes with a per-user `flock` held until allocations are made (`cargo test`: two 14 GiB loads with 20 GiB available; GB10: second concurrent load waits)
+- [x] 3c.3 Reads re-check the shard's identity and modification stamp after every read (`cargo test`: same-length rewrite between chunks fails)
+- [x] 3c.4 Duplicate keys rejected in `weight_map` and shard headers (`cargo test`: literal JSON)
+- [x] 3c.5 Index shard names must be plain relative paths (`cargo test`: `../` and absolute fail, HF cache symlink still opens)
+- [x] 3c.6 Shards opened with `O_NONBLOCK` and must be regular files (`cargo test`: FIFO fails within 5 s)
+- [x] 3c.7 Post-load `MemAvailable` sampled inside the upload while weights are resident (GB10: Llama 3.1 8B reports 11.3 GiB)
+
 ## 4. Verification on GB10
 
 - [x] 4.1 `verify-weights` subcommand: f64 reference GEMVs for first/last layer and lm_head, timing across all layers, load report

@@ -25,7 +25,9 @@ shape; otherwise opening fails naming the shard and tensor.
 ### Requirement: Index entries match their shards
 
 Every index entry MUST name the shard whose header holds that tensor, every tensor in a shard header
-MUST be listed in the index, and every shard the index names MUST exist.
+MUST be listed in the index, and every shard the index names MUST exist. Shard names MUST be plain
+relative paths inside the checkpoint directory (no absolute paths or `..`); symlinked shards, as in
+a Hugging Face cache snapshot, are allowed.
 
 #### Scenario: Sharded checkpoint
 - **WHEN** a directory holds an index and four shards
@@ -34,6 +36,19 @@ MUST be listed in the index, and every shard the index names MUST exist.
 #### Scenario: Swapped index entries
 - **WHEN** the index assigns a tensor to the other shard
 - **THEN** opening fails naming the tensor and the declared shard
+
+#### Scenario: Escaping index
+- **WHEN** every index entry names `../previous/model.safetensors` or an absolute path
+- **THEN** opening fails before any shard is opened, naming the offending shard name
+
+### Requirement: Repeated JSON keys are rejected
+
+A tensor name that appears twice in the index's `weight_map` or in a shard header MUST make opening
+fail, rather than keeping one of the entries.
+
+#### Scenario: Duplicate index key
+- **WHEN** the index lists `model.norm.weight` twice, first pointing at a missing shard
+- **THEN** opening fails naming the duplicate key
 
 ### Requirement: Tensors tile each shard's data section exactly
 
@@ -46,12 +61,25 @@ no unaccounted bytes; empty tensors are allowed.
 
 ### Requirement: A shard that changes after opening is an error
 
-Tensor reads SHALL be fallible positioned reads; a shard whose size changed since it was opened MUST
-produce an error rather than terminating the process.
+Tensor reads SHALL be fallible positioned reads. A read MUST fail, rather than terminate the process
+or return bytes from a different version, when the shard's size, identity or modification stamp
+differs from when it was opened, checked after each read (to filesystem timestamp granularity).
 
 #### Scenario: Truncated after validation
 - **WHEN** a shard is truncated after the checkpoint was opened and before a tensor is read
 - **THEN** the read fails stating that the shard changed size
+
+#### Scenario: Same-length rewrite between chunks
+- **WHEN** a tensor's later bytes are rewritten in place, keeping the file length, after its first chunk was read
+- **THEN** reading the next chunk fails stating that the shard was modified
+
+### Requirement: Shards are regular files opened without blocking
+
+Shards SHALL be opened without blocking, and the opened file MUST be a regular file.
+
+#### Scenario: FIFO shard
+- **WHEN** the shard path is a FIFO with no writer
+- **THEN** opening fails promptly stating that it is not a regular file
 
 ### Requirement: Every tensor the plan needs is present with the planned shape and dtype
 
@@ -106,11 +134,16 @@ about 35% below device memory once warm. The load report SHALL state the bytes c
 
 On Linux, a load SHALL be refused before allocating if the bytes it would copy, plus its bounded
 staging buffer and, when verifying, the reference computation's scratch, exceed `MemAvailable`
-minus 4 GiB. Neither uploads nor references SHALL hold a whole tensor in host memory.
+minus 4 GiB. Admission SHALL be serialized across the user's sparkforge processes until the admitted
+allocations are made. Neither uploads nor references SHALL hold a whole tensor in host memory.
 
 #### Scenario: Too large to copy
 - **WHEN** the bytes to copy plus overhead exceed `MemAvailable` minus 4 GiB
 - **THEN** loading fails before any GPU allocation, stating both numbers
+
+#### Scenario: Concurrent loads
+- **WHEN** two sparkforge loads of 14 GiB start together with 20 GiB available
+- **THEN** the second waits until the first has allocated, then is refused
 
 #### Scenario: Wide vocabulary
 - **WHEN** `verify-weights` checks Llama 3.1 8B's `lm_head` (1.05 GB of weights)

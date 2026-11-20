@@ -364,6 +364,9 @@ pub struct WeightReport {
     pub rows: Vec<WeightRow>,
     pub load_secs: f64,
     pub bytes_copied: u64,
+    /// `MemAvailable` sampled by `upload` while the weights were resident. The weights are freed
+    /// when `verify_weights` returns, so a sample taken by the caller would overstate headroom.
+    pub mem_available_after_load: Option<u64>,
 }
 
 /// GEMVs on real checkpoint weights against an f64 reference, timed across all layers.
@@ -381,7 +384,12 @@ pub fn verify_weights(
     let mut rng = Rng(seed | 1);
     let last = p.model.layers.saturating_sub(1);
     let dw = upload(&s, ck, b, true)?;
-    let mut rep = WeightReport { rows: vec![], load_secs: dw.load_secs, bytes_copied: dw.bytes_copied };
+    let mut rep = WeightReport {
+        rows: vec![],
+        load_secs: dw.load_secs,
+        bytes_copied: dw.bytes_copied,
+        mem_available_after_load: dw.mem_available_after,
+    };
     {
         for linear in ["qkv_proj", "o_proj", "gate_up_proj", "down_proj", "lm_head"] {
             let entry = format!("gemv_{linear}");
