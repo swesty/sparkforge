@@ -51,6 +51,9 @@ framework (`~/.claude/CLAUDE.md`) by **scope**. Read this before multi-step work
   leave a multi-capability sync half-applied, race the archive move, and overwrite a re-synced
   ADDED requirement (upstream Fission-AI/OpenSpec#2289).
 - **Refresh the skills only with `tools/openspec-refresh.sh`**, never a bare `openspec update`. It
-  refuses to run unless `openspec --version` is the pinned 2.1.1, then runs `openspec update`,
-  removes the two skills above, and checks the layout. Never run `openspec update --force` here: it
-  also deletes the global `~/.codex/prompts/opsx-*` files other repos use.
+  refuses to run unless `openspec --version` is the pinned 2.1.1, then runs `openspec update` on
+  the repo that contains the script, removes the two skills above (only their generated
+  `SKILL.md`, even when the update fails), and checks that each `.claude/skills` link resolves to
+  its own `.agents/skills` directory. Never run `openspec update --force` here: it also deletes the
+  global `~/.codex/prompts/opsx-*` files other repos use. After changing the script, run
+  `tools/test-openspec-refresh.sh` (stub `openspec`, no GPU or network needed).

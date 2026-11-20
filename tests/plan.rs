@@ -84,6 +84,26 @@ fn unsupported_configs_fail_loudly_instead_of_planning_wrong_math() {
 }
 
 #[test]
+fn gptq_and_awq_at_unsupported_bit_widths_are_rejected_unless_overridden() {
+    let base = r#"{"hidden_size": 2048, "num_hidden_layers": 2, "num_attention_heads": 16, "vocab_size": 1000,
+                   "quantization_config": QUANT}"#;
+    let cfg = |q: &str| base.replace("QUANT", q);
+    let gptq8 = cfg(r#"{"quant_method": "gptq", "bits": 8, "group_size": 128}"#);
+    let awq8 = cfg(r#"{"quant_method": "awq", "bits": 8, "group_size": 128}"#);
+    // No override: only 4-bit maps to W4A16, so 8 bits must not be read as 4-bit weights.
+    let msg = format!("{:#}", spec(&gptq8).unwrap_err());
+    assert!(msg.contains("bits Some(8)") && msg.contains("--format"), "{msg}");
+    assert!(spec(&awq8).is_err());
+    assert!(spec(&cfg(r#"{"quant_method": "gptq", "bits": 3, "group_size": 128}"#)).is_err());
+    assert!(spec(&cfg(r#"{"quant_method": "awq", "group_size": 128}"#)).is_err(), "missing bits");
+    // An explicit --format still replaces detection.
+    let s = ModelSpec::from_json(&awq8, Some(sparkforge::config::WeightFormat::Bf16)).unwrap();
+    assert!(matches!(s.weights, sparkforge::config::WeightFormat::Bf16));
+    let s = ModelSpec::from_json(&gptq8, Some(sparkforge::config::WeightFormat::Bf16)).unwrap();
+    assert!(matches!(s.weights, sparkforge::config::WeightFormat::Bf16));
+}
+
+#[test]
 fn unimplemented_attention_features_are_flagged_in_the_plan() {
     let p = load("configs/qwen3-30b-a3b.json");
     assert!(p.model.qk_norm);
