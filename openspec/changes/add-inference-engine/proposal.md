@@ -55,4 +55,4 @@ None in this change. Each of the following lands as its own change against its o
 - An OpenAI-compatible HTTP server, tool-call and reasoning parsers, and guided JSON decoding. These belong to the later `serving-api` change.
 - A whole-model persistent megakernel. It is estimated at 3–5% over graph plus PDL and needs a grid-barrier measurement first.
 - Models other than Qwen3.8 Flash Next. Llama 3.1 8B BF16 is used only as the runtime proving ground (SHA-755).
-- Bit-identical output to the fleet engine. Agreement is judged within the fleet's own logprob noise band.
+- Bit-identical output to the fleet engine. Each error is judged against the fleet engine's own measured noise floor.

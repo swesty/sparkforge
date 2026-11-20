@@ -88,33 +88,61 @@ sampling. Draft-only approximations MUST NOT change the target probabilities.
 
 After a verify step accepts j of k draft tokens, every recurrent state (linear-attention state and
 convolution state) MUST equal what non-speculative decoding would hold after the same accepted
-tokens. The engine SHALL keep a committed KV length, and every KV reader, including the sparse
-attention indexer and its caches, MUST ignore positions at or beyond it.
+tokens.
 
 #### Scenario: Partial acceptance
 - **WHEN** a verify step accepts 2 of 4 drafts
 - **THEN** the next step's recurrent state matches a non-speculative run over the same tokens within kernel tolerance
 
+### Requirement: Each verify query sees exactly its causal prefix
+
+In a verify step whose block starts at committed length C, the query at block offset i SHALL see
+positions below C + i + 1 and none after, in attention and in the sparse indexer alike. After
+acceptance, only the accepted prefix SHALL become visible to later steps.
+
+#### Scenario: Earlier position in the same block
+- **WHEN** the indexer for the query at offset 2 would select the key at offset 1 of the same block
+- **THEN** that key is eligible, keys at offsets 3 and later are not, and the logits are bitwise identical to sequential decode
+
 #### Scenario: Rejected KV suffix
 - **WHEN** a verify step appended KV for 4 drafts and accepted 2
 - **THEN** the next step's attention and indexer select the same positions as non-speculative decoding and never a rejected one
 
+### Requirement: Speculative writes never destroy committed state
+
+A verify step's provisional writes MUST NOT overwrite any KV, indexer or raw-key entry that remains
+live after the step, whatever number of drafts is accepted. Circular buffers SHALL reserve room for
+a full verify block beyond their live window.
+
+#### Scenario: Partial acceptance across a ring wrap
+- **WHEN** a full raw-key ring receives a 5-position verify block across its wrap point and 2 positions are accepted
+- **THEN** the next step's keys, selected positions and logits equal sequential decode
+
 ### Requirement: Correctness is gated before speed is claimed
 
-A model's engine MUST pass a per-layer comparison against reference activations, and a
-teacher-forced top-1 agreement check against a reference engine within that engine's own noise
-band, before any tok/s result for it is recorded as a milestone.
+Before a model's tok/s is recorded as a milestone, its engine MUST pass a per-layer activation
+comparison and a teacher-forced check against a reference engine on a fixed reference set. Each
+error SHALL be at most 1.5 times the reference engine's own noise floor, and top-1 agreement SHALL
+meet a minimum rather than fall inside a band.
 
 #### Scenario: Golden diff
 - **WHEN** the engine processes a teacher-forced reference sequence
-- **THEN** it reports per-layer maximum and mean error against the reference activations and the top-1 agreement at the final layer
+- **THEN** it reports per-layer error, top-1 agreement, logprob differences and mean log-likelihood, each with a PASS or FAIL against its limit
+
+#### Scenario: Closer than the band
+- **WHEN** top-1 agreement is 97.5%, above the reference engine's 96.5–97.1% noise band
+- **THEN** the agreement check passes
+
+#### Scenario: Mis-scaled output head
+- **WHEN** every final logit is doubled, leaving top-1 agreement unchanged
+- **THEN** the logprob and log-likelihood checks fail
 
 ### Requirement: Numerics-changing options are opt-in and gated
 
 An option that changes target numerics, such as lower-precision copies of checkpoint weights, MUST
-be off by default and SHALL pass a gate on a fixed reference set: top-1 agreement within the
-reference engine's noise band, and mean and 99th-percentile absolute logprob difference at most 10%
-above the checkpoint-precision engine's. A failing option MUST report FAIL and stay off.
+be off by default and SHALL pass a gate on the fixed reference set: every correctness limit, and
+mean and 99th-percentile absolute logprob difference at most 10% above the checkpoint-precision
+engine's. A failing option MUST report FAIL and stay off.
 
 #### Scenario: MXFP8 HyperConnection weights
 - **WHEN** the user enables the MXFP8 HyperConnection weight option

@@ -21,8 +21,8 @@ Plain-text tokenization lives in this change (task 1.4), because `generate` need
 
 - [ ] 2.1 Step program for the Flash Next layer schedule (36 GDN + 12 QSA, HC, MoE, PLE at layer 2). Verify: `cargo test` checks the step program's per-step bytes equal the planner's 7.34 GB ±1%.
 - [ ] 2.2 Engine memory budget covering weights, KV, GDN state, snapshots, activations and workspaces. Verify: `cargo test` covers the refusal arithmetic; on spark-5 with the fleet lane running, the engine refuses with the budget message and leaves the lane untouched.
-- [ ] 2.3 Per-layer golden diff against activations dumped teacher-forced from the fleet stack. Verify: per-layer max and mean error, and final-layer top-1 agreement, recorded in the PR.
-- [ ] 2.4 Teacher-forced reference check against the fleet engine on the fixed reference set (design decision 9), reporting top-1 agreement and the mean and 99th-percentile absolute logprob difference. Verify: top-1 agreement within 96.5–97.1%, with the logprob figures recorded as the checkpoint-precision baseline.
+- [ ] 2.3 Measure the reference noise floor (design decision 9): two fleet-engine runs on the reference set that differ only in kernel rounding. Verify: per-layer error, top-1 agreement, mean and p99 absolute logprob difference, and the mean log-likelihood difference recorded in the PR and checked in as the gate's limits.
+- [ ] 2.4 Per-layer golden diff and teacher-forced check against the fleet engine, with PASS/FAIL against those limits. Verify: top-1 agreement of at least 96.5%, and every other metric at most 1.5 times its floor. `cargo test` covers the gate arithmetic: it passes 97.5% agreement, fails 96.4%, and fails a run whose logits are doubled with top-1 unchanged.
 - [ ] 2.5 End-to-end greedy decode with a graph per step. Verify: tok/s at 4K, 32K and 128K context on a GB10 (spark-5 lane stopped with operator approval), at least 28 tok/s against the 33 tok/s ceiling.
 
 ## 3. Fusions, PDL and launch count (M5: SHA-750)
@@ -36,9 +36,13 @@ Plain-text tokenization lives in this change (task 1.4), because `generate` need
 - [ ] 4.1 Draft (M=1, k times) and verify (M=k+1) step graphs, with rejection sampling. Verify: `cargo test` checks the acceptance logic against a reference implementation on fixed probabilities.
 - [ ] 4.2 Shape-invariant target computation: every kernel used by verify computes each position with the same reduction partition and order as the M=1 decode kernel (design decision 7). Verify: over 512 positions, verify-step logits are bitwise identical to decode-step logits, including a constructed near-tie position, on a GB10.
 - [ ] 4.3 Snapshot recurrent and convolution state per verify position, and roll back to the last accepted one. Verify: after partial acceptance, state matches a non-speculative run over the same tokens within kernel tolerance, on a GB10.
-- [ ] 4.4 Committed KV length in the step header: attention, the sparse indexer and its compressed cache read only up to it, and rejected positions are overwritten by the next step. Verify: force 2-of-4 acceptance and check that the next step's selected positions and logits equal non-speculative decoding, on a GB10.
-- [ ] 4.5 Greedy output identical with MTP off and with MTP k=4. Verify: the 4 A/B prompts at 256 tokens produce identical token ids.
-- [ ] 4.6 Measure MTP decode. Verify: tok/s and per-draft acceptance on the A/B prompts against the fleet's ~50 tok/s on the same GB10, plus the distinct experts per verify step.
+- [ ] 4.4 Committed KV length in the step header, and per-query causal bounds in verify (query i reads below C+i+1, in attention and the indexer). Verify on a GB10:
+  - a verify block where the indexer selects an earlier in-block key gives logits bitwise identical to sequential decode;
+  - later keys in the block are never selected;
+  - after forced 2-of-4 acceptance, the next step's selected positions and logits equal non-speculative decoding.
+- [ ] 4.5 Circular buffers (the raw-key ring, and the compressed indexer cache if circular) sized to the live window plus k+1, with the head advanced only on commit. Verify: a full ring, a 5-position verify block across the wrap, and 2 accepted positions give next-step keys, selected positions and logits equal to sequential decode, on a GB10.
+- [ ] 4.6 Greedy output identical with MTP off and with MTP k=4. Verify: the 4 A/B prompts at 256 tokens produce identical token ids.
+- [ ] 4.7 Measure MTP decode. Verify: tok/s and per-draft acceptance on the A/B prompts against the fleet's ~50 tok/s on the same GB10, plus the distinct experts per verify step.
 
 ## 5. Prefill chunk graph (M7)
 
@@ -47,7 +51,7 @@ Plain-text tokenization lives in this change (task 1.4), because `generate` need
 
 ## 6. Opt-in byte reductions (M9: SHA-781)
 
-- [ ] 6.1 Precision gate: a run on the reference set (design decision 9) passes only if top-1 agreement stays within the fleet band and the mean and 99th-percentile absolute logprob difference exceed the checkpoint-precision baseline from task 2.4 by at most 10%. Otherwise the option reports FAIL and stays off. Verify: `cargo test` rejects a synthetic case with unchanged top-1 and out-of-tolerance logprobs.
+- [ ] 6.1 Precision gate: a run on the reference set (design decision 9) passes only if it meets every limit of task 2.4 and its mean and 99th-percentile absolute logprob difference exceed the checkpoint-precision baseline from task 2.4 by at most 10%. Otherwise the option reports FAIL and stays off. Verify: `cargo test` rejects a synthetic case with unchanged top-1 and out-of-tolerance logprobs.
 - [ ] 6.2 MXFP8 HyperConnection weight option, off by default and subject to the gate. Verify: tok/s and the gate result with and without it, on a GB10.
 - [ ] 6.3 Truncated-vocabulary draft head option, off by default. Verify: tok/s and acceptance with and without it; greedy output still identical with MTP on and off.
 
