@@ -484,3 +484,143 @@ fn a_quantized_checkpoint_behind_a_bf16_config_is_refused_before_gpu_work() {
     let err = bind(&Checkpoint::open(&d).unwrap(), &spec(false)).err().expect("binding must refuse").to_string();
     assert!(err.contains("model.layers.0.self_attn.o_proj.weight: expected dtype BF16, found F8_E4M3"), "{err}");
 }
+
+// ---- SHA-765: loader hardening ----
+
+#[cfg(unix)]
+fn my_uid() -> u32 { unsafe { libc::geteuid() } }
+
+#[cfg(unix)]
+fn chmod(p: &std::path::Path, mode: u32) {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(p, std::fs::Permissions::from_mode(mode)).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn the_node_lock_is_shared_by_every_user_and_needs_trusted_provisioning() {
+    use sparkforge::weights::{admission_lock_path_in, LockScope};
+    let root = dir("node-lock");
+    let node = root.join("run-sparkforge");
+    std::fs::create_dir(&node).unwrap();
+    chmod(&node, 0o755);
+    std::fs::write(node.join("admission.lock"), b"").unwrap();
+    // Provisioned and owned by the trusted owner: every uid resolves to the same node-wide lock.
+    let (home, run) = (root.join("home"), root.join("no-run-user"));
+    let a = admission_lock_path_in(&node, my_uid(), 1000, &run, &home).unwrap();
+    let b = admission_lock_path_in(&node, my_uid(), 1001, &run, &home).unwrap();
+    assert_eq!(a, b);
+    assert_eq!(a, (node.join("admission.lock"), LockScope::Node));
+    // Writable by others: refused, not silently replaced by a per-user lock.
+    chmod(&node, 0o777);
+    let err = format!("{:#}", admission_lock_path_in(&node, my_uid(), 1000, &run, &home).unwrap_err());
+    assert!(err.contains("not a directory owned by"), "{err}");
+    // Owned by someone other than the trusted owner: refused too.
+    chmod(&node, 0o755);
+    assert!(admission_lock_path_in(&node, my_uid() + 1, 1000, &run, &home).is_err());
+}
+
+#[cfg(unix)]
+#[test]
+fn without_a_node_lock_the_user_lock_comes_from_ownership_not_the_environment() {
+    use sparkforge::weights::{admission_lock_path_in, LockScope};
+    let root = dir("user-lock");
+    let node = root.join("absent-node-dir");
+    let run = root.join("run-user");
+    std::fs::create_dir(&run).unwrap();
+    chmod(&run, 0o700);
+    let home = root.join("home");
+    std::fs::create_dir(&home).unwrap();
+    // A private /run/user/<uid> is used whatever XDG_RUNTIME_DIR says (the function reads no env).
+    let (p, scope) = admission_lock_path_in(&node, 0, my_uid(), &run, &home).unwrap();
+    assert_eq!((p.parent().unwrap(), scope), (run.as_path(), LockScope::User));
+    // A /run/user directory others can write is skipped for a private directory under home.
+    chmod(&run, 0o777);
+    let (p, _) = admission_lock_path_in(&node, 0, my_uid(), &run, &home).unwrap();
+    assert_eq!(p.parent().unwrap(), home.join(".local/state/sparkforge"));
+    use std::os::unix::fs::PermissionsExt;
+    assert_eq!(std::fs::metadata(p.parent().unwrap()).unwrap().permissions().mode() & 0o777, 0o700);
+    // The old shared fallback (<tmp>/sparkforge-<uid>) is never used, so a pre-claimed entry there cannot block loads.
+    assert!(!p.starts_with(std::env::temp_dir().join(format!("sparkforge-{}", my_uid()))));
+}
+
+#[test]
+fn admission_is_decided_on_the_host_before_any_cuda_call() {
+    use sparkforge::weights::admit_load_with;
+    let d = single("admit-host", bf16(tensors(false)));
+    let ck = Checkpoint::open(&d).unwrap();
+    let b = bind(&ck, &spec(false)).unwrap();
+    let lock = dir("admit-host-lock").join("admission.lock");
+    // A machine with 1 GiB available refuses before anything touches the GPU.
+    let err = admit_load_with(&ck, &b, true, &lock, || Some(1 << 30)).err().expect("over budget").to_string();
+    assert!(err.contains("refusing to copy"), "{err}");
+    assert!(admit_load_with(&ck, &b, true, &lock, || Some(64 << 30)).is_ok());
+}
+
+#[cfg(unix)]
+#[test]
+fn a_checkpoint_is_read_from_one_generation_even_if_its_symlink_moves() {
+    let root = dir("generations");
+    let (a, b) = (root.join("gen-a"), root.join("gen-b"));
+    for g in [&a, &b] {
+        std::fs::create_dir(g).unwrap();
+        write_shard(&g.join("model.safetensors"), &bf16(tensors(false)), 0);
+    }
+    // Make generation B's bytes differ.
+    let mut bytes = std::fs::read(b.join("model.safetensors")).unwrap();
+    let n = bytes.len();
+    bytes[n - 1] ^= 0xff;
+    std::fs::write(b.join("model.safetensors"), bytes).unwrap();
+    let current = root.join("current");
+    std::os::unix::fs::symlink(&a, &current).unwrap();
+    let ck = Checkpoint::open(&current).unwrap();
+    assert_eq!(ck.dir, std::fs::canonicalize(&a).unwrap(), "the directory is resolved once, to generation A");
+    // Switch the symlink to generation B after opening: reads still come from A.
+    std::fs::remove_file(&current).unwrap();
+    std::os::unix::fs::symlink(&b, &current).unwrap();
+    let t = ck.tensors.values().max_by_key(|t| t.end).unwrap();
+    let mut got = vec![0u8; 1];
+    ck.read_range(t, t.len() - 1, &mut got).unwrap();
+    let want = std::fs::read(a.join("model.safetensors")).unwrap();
+    assert_eq!(got[0], want[want.len() - 1]);
+    assert_eq!(sparkforge::weights::resolve_checkpoint_dir(&current).unwrap(), std::fs::canonicalize(&b).unwrap());
+}
+
+#[cfg(unix)]
+#[test]
+fn a_fifo_config_or_index_fails_promptly() {
+    for name in ["config.json", "model.safetensors.index.json"] {
+        let d = dir("fifo-meta");
+        write_shard(&d.join("model.safetensors"), &bf16(tensors(false)), 0);
+        let c = std::ffi::CString::new(d.join(name).as_os_str().as_encoded_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let d2 = d.clone();
+        let is_config = name == "config.json";
+        std::thread::spawn(move || {
+            let r = if is_config { sparkforge::weights::read_config(&d2).map(|_| ()) } else { Checkpoint::open(&d2).map(|_| ()) };
+            let _ = tx.send(r.err().map(|e| format!("{e:#}")));
+        });
+        let err = rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap_or_else(|_| panic!("{name}: must not block")).expect("must fail");
+        assert!(err.contains("not a regular file"), "{name}: {err}");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn a_dangling_index_symlink_is_an_error_not_a_fallback() {
+    let d = single("dangling-index", bf16(tensors(false)));
+    std::os::unix::fs::symlink(d.join("missing-index.json"), d.join("model.safetensors.index.json")).unwrap();
+    let err = format!("{:#}", Checkpoint::open(&d).err().expect("must fail"));
+    assert!(err.contains("model.safetensors.index.json"), "{err}");
+}
+
+#[test]
+fn an_untied_model_without_lm_head_is_refused() {
+    let ts: Vec<_> = bf16(tensors(false)).into_iter().filter(|t| t.0 != "lm_head.weight").collect();
+    let d = single("untied-no-head", ts);
+    let err = bind(&Checkpoint::open(&d).unwrap(), &spec(false)).err().expect("must fail").to_string();
+    assert!(err.contains("lm_head.weight"), "{err}");
+    // With tying on, the same checkpoint binds lm_head to the embedding.
+    assert!(bind(&Checkpoint::open(&d).unwrap(), &spec(true)).is_ok());
+}

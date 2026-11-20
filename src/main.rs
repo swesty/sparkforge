@@ -15,7 +15,9 @@ enum Fmt { Auto, Bf16, W4a16, Nvfp4 }
 
 /// Spec, plan and validated binding for a checkpoint directory (config.json beside the weights).
 fn open_checkpoint(dir: &std::path::Path) -> Result<(plan::Plan, sparkforge::weights::Checkpoint, sparkforge::weights::Binding)> {
-    let spec = ModelSpec::from_json(&std::fs::read_to_string(dir.join("config.json"))?, None)?;
+    // One resolution of the directory for the config, the index and every shard.
+    let dir = &sparkforge::weights::resolve_checkpoint_dir(dir)?;
+    let spec = ModelSpec::from_json(&sparkforge::weights::read_config(dir)?, None)?;
     let p = plan::build(&spec, &GB10, &plan::PlanOpts { prefill_tokens: 2048, ctx: 4096 });
     let ck = sparkforge::weights::Checkpoint::open(dir)?;
     let b = sparkforge::weights::bind(&ck, &spec)?;
@@ -166,10 +168,12 @@ fn main() -> Result<()> {
         Cmd::VerifyWeights { dir, cuda_include, seed } => {
             use sparkforge::verify;
             let (p, ck, b) = open_checkpoint(&dir)?;
+            let avail0 = sparkforge::weights::mem_available().unwrap_or(0);
+            // Admission (lock + memory guard) before any CUDA call; held through the upload.
+            let admission = sparkforge::weights::admit_load(&ck, &b, true)?;
             let g = codegen::generate(&p);
             let e = sparkforge::runtime::Engine::load(&g, &cuda_include)?;
-            let avail0 = sparkforge::weights::mem_available().unwrap_or(0);
-            let rep = verify::verify_weights(&p, &g, &e, &ck, &b, seed)?;
+            let rep = verify::verify_weights(&p, &g, &e, &ck, &b, seed, admission)?;
             println!("{} ({} layers), MemAvailable at start {:.1} GiB", p.model.arch, p.model.layers, avail0 as f64 / (1u64 << 30) as f64);
             // Sampled inside the upload while the weights were resident, not here after they were freed.
             println!("loaded {:.2} GiB into GPU memory in {:.2} s; MemAvailable with the weights resident {}", rep.bytes_copied as f64 / (1u64 << 30) as f64,

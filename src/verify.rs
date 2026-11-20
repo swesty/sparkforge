@@ -378,13 +378,14 @@ pub fn verify_weights(
     ck: &crate::weights::Checkpoint,
     b: &crate::weights::Binding,
     seed: u64,
+    admission: crate::weights::Admission,
 ) -> Result<WeightReport> {
     use crate::device_weights::upload;
     unsafe { e.ctx.disable_event_tracking() };
     let s = e.stream.clone();
     let mut rng = Rng(seed | 1);
     let last = p.model.layers.saturating_sub(1);
-    let dw = upload(&s, ck, b, true)?;
+    let dw = upload(&s, ck, b, admission)?;
     let mut rep = WeightReport {
         rows: vec![],
         load_secs: dw.load_secs,
