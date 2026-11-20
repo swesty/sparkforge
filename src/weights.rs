@@ -81,53 +81,112 @@ impl FileStamp {
     }
 }
 
-/// Opens a shard without blocking (a FIFO with no writer would otherwise hang `open`) and requires
-/// the opened descriptor to be a regular file. Symlinks are followed: a Hugging Face cache snapshot
-/// links each shard to `../../blobs/<hash>`.
-fn open_shard(path: &Path) -> Result<File> {
-    let mut opts = std::fs::OpenOptions::new();
-    opts.read(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.custom_flags(libc::O_NONBLOCK);
-    }
-    let file = opts.open(path).with_context(|| format!("opening {}", path.display()))?;
-    let m = file.metadata().with_context(|| format!("inspecting {}", path.display()))?;
-    ensure!(m.file_type().is_file(), "{} is not a regular file", path.display());
-    Ok(file)
-}
-
 /// Largest metadata file (config or index) read into memory; Flash Next's index is about 33 MB.
 const MAX_METADATA_BYTES: u64 = 256 << 20;
 
-/// Reads a small metadata file with the shard open rules: no blocking open (a FIFO fails instead
-/// of hanging), regular files only, and a size cap.
-fn read_metadata_file(path: &Path) -> Result<String> {
+/// A checkpoint directory opened once. The config, the index and every shard are opened relative
+/// to this descriptor (`openat`), so replacing the directory, or a symlink on its path, while a
+/// load runs cannot mix two generations (codex-review of SHA-765).
+pub struct CheckpointDir {
+    /// Canonical path at resolution time; used for messages only.
+    pub path: PathBuf,
+    #[cfg(unix)]
+    fd: File,
+}
+
+impl CheckpointDir {
+    fn entry(&self, name: &str) -> PathBuf {
+        self.path.join(name)
+    }
+
+    /// Opens `name` inside the directory without blocking (a FIFO with no writer would otherwise
+    /// hang `open`) and requires the opened descriptor to be a regular file. Symlinks are followed:
+    /// a Hugging Face cache snapshot links each shard to `../../blobs/<hash>`.
+    fn open(&self, name: &str) -> Result<File> {
+        let path = self.entry(name);
+        #[cfg(unix)]
+        let opened = {
+            use std::os::fd::{AsRawFd, FromRawFd};
+            let c = std::ffi::CString::new(name).with_context(|| format!("{name:?} contains a NUL byte"))?;
+            let fd = unsafe { libc::openat(self.fd.as_raw_fd(), c.as_ptr(), libc::O_RDONLY | libc::O_NONBLOCK | libc::O_CLOEXEC) };
+            if fd < 0 { Err(std::io::Error::last_os_error()) } else { Ok(unsafe { File::from_raw_fd(fd) }) }
+        };
+        #[cfg(not(unix))]
+        let opened = File::open(&path);
+        let file = match opened {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => bail!("{} is missing", path.display()),
+            Err(e) => return Err(e).with_context(|| format!("opening {}", path.display())),
+        };
+        let m = file.metadata().with_context(|| format!("inspecting {}", path.display()))?;
+        ensure!(m.file_type().is_file(), "{} is not a regular file", path.display());
+        Ok(file)
+    }
+
+    /// Whether the directory entry `name` exists; a dangling symlink counts as present.
+    fn has_entry(&self, name: &str) -> Result<bool> {
+        let path = self.entry(name);
+        #[cfg(unix)]
+        let r = {
+            use std::os::fd::AsRawFd;
+            let c = std::ffi::CString::new(name).with_context(|| format!("{name:?} contains a NUL byte"))?;
+            let mut st: libc::stat = unsafe { std::mem::zeroed() };
+            let rc = unsafe { libc::fstatat(self.fd.as_raw_fd(), c.as_ptr(), &mut st, libc::AT_SYMLINK_NOFOLLOW) };
+            if rc == 0 { Ok(()) } else { Err(std::io::Error::last_os_error()) }
+        };
+        #[cfg(not(unix))]
+        let r = std::fs::symlink_metadata(&path).map(|_| ());
+        match r {
+            Ok(()) => Ok(true),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(e).with_context(|| format!("inspecting {}", path.display())),
+        }
+    }
+
+    /// Reads a metadata file (config or index) with the shard open rules plus a size cap.
+    pub fn read_metadata(&self, name: &str) -> Result<String> {
+        let path = self.entry(name);
+        let file = self.open(name)?;
+        let len = file.metadata()?.len();
+        ensure!(len <= MAX_METADATA_BYTES, "{} is {len} bytes, above the {MAX_METADATA_BYTES}-byte metadata limit", path.display());
+        read_capped(file, MAX_METADATA_BYTES, &path.display().to_string())
+    }
+}
+
+/// Reads at most `cap` bytes of UTF-8. A source that yields more (a file that grew after its size
+/// was checked) is an error, never a silently truncated prefix that may still parse.
+pub fn read_capped(r: impl std::io::Read, cap: u64, what: &str) -> Result<String> {
     use std::io::Read;
-    let file = open_shard(path)?;
-    let len = file.metadata()?.len();
-    ensure!(len <= MAX_METADATA_BYTES, "{} is {len} bytes, above the {MAX_METADATA_BYTES}-byte metadata limit", path.display());
-    let mut s = String::with_capacity(len as usize);
-    file.take(MAX_METADATA_BYTES + 1).read_to_string(&mut s).with_context(|| format!("reading {}", path.display()))?;
-    Ok(s)
+    let mut buf = Vec::new();
+    r.take(cap + 1).read_to_end(&mut buf).with_context(|| format!("reading {what}"))?;
+    ensure!(buf.len() as u64 <= cap, "{what} grew past the {cap}-byte metadata limit while it was read");
+    String::from_utf8(buf).with_context(|| format!("{what} is not UTF-8"))
 }
 
-/// Resolves a checkpoint directory once to its canonical path, so the config, the index and every
-/// shard come from one generation even if a symlink along the path is switched while loading.
-pub fn resolve_checkpoint_dir(dir: &Path) -> Result<PathBuf> {
-    let d = std::fs::canonicalize(dir).with_context(|| format!("resolving checkpoint directory {}", dir.display()))?;
-    ensure!(d.is_dir(), "{} is not a directory", d.display());
-    Ok(d)
+/// Resolves a checkpoint directory once and opens it, so the config, the index and every shard
+/// come from one generation even if the directory or a symlink on its path is replaced mid-load.
+pub fn resolve_checkpoint_dir(dir: &Path) -> Result<CheckpointDir> {
+    let path = std::fs::canonicalize(dir).with_context(|| format!("resolving checkpoint directory {}", dir.display()))?;
+    ensure!(path.is_dir(), "{} is not a directory", path.display());
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        // O_NOFOLLOW: if the canonical entry became a symlink since `canonicalize`, fail.
+        let fd = std::fs::OpenOptions::new().read(true).custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+            .open(&path).with_context(|| format!("opening checkpoint directory {}", path.display()))?;
+        Ok(CheckpointDir { path, fd })
+    }
+    #[cfg(not(unix))]
+    Ok(CheckpointDir { path })
 }
 
-/// `config.json` of a resolved checkpoint directory, read with the metadata open rules.
-pub fn read_config(dir: &Path) -> Result<String> {
-    read_metadata_file(&dir.join("config.json"))
+/// `config.json` of an opened checkpoint directory, read with the metadata open rules.
+pub fn read_config(dir: &CheckpointDir) -> Result<String> {
+    dir.read_metadata("config.json")
 }
 
 /// Index shard names must be plain relative paths inside the checkpoint directory: no absolute
-/// paths, no `..`, no drive prefixes. (Lexical only; symlinked shards are allowed, see `open_shard`.)
+/// paths, no `..`, no drive prefixes. (Lexical only; symlinked shards are allowed, see `CheckpointDir::open`.)
 fn check_shard_name(name: &str) -> Result<()> {
     let p = Path::new(name);
     ensure!(
@@ -247,21 +306,21 @@ impl Checkpoint {
     /// index, every entry must name the shard whose header actually holds that tensor, and every
     /// tensor in a shard header must be listed in the index.
     pub fn open(dir: &Path) -> Result<Self> {
-        let dir = &resolve_checkpoint_dir(dir)?;
-        let index_path = dir.join("model.safetensors.index.json");
+        Self::open_dir(&resolve_checkpoint_dir(dir)?)
+    }
+
+    /// `open` on an already opened directory: the index and every shard are opened relative to it.
+    pub fn open_dir(dir: &CheckpointDir) -> Result<Self> {
+        const INDEX: &str = "model.safetensors.index.json";
+        let index_path = dir.entry(INDEX);
         // Presence is the directory entry itself: a dangling index symlink is an error, never a
         // silent fallback to a single-file checkpoint that may be stale.
-        let has_index = match std::fs::symlink_metadata(&index_path) {
-            Ok(_) => true,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
-            Err(e) => return Err(e).with_context(|| format!("inspecting {}", index_path.display())),
-        };
-        let index: Option<BTreeMap<String, String>> = if has_index {
+        let index: Option<BTreeMap<String, String>> = if dir.has_entry(INDEX)? {
             #[derive(serde::Deserialize)]
             struct Index {
                 weight_map: UniqueMap<String>,
             }
-            let idx: Index = serde_json::from_str(&read_metadata_file(&index_path)?)
+            let idx: Index = serde_json::from_str(&dir.read_metadata(INDEX)?)
                 .with_context(|| format!("parsing {}", index_path.display()))?;
             for (_, shard) in &idx.weight_map.0 {
                 check_shard_name(shard)?;
@@ -279,11 +338,10 @@ impl Checkpoint {
             }
             None => vec!["model.safetensors".into()],
         };
-        let mut ck = Checkpoint { dir: dir.to_path_buf(), shards: vec![], tensors: HashMap::new() };
+        let mut ck = Checkpoint { dir: dir.path.clone(), shards: vec![], tensors: HashMap::new() };
         for f in &shard_files {
-            let path = dir.join(f);
-            ensure!(path.exists(), "shard {} is missing", path.display());
-            let file = open_shard(&path)?;
+            let path = dir.entry(f);
+            let file = dir.open(f).context("opening a shard")?;
             let stamp = FileStamp::of(&file)?;
             let len = stamp.len;
             let shard = ck.shards.len();
@@ -582,64 +640,117 @@ pub fn check_headroom(copy_bytes: u64, mem_available: u64) -> Result<()> {
     Ok(())
 }
 
-/// Proof that this process passed the memory guard. Hold it until the admitted allocations are
-/// made: a second sparkforge load blocks in `admit` until then, so its `MemAvailable` reading
-/// already reflects this one. Without it, two loads started together could both read the same
-/// `MemAvailable` and both pass (codex-review cycle 2).
+/// Proof that this process passed the memory guard for `copy_bytes` plus `overhead`. Hold it until
+/// the admitted allocations are made: a second sparkforge load blocks in `admit` until then, so its
+/// `MemAvailable` reading already reflects this one. Without it, two loads started together could
+/// both read the same `MemAvailable` and both pass (codex-review cycle 2).
 pub struct Admission {
-    _lock: File,
+    _locks: Vec<File>,
+    copy_bytes: u64,
+    overhead: u64,
 }
 
-/// Takes the cross-process admission lock at `lock_path` (blocking), then runs the memory guard
-/// against `mem()` for `need` bytes. The lock is an advisory `flock`, so it coordinates sparkforge
-/// processes that use the same path; other programs are seen only through `MemAvailable`.
-pub fn admit(lock_path: &Path, need: u64, mem: impl Fn() -> Option<u64>) -> Result<Admission> {
-    let mut opts = std::fs::OpenOptions::new();
-    // Read access is enough for flock; it also opens a root-owned node lock that other users may
-    // read but not write.
-    opts.read(true).write(false).create(false);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.custom_flags(libc::O_NOFOLLOW);
+impl Admission {
+    /// Bytes of weights this admission covers.
+    pub fn copy_bytes(&self) -> u64 {
+        self.copy_bytes
     }
-    if !lock_path.exists() {
-        // A per-user lock is created on first use, private to this user.
+
+    /// Re-checks, under the held locks and right before allocating, that this admission covers the
+    /// workload actually being copied, and that `MemAvailable` still leaves the headroom: CUDA
+    /// startup between admission and upload uses memory too (codex-review of SHA-765).
+    pub fn confirm(&self, copy_bytes: u64, mem: impl Fn() -> Option<u64>) -> Result<()> {
+        ensure!(
+            copy_bytes <= self.copy_bytes,
+            "this upload copies {copy_bytes} bytes but its admission covers only {} bytes; take admission for the binding being uploaded",
+            self.copy_bytes
+        );
+        let avail = mem().context("cannot read MemAvailable from /proc/meminfo; refusing to allocate without the memory guard")?;
+        check_headroom(copy_bytes + self.overhead, avail)
+    }
+}
+
+/// Longest wait for another process's admission before giving up, so a stuck or hostile holder
+/// turns into an error instead of an indefinite hang.
+pub const ADMISSION_WAIT: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+
+/// Opens an admission lock read-only (enough for `flock`) without following a final symlink and
+/// without blocking, and requires a regular file: a FIFO there fails promptly. A missing per-user
+/// lock is created private to this user first.
+fn open_lock(path: &Path) -> Result<File> {
+    #[cfg(unix)]
+    use std::os::unix::fs::OpenOptionsExt;
+    if matches!(std::fs::symlink_metadata(path), Err(e) if e.kind() == std::io::ErrorKind::NotFound) {
         let mut create = std::fs::OpenOptions::new();
         create.write(true).create_new(true);
         #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            create.mode(0o600).custom_flags(libc::O_NOFOLLOW);
-        }
-        match create.open(lock_path) {
+        create.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+        match create.open(path) {
             Ok(_) => {}
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
-            Err(e) => return Err(e).with_context(|| format!("creating the admission lock {}", lock_path.display())),
+            Err(e) => return Err(e).with_context(|| format!("creating the admission lock {}", path.display())),
         }
     }
-    let lock = opts.open(lock_path).with_context(|| format!("opening the admission lock {}", lock_path.display()))?;
-    match lock.try_lock() {
-        Ok(()) => {}
-        Err(std::fs::TryLockError::WouldBlock) => {
-            eprintln!("waiting for another sparkforge load to finish allocating ({})", lock_path.display());
-            lock.lock().with_context(|| format!("locking {}", lock_path.display()))?;
-        }
-        Err(std::fs::TryLockError::Error(e)) => return Err(e).with_context(|| format!("locking {}", lock_path.display())),
-    }
-    let avail = mem().context("cannot read MemAvailable from /proc/meminfo; refusing to allocate without the memory guard")?;
-    check_headroom(need, avail)?;
-    Ok(Admission { _lock: lock })
+    let mut opts = std::fs::OpenOptions::new();
+    opts.read(true);
+    #[cfg(unix)]
+    opts.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    let lock = match opts.open(path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => bail!(
+            "this account cannot open the admission lock {}; the node lock is shared through its group, so ask an administrator to add this user to that group",
+            path.display()
+        ),
+        Err(e) => return Err(e).with_context(|| format!("opening the admission lock {}", path.display())),
+    };
+    let m = lock.metadata().with_context(|| format!("inspecting {}", path.display()))?;
+    ensure!(m.file_type().is_file(), "the admission lock {} is not a regular file", path.display());
+    Ok(lock)
 }
 
-/// Root-provisioned directory holding the node-wide admission lock (a deploy step on each GB10):
-/// `install -d -m 0755 -o root /run/sparkforge && install -m 0644 -o root /dev/null
-/// /run/sparkforge/admission.lock`. `/run` is tmpfs, so a boot-time unit recreates it.
+/// Takes the `flock` on `path`, waiting at most `wait` for the current holder.
+fn take_lock(path: &Path, wait: std::time::Duration) -> Result<File> {
+    let lock = open_lock(path)?;
+    let deadline = std::time::Instant::now() + wait;
+    let mut told = false;
+    loop {
+        match lock.try_lock() {
+            Ok(()) => return Ok(lock),
+            Err(std::fs::TryLockError::WouldBlock) => {
+                if !told {
+                    eprintln!("waiting for another sparkforge load to finish allocating ({})", path.display());
+                    told = true;
+                }
+                ensure!(std::time::Instant::now() < deadline,
+                    "gave up after {} s waiting for the admission lock {}; another process has held it that long", wait.as_secs(), path.display());
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            Err(std::fs::TryLockError::Error(e)) => return Err(e).with_context(|| format!("locking {}", path.display())),
+        }
+    }
+}
+
+/// Takes every lock in `locks`, in order (see `AdmissionLocks::paths`), then runs the memory guard
+/// against `mem()` for `copy_bytes + overhead`. The locks are advisory `flock`s, so they coordinate
+/// sparkforge processes; other programs are seen only through `MemAvailable`.
+pub fn admit(locks: &[&Path], copy_bytes: u64, overhead: u64, mem: impl Fn() -> Option<u64>, wait: std::time::Duration) -> Result<Admission> {
+    ensure!(!locks.is_empty(), "no admission lock to take");
+    let held = locks.iter().map(|p| take_lock(p, wait)).collect::<Result<Vec<_>>>()?;
+    let avail = mem().context("cannot read MemAvailable from /proc/meminfo; refusing to allocate without the memory guard")?;
+    check_headroom(copy_bytes + overhead, avail)?;
+    Ok(Admission { _locks: held, copy_bytes, overhead })
+}
+
+/// Root-provisioned directory holding the node-wide admission lock (a deploy step on each GB10).
+/// The lock is shared through a group, never with every account, so a local account outside that
+/// group cannot hold it and stall other users' loads. `/run` is tmpfs, so a boot-time
+/// `tmpfiles.d` entry recreates it:
+/// `d /run/sparkforge 0755 root root -` and `f /run/sparkforge/admission.lock 0640 root sparkforge -`.
 pub const NODE_LOCK_DIR: &str = "/run/sparkforge";
 const NODE_LOCK_NAME: &str = "admission.lock";
 const USER_LOCK_NAME: &str = "sparkforge-gpu-admission.lock";
 
-/// Which processes an admission lock coordinates.
+/// Which processes an admission coordinates with.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LockScope {
     /// Every user's sparkforge processes on this node (the node-wide lock is provisioned).
@@ -649,21 +760,42 @@ pub enum LockScope {
     User,
 }
 
-/// Lock location, decided from ownership only, never from environment variables, so a login shell
-/// and a scheduled job of the same user always meet at the same lock.
-/// - The node-wide lock when `node_dir` is a real directory owned by `trusted_owner` (root in
-///   production) holding a regular `admission.lock`. No other user can claim that path.
-/// - Otherwise this user's `run_user` directory (`/run/user/<uid>`) if it is ours and not
-///   writable by others, else `<home>/.local/state/sparkforge`, created private.
-///
-/// A `node_dir` that exists but is not trustworthy is an error, not a silent fallback.
-pub fn admission_lock_path_in(node_dir: &Path, trusted_owner: u32, uid: u32, run_user: &Path, home: &Path) -> Result<(PathBuf, LockScope)> {
+/// The locks one admission takes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdmissionLocks {
+    /// This user's lock under the password-database home directory. It doesn't depend on a login
+    /// session, so a background job and a login shell always meet here. Optional only when the
+    /// node lock is available.
+    pub user: Option<PathBuf>,
+    /// The node-wide lock, when provisioned.
+    pub node: Option<PathBuf>,
+}
+
+impl AdmissionLocks {
+    pub fn scope(&self) -> LockScope {
+        if self.node.is_some() { LockScope::Node } else { LockScope::User }
+    }
+
+    /// The order they are taken: user, then node. Taking the user lock first also covers turning
+    /// the node lock on while this user's earlier load (which held only the user lock) is still
+    /// allocating.
+    pub fn paths(&self) -> Vec<&Path> {
+        self.user.iter().chain(self.node.iter()).map(|p| p.as_path()).collect()
+    }
+}
+
+/// Lock locations, decided from ownership only, never from environment variables.
+/// - The node lock when `node_dir` is a real directory owned by `trusted_owner` (root in
+///   production) and closed to writes by others, holding a regular `admission.lock` owned by
+///   `trusted_owner` that grants no access to every account (only its group can open it). A
+///   `node_dir` that exists but fails these checks is an error, not a silent fallback.
+/// - The user lock in `<home>/.local/state/sparkforge` (created 0700). `home` is consulted only
+///   here, so a numeric uid without a password entry can still use a provisioned node lock.
+pub fn admission_locks_in(node_dir: &Path, trusted_owner: u32, uid: u32, home: impl FnOnce() -> Option<PathBuf>) -> Result<AdmissionLocks> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::{DirBuilderExt, MetadataExt};
-        let private_dir = |d: &Path| std::fs::symlink_metadata(d)
-            .is_ok_and(|m| m.file_type().is_dir() && m.uid() == uid && m.mode() & 0o022 == 0);
-        match std::fs::symlink_metadata(node_dir) {
+        let node = match std::fs::symlink_metadata(node_dir) {
             Ok(m) => {
                 ensure!(m.file_type().is_dir() && m.uid() == trusted_owner && m.mode() & 0o022 == 0,
                     "{} exists but is not a directory owned by uid {trusted_owner} and closed to writes by others; fix the provisioning or remove it", node_dir.display());
@@ -671,38 +803,44 @@ pub fn admission_lock_path_in(node_dir: &Path, trusted_owner: u32, uid: u32, run
                 let lm = std::fs::symlink_metadata(&lock).with_context(|| format!("{} is provisioned without {NODE_LOCK_NAME}", node_dir.display()))?;
                 ensure!(lm.file_type().is_file() && lm.uid() == trusted_owner,
                     "{} must be a regular file owned by uid {trusted_owner}", lock.display());
-                return Ok((lock, LockScope::Node));
+                ensure!(lm.mode() & 0o007 == 0,
+                    "{} grants access to every account (mode {:o}), so any local account could hold it and stall every load; share it through a group (mode 0640)", lock.display(), lm.mode() & 0o777);
+                Some(lock)
             }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
             Err(e) => return Err(e).with_context(|| format!("inspecting {}", node_dir.display())),
-        }
-        if private_dir(run_user) {
-            return Ok((run_user.join(USER_LOCK_NAME), LockScope::User));
-        }
-        let d = home.join(".local/state/sparkforge");
-        std::fs::DirBuilder::new().recursive(true).mode(0o700).create(&d).with_context(|| format!("creating {}", d.display()))?;
-        ensure!(private_dir(&d), "{} must be a directory owned by uid {uid} and not writable by others", d.display());
-        Ok((d.join(USER_LOCK_NAME), LockScope::User))
+        };
+        let user = (|| -> Result<PathBuf> {
+            let home = home().with_context(|| format!("no home directory for uid {uid} in the password database, and {} is not provisioned", node_dir.display()))?;
+            let d = home.join(".local/state/sparkforge");
+            std::fs::DirBuilder::new().recursive(true).mode(0o700).create(&d).with_context(|| format!("creating {}", d.display()))?;
+            let private = std::fs::symlink_metadata(&d).is_ok_and(|m| m.file_type().is_dir() && m.uid() == uid && m.mode() & 0o022 == 0);
+            ensure!(private, "{} must be a directory owned by uid {uid} and not writable by others", d.display());
+            Ok(d.join(USER_LOCK_NAME))
+        })();
+        // With the node lock, the user lock only adds same-user cutover cover, so it is optional.
+        let user = if node.is_some() { user.ok() } else { Some(user?) };
+        Ok(AdmissionLocks { user, node })
     }
     #[cfg(not(unix))]
     {
-        let _ = (node_dir, trusted_owner, uid, run_user);
-        Ok((home.join(USER_LOCK_NAME), LockScope::User))
+        let _ = (node_dir, trusted_owner, uid);
+        let home = home().unwrap_or_else(std::env::temp_dir);
+        Ok(AdmissionLocks { user: Some(home.join(USER_LOCK_NAME)), node: None })
     }
 }
 
-/// The production lock location: `/run/sparkforge` owned by root, this process's effective uid,
-/// `/run/user/<uid>`, and the home directory from the password database (not `$HOME`).
-pub fn admission_lock_path() -> Result<(PathBuf, LockScope)> {
+/// The production lock locations: `/run/sparkforge` owned by root, this process's effective uid,
+/// and the home directory from the password database (not `$HOME`).
+pub fn admission_locks() -> Result<AdmissionLocks> {
     #[cfg(unix)]
     {
         let uid = unsafe { libc::geteuid() };
-        let home = home_dir_of(uid).with_context(|| format!("no home directory for uid {uid} in the password database"))?;
-        admission_lock_path_in(Path::new(NODE_LOCK_DIR), 0, uid, &PathBuf::from(format!("/run/user/{uid}")), &home)
+        admission_locks_in(Path::new(NODE_LOCK_DIR), 0, uid, || home_dir_of(uid))
     }
     #[cfg(not(unix))]
     {
-        admission_lock_path_in(Path::new(NODE_LOCK_DIR), 0, 0, Path::new(""), &std::env::temp_dir())
+        admission_locks_in(Path::new(NODE_LOCK_DIR), 0, 0, || None)
     }
 }
 
@@ -725,21 +863,21 @@ pub fn bytes_to_copy(ck: &Checkpoint, b: &Binding) -> u64 {
     b.linears.iter().flat_map(|l| l.parts.iter()).map(|p| ck.tensors[p].len()).sum()
 }
 
-/// Admission for loading `b`, taken on the host before any CUDA call: the lock at `lock_path`
-/// and the memory guard for the copied bytes plus the load's overhead. Hold the result until the
-/// upload has made and filled every allocation.
-pub fn admit_load_with(ck: &Checkpoint, b: &Binding, verifying: bool, lock_path: &Path, mem: impl Fn() -> Option<u64>) -> Result<Admission> {
-    admit(lock_path, bytes_to_copy(ck, b) + load_overhead_bytes(b, verifying), mem)
+/// Admission for loading `b`, taken on the host before any CUDA call: the `locks` and the memory
+/// guard for the copied bytes plus the load's overhead. Hold the result until the upload has made
+/// and filled every allocation; the upload confirms it against what it actually copies.
+pub fn admit_load_with(ck: &Checkpoint, b: &Binding, verifying: bool, locks: &[&Path], mem: impl Fn() -> Option<u64>) -> Result<Admission> {
+    admit(locks, bytes_to_copy(ck, b), load_overhead_bytes(b, verifying), mem, ADMISSION_WAIT)
 }
 
-/// `admit_load_with` at the production lock location with `/proc/meminfo`. Warns when only a
+/// `admit_load_with` at the production lock locations with `/proc/meminfo`. Warns when only the
 /// per-user lock is available.
 pub fn admit_load(ck: &Checkpoint, b: &Binding, verifying: bool) -> Result<Admission> {
-    let (lock, scope) = admission_lock_path()?;
-    if scope == LockScope::User {
+    let locks = admission_locks()?;
+    if locks.scope() == LockScope::User {
         eprintln!("note: {NODE_LOCK_DIR}/{NODE_LOCK_NAME} is not provisioned; loads are serialized only among this user's processes");
     }
-    admit_load_with(ck, b, verifying, &lock, mem_available)
+    admit_load_with(ck, b, verifying, &locks.paths(), mem_available)
 }
 
 /// `MemAvailable` from /proc/meminfo in bytes (Linux only).

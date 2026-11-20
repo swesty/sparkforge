@@ -15,11 +15,11 @@ enum Fmt { Auto, Bf16, W4a16, Nvfp4 }
 
 /// Spec, plan and validated binding for a checkpoint directory (config.json beside the weights).
 fn open_checkpoint(dir: &std::path::Path) -> Result<(plan::Plan, sparkforge::weights::Checkpoint, sparkforge::weights::Binding)> {
-    // One resolution of the directory for the config, the index and every shard.
+    // One opened directory for the config, the index and every shard.
     let dir = &sparkforge::weights::resolve_checkpoint_dir(dir)?;
     let spec = ModelSpec::from_json(&sparkforge::weights::read_config(dir)?, None)?;
     let p = plan::build(&spec, &GB10, &plan::PlanOpts { prefill_tokens: 2048, ctx: 4096 });
-    let ck = sparkforge::weights::Checkpoint::open(dir)?;
+    let ck = sparkforge::weights::Checkpoint::open_dir(dir)?;
     let b = sparkforge::weights::bind(&ck, &spec)?;
     Ok((p, ck, b))
 }

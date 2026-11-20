@@ -3,7 +3,7 @@
 //! Every linear is copied into one GPU allocation; fused linears are packed in kernel row order
 //! (q|k|v, gate|up). Reading the memory-mapped file in place through ATS was measured and
 //! rejected: see openspec/changes/add-weight-loading/design.md, decision 2.
-use crate::weights::{mem_available, Admission, Binding, BoundLinear, Checkpoint, STAGING_BYTES};
+use crate::weights::{bytes_to_copy, mem_available, Admission, Binding, BoundLinear, Checkpoint, STAGING_BYTES};
 use anyhow::{Context, Result};
 use cudarc::driver::{CudaSlice, CudaStream, DevicePtr};
 use std::collections::HashMap;
@@ -28,8 +28,10 @@ pub struct DeviceWeights {
 
 /// Copies every linear of `b` into GPU memory. `admission` comes from `weights::admit_load`,
 /// taken before the CUDA context was created; it is held until every allocation is made and
-/// filled, so a concurrent load's guard sees this one's memory as used.
+/// filled, so a concurrent load's guard sees this one's memory as used. Before allocating, it
+/// confirms the admission covers this binding and that CUDA startup left the headroom.
 pub fn upload(stream: &Arc<CudaStream>, ck: &Checkpoint, b: &Binding, admission: Admission) -> Result<DeviceWeights> {
+    admission.confirm(bytes_to_copy(ck, b), mem_available)?;
     let _admission = admission;
     let t0 = Instant::now();
     let mut out = DeviceWeights { linears: HashMap::new(), bytes_copied: 0, load_secs: 0.0, mem_available_after: None };

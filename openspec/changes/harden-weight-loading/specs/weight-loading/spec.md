@@ -4,8 +4,8 @@
 
 ### Requirement: Checkpoints are discovered and every byte range is checked
 
-Opening a checkpoint directory SHALL resolve it once to its canonical path and read the config,
-index and shards from it. It SHALL use `model.safetensors.index.json` when that directory entry
+Opening a checkpoint directory SHALL open it once and read the config, index and shards relative
+to that opened directory. It SHALL use `model.safetensors.index.json` when that directory entry
 exists (a dangling link is an error) and `model.safetensors` otherwise. Each tensor's offsets MUST
 lie inside its shard's data section, checked without overflow, and its byte count MUST match its
 dtype and shape.
@@ -22,6 +22,10 @@ dtype and shape.
 - **WHEN** a checkpoint is opened through a symlink that is then switched to another generation
 - **THEN** every read still comes from the generation that was opened
 
+#### Scenario: Directory replaced after the config read
+- **WHEN** the canonical directory is moved aside and replaced by another generation after the config is read
+- **THEN** the index and shards still come from the generation the config came from
+
 #### Scenario: Dangling index link
 - **WHEN** `model.safetensors.index.json` is a dangling symlink beside a valid `model.safetensors`
 - **THEN** opening fails naming the index instead of loading the single file
@@ -29,7 +33,7 @@ dtype and shape.
 ### Requirement: Shards are regular files opened without blocking
 
 Shards, `config.json` and the index SHALL be opened without blocking, and each opened file MUST be
-a regular file; metadata files are also size-capped.
+a regular file; metadata files are also size-capped, counting bytes that arrive after the size check.
 
 #### Scenario: FIFO shard
 - **WHEN** the shard path is a FIFO with no writer
@@ -57,9 +61,10 @@ before any GPU work, naming the tensor and the expected and found values.
 ### Requirement: Loads never exhaust host memory
 
 A load SHALL be refused before any CUDA call if its copied bytes, bounded staging buffer and, when
-verifying, reference scratch exceed `MemAvailable` minus 4 GiB. Admission SHALL be serialized,
-until the allocations are made, across all users' sparkforge processes when the node-wide lock is
-provisioned, else across this user's, at a location chosen by ownership, never by environment.
+verifying, reference scratch exceed `MemAvailable` minus 4 GiB, and rechecked before allocating.
+Admission SHALL be serialized until the allocations are made: always across this user's sparkforge
+processes, and across all users' through a group-shared node lock when provisioned, with locations
+chosen by ownership, never by environment.
 
 #### Scenario: Too large to copy
 - **WHEN** the bytes to copy plus overhead exceed `MemAvailable` minus 4 GiB
@@ -72,6 +77,18 @@ provisioned, else across this user's, at a location chosen by ownership, never b
 #### Scenario: Loads by two users
 - **WHEN** the node-wide lock is provisioned and two different users start loads
 - **THEN** both use the same lock, so the second waits for the first
+
+#### Scenario: Lock open to every account
+- **WHEN** the node-wide lock file grants access to every account
+- **THEN** admission refuses it, naming the mode, instead of letting any account hold it
+
+#### Scenario: Login during a load
+- **WHEN** a user's load is admitted and a login then creates that user's runtime directory
+- **THEN** the user's next load waits on the same lock
+
+#### Scenario: Memory used after admission
+- **WHEN** `MemAvailable` drops below the guard between admission and upload
+- **THEN** the upload refuses before allocating
 
 #### Scenario: Wide vocabulary
 - **WHEN** `verify-weights` checks Llama 3.1 8B's `lm_head` (1.05 GB of weights)
