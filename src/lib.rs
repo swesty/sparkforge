@@ -8,8 +8,11 @@ pub mod codegen;
 pub mod config;
 pub mod plan;
 pub mod target;
+pub mod weights;
 
 #[cfg(feature = "cuda")]
 pub mod runtime;
 #[cfg(feature = "cuda")]
 pub mod verify;
+#[cfg(feature = "cuda")]
+pub mod device_weights;

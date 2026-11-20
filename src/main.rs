@@ -13,6 +13,15 @@ struct Cli {
 #[derive(Clone, Copy, ValueEnum)]
 enum Fmt { Auto, Bf16, W4a16, Nvfp4 }
 
+/// Spec, plan and validated binding for a checkpoint directory (config.json beside the weights).
+fn open_checkpoint(dir: &std::path::Path) -> Result<(plan::Plan, sparkforge::weights::Checkpoint, sparkforge::weights::Binding)> {
+    let spec = ModelSpec::from_json(&std::fs::read_to_string(dir.join("config.json"))?, None)?;
+    let p = plan::build(&spec, &GB10, &plan::PlanOpts { prefill_tokens: 2048, ctx: 4096 });
+    let ck = sparkforge::weights::Checkpoint::open(dir)?;
+    let b = sparkforge::weights::bind(&ck, &spec)?;
+    Ok((p, ck, b))
+}
+
 #[derive(Subcommand)]
 enum Cmd {
     /// Print the derived shapes, kernel choices, and memory/throughput budget.
@@ -31,6 +40,20 @@ enum Cmd {
         c: Common,
         #[arg(long, default_value = "/usr/local/cuda/include")]
         cuda_include: String,
+    },
+    /// Open a safetensors checkpoint directory (with its config.json) and validate it against the plan.
+    Weights {
+        /// Checkpoint directory containing config.json and model.safetensors (or an index + shards)
+        dir: PathBuf,
+    },
+    /// GEMVs on real checkpoint weights against an f64 reference (needs --features cuda on a Spark).
+    #[cfg(feature = "cuda")]
+    VerifyWeights {
+        dir: PathBuf,
+        #[arg(long, default_value = "/usr/local/cuda/include")]
+        cuda_include: String,
+        #[arg(long, default_value_t = 0x5eed)]
+        seed: u64,
     },
     /// Run every generated kernel on the GPU against a CPU reference (needs --features cuda on a Spark).
     #[cfg(feature = "cuda")]
@@ -114,6 +137,39 @@ fn main() -> Result<()> {
             let g = codegen::generate(&build(&c)?);
             let e = sparkforge::runtime::Engine::load(&g, &cuda_include)?;
             println!("loaded {} kernels for sm_121a", e.funcs.len());
+        }
+        Cmd::Weights { dir } => {
+            let t0 = std::time::Instant::now();
+            let (p, ck, b) = open_checkpoint(&dir)?;
+            let bytes: u64 = ck.shards.iter().map(|s| s.len).sum();
+            println!("{}: {} shard(s), {} tensors, {:.2} GiB, opened and validated in {:.2} s",
+                p.model.arch, ck.shards.len(), ck.tensors.len(), bytes as f64 / (1u64 << 30) as f64, t0.elapsed().as_secs_f64());
+            println!("bound {} linears ({} fused) and {} other tensors; {} unexpected tensor(s){}",
+                b.linears.len(), b.linears.iter().filter(|l| l.fused()).count(), b.others.len(), b.unexpected.len(),
+                if b.unexpected.is_empty() { String::new() } else { format!(": {}", b.unexpected.iter().take(5).cloned().collect::<Vec<_>>().join(", ")) });
+        }
+        #[cfg(feature = "cuda")]
+        Cmd::VerifyWeights { dir, cuda_include, seed } => {
+            use sparkforge::verify;
+            let (p, ck, b) = open_checkpoint(&dir)?;
+            let g = codegen::generate(&p);
+            let e = sparkforge::runtime::Engine::load(&g, &cuda_include)?;
+            let avail0 = sparkforge::weights::mem_available().unwrap_or(0);
+            let rep = verify::verify_weights(&p, &g, &e, &ck, &b, seed)?;
+            println!("{} ({} layers), MemAvailable at start {:.1} GiB", p.model.arch, p.model.layers, avail0 as f64 / (1u64 << 30) as f64);
+            // Sampled inside the upload while the weights were resident, not here after they were freed.
+            println!("loaded {:.2} GiB into GPU memory in {:.2} s; MemAvailable with the weights resident {}", rep.bytes_copied as f64 / (1u64 << 30) as f64,
+                rep.load_secs, rep.mem_available_after_load.map_or("unknown".into(), |a| format!("{:.1} GiB", a as f64 / (1u64 << 30) as f64)));
+            println!("{:<13} {:<16} {:>10} {:>5} {:>10} {:>8}", "linear", "case", "max err", "ok", "us", "GB/s");
+            let mut fails = 0;
+            for r in &rep.rows {
+                let ok = r.err.is_none_or(|e| e < verify::TOL);
+                fails += !ok as usize;
+                println!("{:<13} {:<16} {:>10} {:>5} {:>10} {:>8}", r.linear, r.case,
+                    r.err.map_or("-".into(), |e| format!("{e:.2e}")), if r.err.is_none() { "" } else if ok { "yes" } else { "NO" },
+                    r.us.map_or("-".into(), |t| format!("{t:.1}")), r.gbs.map_or("-".into(), |g| format!("{g:.0}")));
+            }
+            anyhow::ensure!(fails == 0, "{fails} check(s) above tolerance {:.4}", verify::TOL);
         }
         #[cfg(feature = "cuda")]
         Cmd::Verify { c, cuda_include, bench, seed } => {

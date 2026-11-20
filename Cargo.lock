@@ -292,6 +292,7 @@ dependencies = [
  "anyhow",
  "clap",
  "cudarc",
+ "libc",
  "serde",
  "serde_json",
  "sha2",
