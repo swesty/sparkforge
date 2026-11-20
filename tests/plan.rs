@@ -90,3 +90,39 @@ fn unimplemented_attention_features_are_flagged_in_the_plan() {
     assert!(p.notes.iter().any(|n| n.contains("q_norm")));
     assert!(!load("configs/llama-3.1-8b.json").notes.iter().any(|n| n.contains("q_norm") || n.contains("bias")));
 }
+
+#[test]
+fn attention_splits_stay_valid_below_at_and_above_256_tokens() {
+    let s = ModelSpec::from_json(&std::fs::read_to_string("configs/llama-3.1-8b.json").unwrap(), None).unwrap();
+    let splits = |ctx| plan::build(&s, &GB10, &plan::PlanOpts { prefill_tokens: 2048, ctx }).attn.splits;
+    assert_eq!((splits(128), splits(255), splits(256), splits(512), splits(32768)), (1, 1, 1, 2, 12));
+}
+
+#[test]
+fn gemv_whose_staged_activations_exceed_smem_is_planned_not_generated() {
+    // down_proj K = 4 * 16384 = 65536 -> 131072 B of staged activations, above 101376 B.
+    let wide = r#"{"hidden_size": 16384, "num_hidden_layers": 1, "num_attention_heads": 128,
+                   "num_key_value_heads": 8, "vocab_size": 4096}"#;
+    let p = plan::build(&spec(wide).unwrap(), &GB10, &plan::PlanOpts { prefill_tokens: 2048, ctx: 4096 });
+    let g = codegen::generate(&p);
+    let down = g.kernels.iter().find(|k| k.entry == "gemv_down_proj").unwrap();
+    assert_eq!(down.status, "planned");
+    assert!(p.notes.iter().any(|n| n.contains("gemv down_proj")));
+    assert!(!g.files[0].1.contains("gemv_down_proj("));
+    for k in g.kernels.iter().filter(|k| k.status == "generated") {
+        assert!(k.dyn_smem <= GB10.smem_per_block_optin, "{k:?}");
+    }
+}
+
+#[test]
+fn only_generated_gemvs_get_cuda_source() {
+    let s = ModelSpec::from_json(&std::fs::read_to_string("configs/qwen3-30b-a3b.json").unwrap(),
+        Some(sparkforge::config::WeightFormat::Nvfp4)).unwrap();
+    let g = codegen::generate(&plan::build(&s, &GB10, &plan::PlanOpts { prefill_tokens: 2048, ctx: 32768 }));
+    let src = &g.files.iter().find(|(n, _)| n == "model.cu").unwrap().1;
+    let status = |e: &str| g.kernels.iter().find(|k| k.entry == e).unwrap().status;
+    assert_eq!(status("gemv_qkv_proj"), "planned");
+    assert!(!src.contains("gemv_qkv_proj("));
+    assert_eq!(status("gemv_lm_head"), "generated");
+    assert!(src.contains("gemv_lm_head("));
+}

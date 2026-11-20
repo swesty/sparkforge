@@ -232,6 +232,9 @@ pub fn build(m: &ModelSpec, t: &Target, o: &PlanOpts) -> Plan {
     let mut gemv: Vec<GemvPlan> = ls.iter().map(|l| plan_gemv(l, t)).collect();
     let lm = Linear { name: "lm_head".into(), n: m.vocab, k: m.hidden, copies: 1, active: 1, format: WeightFormat::Bf16 };
     gemv.push(plan_gemv(&lm, t));
+    for g in gemv.iter().filter(|g| g.smem_bytes > t.smem_per_block_optin) {
+        notes.push(format!("gemv {} (K={}) needs {} B of shared memory for its activation vector, above the {} B per-block limit; it is not generated until a non-staged GEMV variant exists", g.linear, g.k, g.smem_bytes, t.smem_per_block_optin));
+    }
     let mut gemm: Vec<GemmTile> = ls.iter()
         .filter(|l| l.copies == 1)
         .map(|l| plan_gemm(l, o.prefill_tokens, t)).collect();

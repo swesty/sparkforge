@@ -318,9 +318,15 @@ pub fn generate(p: &Plan) -> Generated {
 
     for g in &p.gemv {
         let entry = format!("gemv_{}", g.linear);
-        src += &fill(GEMV, &[("NS", format!("{entry}_ns")), ("ENTRY", entry.clone()), ("N", g.n.to_string()), ("K", g.k.to_string()), ("WARPS", g.warps_per_block.to_string()), ("RPW", g.rows_per_warp.to_string())]);
+        // Only BF16 weights have a GEMV body today, and the body stages x in shared memory, so a K
+        // whose activation vector exceeds the per-block limit cannot launch. Anything else stays
+        // `planned` and gets no CUDA source, so model.cu never contains a kernel for the wrong format.
         let fmt_ok = g.linear == "lm_head" || g.linear == "router" || matches!(m.weights, crate::config::WeightFormat::Bf16);
-        kernels.push(KernelEntry { entry, file: "model.cu".into(), grid: [g.grid, 1, 1], block: g.warps_per_block * 32, dyn_smem: g.smem_bytes, status: if fmt_ok { "generated" } else { "planned" }, args: vec!["W", "x", "y"] });
+        let generated = fmt_ok && g.smem_bytes <= p.target.smem_per_block_optin;
+        if generated {
+            src += &fill(GEMV, &[("NS", format!("{entry}_ns")), ("ENTRY", entry.clone()), ("N", g.n.to_string()), ("K", g.k.to_string()), ("WARPS", g.warps_per_block.to_string()), ("RPW", g.rows_per_warp.to_string())]);
+        }
+        kernels.push(KernelEntry { entry, file: "model.cu".into(), grid: [g.grid, 1, 1], block: g.warps_per_block * 32, dyn_smem: g.smem_bytes, status: if generated { "generated" } else { "planned" }, args: vec!["W", "x", "y"] });
     }
 
     let mut tiles = String::from("// Prefill GEMM tile configs chosen by the planner (mma.sync m16n8k16 bf16, cp.async/TMA pipeline).\n#pragma once\n");
