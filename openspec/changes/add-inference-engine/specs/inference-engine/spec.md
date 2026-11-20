@@ -35,9 +35,10 @@ serialization rule.
 
 ### Requirement: Steady-state steps replay captured graphs
 
-Each step shape (decode, draft, verify, prefill chunk) SHALL execute as one captured CUDA Graph.
-Per-step values such as position, sequence length and token ids MUST be updated without
-re-instantiating the graph, and a steady-state decode step MUST NOT launch kernels individually.
+Each step shape (decode, speculative step of drafts plus verify plus accept, prefill chunk) SHALL
+execute as one captured CUDA Graph. Per-step values such as position, sequence length and token
+ids MUST be updated without re-instantiating the graph, and a steady-state step MUST NOT launch
+kernels individually.
 
 #### Scenario: Decode step launch count
 - **WHEN** the engine decodes 256 tokens after warm-up

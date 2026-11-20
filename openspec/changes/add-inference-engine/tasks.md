@@ -12,7 +12,7 @@ Plain-text tokenization lives in this change (task 1.4), because `generate` need
 ## 1. Runtime proving ground on Llama 3.1 8B (SHA-755)
 
 - [ ] 1.1 Step program built from plan + manifest for a dense model, with arena allocation behind the memory budget. Verify: `cargo test` builds the program for both example configs, and its kernel list matches the manifest.
-- [ ] 1.2 One CUDA Graph per decode step, with a device step header updated by a memcpy node. Verify: on a GB10, 256 decode steps of Llama 3.1 8B issue one graph launch each, and the text matches non-graph execution.
+- [ ] 1.2 One CUDA Graph per decode step, with a device step header that the sampling kernel advances on the device (a host memcpy node only for prefill and a new request). Verify: on a GB10, 256 decode steps of Llama 3.1 8B issue one graph launch each, and the text matches non-graph execution.
 - [ ] 1.3 Greedy and temperature sampling (Philox) in the `lm_head` epilogue, with ties broken toward the lowest token id. Verify: greedy output matches an argmax over full logits for 256 steps, including a constructed exact tie; `verify --bench` on the fused kernel on a GB10.
 - [ ] 1.4 Plain-text prompt encoding and output decoding from the checkpoint's `tokenizer.json` (HF `tokenizers` crate), with no chat template. Verify: `cargo test` round-trips text and matches the Hugging Face tokenizer's ids for 20 fixed strings (ids checked in as fixtures).
 - [ ] 1.5 `sparkforge generate --prompt "<text>"` prints decoded text, decode tok/s, time to first token and the ceiling. Verify: Llama 3.1 8B on a GB10 with a plain-text prompt, with the tok/s recorded in the PR against the planner ceiling (12.2 tok/s at 32K, 15.1 at 4K).
@@ -33,7 +33,7 @@ Plain-text tokenization lives in this change (task 1.4), because `generate` need
 
 ## 4. MTP speculative decoding (M6: SHA-753, SHA-775)
 
-- [ ] 4.1 Draft (M=1, k times) and verify (M=k+1) step graphs, with rejection sampling. Verify: `cargo test` checks the acceptance logic against a reference implementation on fixed probabilities.
+- [ ] 4.1 One speculative-step graph (k drafts at M=1, verify at M=k+1, accept), with rejection sampling, and the accept kernel advancing the step header on the device. Verify: `cargo test` checks the acceptance logic against a reference implementation on fixed probabilities; on a GB10, 256 steps replay with no host write to the step header.
 - [ ] 4.2 Shape-invariant target computation: every kernel used by verify computes each position with the same reduction partition and order as the M=1 decode kernel (design decision 8). Verify: over 512 positions, verify-step logits are bitwise identical to decode-step logits, including a constructed near-tie position, on a GB10.
 - [ ] 4.3 Snapshot recurrent and convolution state per verify position, and roll back to the last accepted one. Verify: after partial acceptance, state matches a non-speculative run over the same tokens within kernel tolerance, on a GB10.
 - [ ] 4.4 Committed KV length in the step header, and per-query causal bounds in verify (query i reads below C+i+1, in attention and the indexer). Verify on a GB10:
