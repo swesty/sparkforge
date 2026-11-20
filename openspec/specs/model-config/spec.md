@@ -29,12 +29,16 @@ divisible by `num_key_value_heads`.
 
 The parser SHALL accept `num_experts`, `num_local_experts` (Mixtral) and `n_routed_experts` as the
 expert count. A model SHALL be treated as MoE only when that count is greater than 1 and
-`num_experts_per_tok` is present. The expert width SHALL be `moe_intermediate_size`, falling back
-to `intermediate_size`; if neither exists parsing MUST fail. `n_shared_experts` defaults to 0.
+`num_experts_per_tok` is present, which MUST be between 1 and the count. The expert width SHALL be
+`moe_intermediate_size`, falling back to `intermediate_size`; if neither exists parsing MUST fail.
 
 #### Scenario: Qwen3-30B-A3B
 - **WHEN** `configs/qwen3-30b-a3b.json` is parsed
 - **THEN** the spec is MoE with 128 experts, top-8, expert width 768
+
+#### Scenario: Top-k out of range
+- **WHEN** a 512-expert config sets `num_experts_per_tok` to 0 or 513
+- **THEN** parsing fails naming `num_experts_per_tok`
 
 ### Requirement: Weight format comes from quantization_config, and unknown schemes are rejected
 
@@ -75,12 +79,22 @@ Without a format override, parsing MUST fail for GPTQ/AWQ whose `bits` is anythi
 
 ### Requirement: An explicit format override replaces detection
 
-An explicit format override (CLI `--format`) SHALL replace detection entirely, so an unrecognized
-`quantization_config` is not an error when an override is given.
+An explicit format override (CLI `--format`) SHALL replace detection entirely, so an unrecognized,
+malformed or conflicting `quantization_config` (any field, any level, including a `quantized_layers`
+map this parser cannot read) is not an error when an override is given. A mixed-precision
+declaration at either level is still recorded.
 
 #### Scenario: Override wins
 - **WHEN** `quantization_config` names modelopt FP8 and the caller passes BF16 as the format
 - **THEN** parsing succeeds with BF16 weights
+
+#### Scenario: Malformed field with an override
+- **WHEN** `quantization_config` is `{"quant_method": "awq", "bits": "4", "group_size": 128}` and the caller passes BF16
+- **THEN** parsing succeeds with BF16 weights, and without the override it fails naming `quantization_config`
+
+#### Scenario: Malformed layer map with an override
+- **WHEN** a MIXED_PRECISION `quantized_layers` entry is null and the caller passes BF16
+- **THEN** parsing succeeds with BF16 weights, and without the override it fails naming the entry
 
 ### Requirement: RoPE scaling is either implemented exactly or rejected
 
@@ -112,8 +126,9 @@ kernel-planning).
 
 When `config.json` has a `text_config` object, the language model SHALL be parsed from it, taking
 `quantization_config` and `architectures` from the top level when `text_config` lacks them or sets
-them to null. Different non-null values at both levels MUST be rejected. The vision configuration
-SHALL be ignored.
+them to null. Different non-null values at both levels MUST be rejected, except that a
+`quantization_config` conflict is ignored when a format override is given. A missing nested
+`model_type` SHALL come from the top level.
 
 #### Scenario: Flash Next nesting
 - **WHEN** `configs/qwen3.8-flash-next-nvfp4.json` is parsed
@@ -122,6 +137,14 @@ SHALL be ignored.
 #### Scenario: Null nested quantization config
 - **WHEN** `text_config.quantization_config` is null and the top level carries the mixed-precision map
 - **THEN** the map is used
+
+#### Scenario: Family named only at the top level
+- **WHEN** `text_config.model_type` is absent and the top-level `model_type` is `qwen4_exp`
+- **THEN** the model is parsed as the qwen4_exp hybrid
+
+#### Scenario: Nested quantization conflict with an override
+- **WHEN** the nested `quantization_config` has `"bits": "4"`, the top level has `"bits": 4`, and the caller passes BF16
+- **THEN** parsing succeeds with BF16 weights, and without the override it fails reporting the conflict
 
 ### Requirement: The qwen4_exp hybrid layout is parsed into a layer schedule
 
@@ -193,8 +216,13 @@ RoPE rotates the whole head.
 ### Requirement: The shared-expert width follows the config
 
 The shared-expert width SHALL be `shared_expert_intermediate_size` when present, otherwise
-`n_shared_experts` times the expert width; a model has shared experts when that width is above 0.
+`n_shared_experts` (default 0) times the expert width; a model has shared experts when that width
+is above 0.
 
 #### Scenario: Flash Next shared expert
 - **WHEN** `configs/qwen3.8-flash-next-nvfp4.json` is parsed
 - **THEN** the MoE has 512 experts, top-10, expert width 640 and a shared expert of width 640
+
+#### Scenario: No shared-expert fields
+- **WHEN** an MoE config with 128 experts, top-8 and expert width 768 omits `n_shared_experts` and `shared_expert_intermediate_size`
+- **THEN** it parses with zero shared experts

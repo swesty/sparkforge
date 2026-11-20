@@ -36,7 +36,7 @@ fn write_shard(path: &PathBuf, ts: &[(String, Vec<usize>, &str)], truncate: usiz
     let mut header = serde_json::Map::new();
     let mut data: Vec<u8> = vec![];
     for (name, shape, dtype) in ts {
-        let elem = if *dtype == "F32" { 4 } else { 2 };
+        let elem = match *dtype { "F32" => 4, "F8_E4M3" | "U8" => 1, _ => 2 };
         let bytes = shape.iter().product::<usize>() * elem;
         let b = data.len();
         data.extend((0..bytes).map(|i| (i % 251) as u8));
@@ -470,4 +470,17 @@ fn a_format_override_does_not_let_a_mixed_precision_checkpoint_load() {
     let d = single("mixed-override", bf16(tensors(false)));
     let err = bind(&Checkpoint::open(&d).unwrap(), &s).err().expect("binding must refuse").to_string();
     assert!(err.contains("mixed-precision"), "{err}");
+}
+
+#[test]
+fn a_quantized_checkpoint_behind_a_bf16_config_is_refused_before_gpu_work() {
+    // The config omits quantization_config, but the checkpoint holds an FP8 projection and its scale.
+    let mut ts = bf16(tensors(false));
+    for t in ts.iter_mut() {
+        if t.0 == "model.layers.0.self_attn.o_proj.weight" { t.2 = "F8_E4M3"; }
+    }
+    ts.push(("model.layers.0.self_attn.o_proj.weight_scale".into(), vec![16, 1], "U8"));
+    let d = single("undeclared-fp8", ts);
+    let err = bind(&Checkpoint::open(&d).unwrap(), &spec(false)).err().expect("binding must refuse").to_string();
+    assert!(err.contains("model.layers.0.self_attn.o_proj.weight: expected dtype BF16, found F8_E4M3"), "{err}");
 }

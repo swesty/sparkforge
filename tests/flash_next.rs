@@ -525,3 +525,25 @@ fn an_absent_mtp_shared_expert_leaves_its_entries_unused() {
     let p = plan_of(&spec_of(&v).unwrap());
     assert!(p.notes.iter().any(|n| n.contains("not used by the plan") && n.contains("mtp.layers.0.mlp.shared_expert.up_proj")), "{:#?}", p.notes);
 }
+
+// ---- archive review (swesty/sparkforge#12) ----
+
+#[test]
+fn moe_without_n_shared_experts_has_no_shared_expert() {
+    let s = ModelSpec::from_json(&json!({"hidden_size": 2048, "num_hidden_layers": 2, "num_attention_heads": 16, "vocab_size": 1000,
+        "num_experts": 128, "num_experts_per_tok": 8, "moe_intermediate_size": 768}).to_string(), None).unwrap();
+    let e = s.moe.unwrap();
+    assert_eq!((e.shared_experts, e.shared_intermediate), (0, 0));
+}
+
+#[test]
+fn an_override_also_skips_a_nested_quantization_conflict() {
+    let mut v = json!({"text_config": {"hidden_size": 2048, "num_hidden_layers": 2, "num_attention_heads": 16, "vocab_size": 1000,
+        "quantization_config": {"quant_method": "awq", "bits": "4", "group_size": 128}},
+        "quantization_config": {"quant_method": "awq", "bits": 4, "group_size": 128}});
+    assert_eq!(ModelSpec::from_json(&v.to_string(), Some(WeightFormat::Bf16)).unwrap().weights, WeightFormat::Bf16);
+    assert!(format!("{:#}", spec_of(&v).unwrap_err()).contains("different quantization_config"));
+    // A mixed-precision declaration at either level survives the override.
+    v["quantization_config"] = json!({"quant_method": "modelopt", "quant_algo": "MIXED_PRECISION"});
+    assert!(ModelSpec::from_json(&v.to_string(), Some(WeightFormat::Bf16)).unwrap().declared_mixed);
+}

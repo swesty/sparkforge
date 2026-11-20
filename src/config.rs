@@ -373,15 +373,20 @@ fn detect_format(q: &Option<serde_json::Value>) -> Result<(WeightFormat, FormatM
 
 /// Multimodal configs nest the language model under `text_config`. Its fields win; the top level
 /// supplies what only it carries (the checkpoint's quantization and architecture names).
-fn text_config(v: serde_json::Value) -> Result<serde_json::Value> {
+/// Returns the flattened body, plus the top-level `quantization_config` when it differs from a
+/// non-null nested one. That conflict is an error only for format detection, so a format override
+/// can still parse the config; the caller decides.
+fn text_config(v: serde_json::Value) -> Result<(serde_json::Value, Option<serde_json::Value>)> {
     let serde_json::Value::Object(mut top) = v else { bail!("config.json is not a JSON object") };
-    let Some(tc) = top.remove("text_config") else { return Ok(serde_json::Value::Object(top)) };
+    let Some(tc) = top.remove("text_config") else { return Ok((serde_json::Value::Object(top), None)) };
     let serde_json::Value::Object(mut text) = tc else { bail!("text_config is not a JSON object") };
+    let mut quant_conflict = None;
     for k in ["quantization_config", "architectures"] {
         let Some(x) = top.remove(k).filter(|x| !x.is_null()) else { continue };
         match text.get(k) {
             None | Some(serde_json::Value::Null) => { text.insert(k.into(), x); }
             Some(nested) if *nested == x => {}
+            Some(_) if k == "quantization_config" => quant_conflict = Some(x),
             Some(_) => bail!("config.json declares different {k} values at the top level and in text_config"),
         }
     }
@@ -392,7 +397,7 @@ fn text_config(v: serde_json::Value) -> Result<serde_json::Value> {
             text.insert("model_type".into(), mt);
         }
     }
-    Ok(serde_json::Value::Object(text))
+    Ok((serde_json::Value::Object(text), quant_conflict))
 }
 
 fn need<T>(v: Option<T>, field: &str) -> Result<T> {
@@ -522,7 +527,11 @@ fn check_hybrid_formats(formats: &FormatMap, h: &Hybrid) -> Result<()> {
 
 impl ModelSpec {
     pub fn from_json(text: &str, override_fmt: Option<WeightFormat>) -> Result<Self> {
-        let body = text_config(serde_json::from_str(text).context("parsing config.json")?)?;
+        let (body, quant_conflict) = text_config(serde_json::from_str(text).context("parsing config.json")?)?;
+        if override_fmt.is_none() {
+            ensure!(quant_conflict.is_none(),
+                "config.json declares different quantization_config values at the top level and in text_config; pass --format to override");
+        }
         let r: RawConfig = serde_json::from_value(body.clone()).context("parsing config.json")?;
         let kv_heads = r.num_key_value_heads.unwrap_or(r.num_attention_heads);
         let head_dim = r.head_dim.unwrap_or(r.hidden_size / r.num_attention_heads);
@@ -577,10 +586,12 @@ impl ModelSpec {
             .unwrap_or(10_000.0);
         // Read from the raw strings, independently of format detection, so an override never
         // hides that the checkpoint itself is mixed precision.
-        let declared_mixed = r.quantization_config.as_ref().is_some_and(|q| {
+        // Either level declaring mixed precision is enough: an override never hides it.
+        let is_mixed = |q: &serde_json::Value| {
             q.get("quant_method").and_then(|v| v.as_str()) == Some("modelopt")
                 && q.get("quant_algo").and_then(|v| v.as_str()) == Some("MIXED_PRECISION")
-        });
+        };
+        let declared_mixed = r.quantization_config.as_ref().is_some_and(is_mixed) || quant_conflict.as_ref().is_some_and(is_mixed);
         Ok(ModelSpec {
             declared_mixed,
             qk_norm: arch.starts_with("Qwen3"),

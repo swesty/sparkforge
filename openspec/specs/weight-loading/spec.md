@@ -162,9 +162,19 @@ time and GB/s. It MUST exit non-zero if any check fails.
 
 ### Requirement: Hybrid and mixed-precision checkpoints are refused
 
-Binding MUST fail, before any GPU work, for a hybrid-layout or mixed-precision checkpoint until
-the mixed-format loader exists, naming the architecture.
+Binding MUST fail, before any GPU work, for a hybrid-layout checkpoint, one whose config declares
+mixed precision, or one whose planned tensors are not in the planned dtype, until the mixed-format
+loader exists, naming the architecture or the tensor. A format override used for planning MUST NOT
+lift this refusal.
 
 #### Scenario: Flash Next checkpoint
 - **WHEN** `sparkforge weights` opens a Qwen3.8 Flash Next checkpoint
 - **THEN** it fails stating that hybrid or mixed-precision checkpoints do not load yet
+
+#### Scenario: Override used for planning
+- **WHEN** a dense MIXED_PRECISION config is parsed with a BF16 override and its checkpoint is bound
+- **THEN** binding fails stating that mixed-precision checkpoints do not load yet
+
+#### Scenario: Quantized tensors behind a BF16 config
+- **WHEN** a config without `quantization_config` is bound to a checkpoint whose `o_proj` is F8_E4M3 with a scale tensor
+- **THEN** binding fails before GPU work, naming the tensor and its dtype
