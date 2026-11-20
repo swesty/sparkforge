@@ -7,11 +7,16 @@
 For a hybrid model the planner SHALL emit one op class per distinct shape and format, each with its
 shape, weight format, instances per decode token and bytes per token, instead of one entry per
 layer. Layers of one module class in different formats SHALL be separate op classes, each counted
-at its own size. Prefill tiles SHALL NOT be planned for hybrid models yet.
+at its own size, and projections SHALL fuse only where their formats match. Prefill tiles SHALL NOT
+be planned for hybrid models yet.
 
 #### Scenario: One layer in a different format
 - **WHEN** layer 0's `in_proj_qkv` is BF16 and the other 35 are MXFP8
 - **THEN** `gdn_in_proj_qkv` is MXFP8 ×35 and `gdn_in_proj_qkv_bf16` is BF16 ×1
+
+#### Scenario: Shared expert up projection left in BF16
+- **WHEN** the 48 shared-expert `up_proj` entries are removed from the map
+- **THEN** `shared_gate` (MXFP8 ×48) and `shared_up` (BF16 ×48) replace `shared_gate_up`, and both budgets grow by 76,185,600 bytes
 
 #### Scenario: Flash Next op classes
 - **WHEN** `configs/qwen3.8-flash-next-nvfp4.json` is planned
@@ -21,7 +26,8 @@ at its own size. Prefill tiles SHALL NOT be planned for hybrid models yet.
 
 The hybrid budget SHALL count each linear at its module's format, Gated DeltaNet state read and
 written, and per context token the FP8 KV of the selected positions plus the indexer key scan.
-Resident weights SHALL include every expert copy, the PLE table and the MTP layers.
+Resident weights SHALL include every expert copy, the PLE table, the MTP layer, norm and conv
+filter parameters, and a tied embedding once.
 
 #### Scenario: Flash Next at 32K
 - **WHEN** `configs/qwen3.8-flash-next-nvfp4.json` is planned at a 32768-token context
@@ -35,6 +41,15 @@ omitted when empty.
 #### Scenario: Llama and Qwen3-30B-A3B
 - **WHEN** `sparkforge plan --json` runs on `configs/llama-3.1-8b.json` or `configs/qwen3-30b-a3b.json`
 - **THEN** the output equals the checked-in golden file from before this change
+
+### Requirement: Format lookups are scoped to the language model
+
+Per-layer format lookups SHALL match only language-model module paths, so an entry of another tower
+(vision, MTP) with the same layer suffix never sets a text layer's format.
+
+#### Scenario: Vision experts in the map
+- **WHEN** the map also lists `model.visual.layers.0.mlp.experts` as MXFP8
+- **THEN** the text experts stay NVFP4, the budget is unchanged, and the vision entry is reported as unused
 
 ### Requirement: Unused format-map entries are reported
 

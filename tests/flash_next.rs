@@ -241,3 +241,125 @@ fn dense_plan_json_is_unchanged_from_the_base_revision() {
         assert_eq!(got, want, "{c}: dense plan JSON changed");
     }
 }
+
+fn plan_at(s: &ModelSpec, ctx: u32) -> plan::Plan {
+    plan::build(s, &GB10, &plan::PlanOpts { prefill_tokens: 2048, ctx })
+}
+
+fn ql(v: &mut Value) -> &mut serde_json::Map<String, Value> {
+    v["quantization_config"]["quantized_layers"].as_object_mut().unwrap()
+}
+
+#[test]
+fn shared_gate_and_up_in_different_formats_are_planned_separately() {
+    let mut v = raw();
+    for l in 0..48 {
+        ql(&mut v).remove(&format!("model.language_model.layers.{l}.mlp.shared_expert.up_proj")).unwrap();
+    }
+    let p = plan_of(&spec_of(&v).unwrap());
+    let op = |n: &str| p.ops.iter().find(|o| o.name == n);
+    assert!(op("shared_gate_up").is_none(), "incompatible projections are not fused");
+    assert_eq!((op("shared_gate").unwrap().per_token, op("shared_gate").unwrap().format), (48, Some(WeightFormat::Mxfp8)));
+    assert_eq!((op("shared_up").unwrap().per_token, op("shared_up").unwrap().format), (48, Some(WeightFormat::Bf16)));
+    // Each BF16 up projection costs (2 - 1.03125) bytes per element more: 48 x 640 x 2560 elements.
+    let base = plan_of(&spec_of(&raw()).unwrap());
+    let want = 48.0 * 640.0 * 2560.0 * (2.0 - 1.03125);
+    assert_eq!(want, 76_185_600.0);
+    let gib = (1u64 << 30) as f64;
+    assert!(((p.budget.weight_gib - base.budget.weight_gib) * gib - want).abs() < 1.0, "resident grows by the up matrices");
+    let free = |p: &plan::Plan| p.budget.decode_bytes_per_token_ctx_free_gb.unwrap() * 1e9;
+    assert!((free(&p) - free(&base) - want).abs() < 1.0, "decode reads grow by the same amount");
+}
+
+#[test]
+fn a_null_nested_quantization_config_falls_back_to_the_top_level() {
+    let mut v = raw();
+    v["text_config"]["quantization_config"] = Value::Null;
+    assert_eq!(spec_of(&v).unwrap().formats.modules.len(), 435);
+    let mut v = raw();
+    v["text_config"]["quantization_config"] = json!({"quant_method": "modelopt", "quant_algo": "NVFP4"});
+    assert!(format!("{:#}", spec_of(&v).unwrap_err()).contains("different quantization_config"));
+}
+
+#[test]
+fn other_towers_never_match_text_layer_lookups() {
+    let base = plan_of(&spec_of(&raw()).unwrap());
+    let mut v = raw();
+    ql(&mut v).insert("model.visual.layers.0.mlp.experts".into(), json!({"quant_algo": "MXFP8", "group_size": 32}));
+    let p = plan_of(&spec_of(&v).unwrap());
+    let op = |p: &plan::Plan, n: &str| p.ops.iter().find(|o| o.name == n).unwrap().clone();
+    assert_eq!(op(&p, "expert_gate_up").format, Some(WeightFormat::Nvfp4), "the vision entry does not change the text experts");
+    assert_eq!(p.budget.weight_gib, base.budget.weight_gib);
+    assert!(p.notes.iter().any(|n| n.contains("not used by the plan") && n.contains("model.visual.layers.0.mlp.experts")), "and is not consumed");
+    // Two paths for one text module that disagree are rejected at parse time.
+    let mut v = raw();
+    ql(&mut v).insert("layers.0.mlp.experts".into(), json!({"quant_algo": "MXFP8", "group_size": 32}));
+    assert!(format!("{:#}", spec_of(&v).unwrap_err()).contains("conflicting formats"));
+}
+
+#[test]
+fn unplanned_hybrid_shapes_are_rejected_instead_of_mis_budgeted() {
+    let mut v = raw();
+    v["text_config"]["mtp_num_hidden_layers"] = json!(2);
+    v["text_config"]["mtp"]["num_hidden_layers"] = json!(2);
+    assert!(format!("{:#}", spec_of(&v).unwrap_err()).contains("at most one MTP layer"));
+    for field in ["indexer_compress_ratio", "linear_conv_kernel_dim", "heads_per_ngram", "hc_lowrank"] {
+        let mut v = raw();
+        v["text_config"][field] = json!(0);
+        assert!(format!("{:#}", spec_of(&v).unwrap_err()).contains(field), "{field} = 0 must be a config error");
+    }
+}
+
+#[test]
+fn a_qwen4_exp_variant_without_linear_attention_stays_planned_only() {
+    let mut v = raw();
+    let n = v["text_config"]["layer_types"].as_array().unwrap().len();
+    v["text_config"]["layer_types"] = json!(vec!["full_attention"; n]);
+    v["text_config"]["full_attention_interval"] = json!(1);
+    let p = plan_of(&spec_of(&v).unwrap());
+    assert!(p.model.hybrid.is_some(), "qwen4_exp keeps its HyperConnection, PLE and gated attention");
+    let g = codegen::generate(&p);
+    assert!(g.kernels.iter().all(|k| k.status == "planned") && g.files.iter().all(|(_, s)| !s.contains("__global__")));
+    let mut v = raw();
+    v["text_config"].as_object_mut().unwrap().remove("layer_types");
+    assert!(format!("{:#}", spec_of(&v).unwrap_err()).contains("missing layer_types"));
+}
+
+#[test]
+fn tied_embeddings_are_resident_once() {
+    let base = plan_of(&spec_of(&raw()).unwrap());
+    let mut v = raw();
+    v["text_config"]["tie_word_embeddings"] = json!(true);
+    v["tie_word_embeddings"] = json!(true);
+    let p = plan_of(&spec_of(&v).unwrap());
+    let gib = (1u64 << 30) as f64;
+    let lm_head = 248_320.0 * 2560.0 * 2.0;
+    assert!(((base.budget.weight_gib - p.budget.weight_gib) * gib - lm_head).abs() < 1.0, "one matrix fewer resident");
+    assert_eq!(p.budget.decode_bytes_per_token_gb, base.budget.decode_bytes_per_token_gb, "lm_head is still read every token");
+}
+
+#[test]
+fn resident_parameters_and_fixed_state_are_counted_separately() {
+    let s = spec_of(&raw()).unwrap();
+    let h = s.hybrid.as_ref().unwrap();
+    let params = plan::hybrid_param_bytes(&s, h);
+    let get = |n: &str| params.iter().find(|(k, _)| *k == n).unwrap().1;
+    assert_eq!(get("gdn_conv_filters"), 36.0 * 10_240.0 * 4.0 * 2.0); // 2,949,120 B
+    assert_eq!(get("hc_norms"), 97.0 * 10_240.0 * 4.0);
+    // With no context, KV/state is exactly the fixed recurrent state: FP32 state + BF16 conv state.
+    let p0 = plan_at(&s, 0);
+    let fixed = 36.0 * (48.0 * 128.0 * 128.0 * 4.0 + 10_240.0 * 3.0 * 2.0);
+    assert!((p0.budget.kv_gib_at_ctx * (1u64 << 30) as f64 - fixed).abs() < 1.0, "{}", p0.budget.kv_gib_at_ctx);
+    // Decode traffic is unchanged by the residency accounting.
+    assert!(close(p0.budget.decode_bytes_per_token_ctx_free_gb.unwrap(), 7.338, 0.01));
+}
+
+#[test]
+fn formats_the_planner_cannot_honor_are_rejected() {
+    let mut v = raw();
+    ql(&mut v).insert("model.language_model.layers.0.attn_hyper_connection.input_mix_weight_down".into(), json!({"quant_algo": "MXFP8", "group_size": 32}));
+    assert!(format!("{:#}", spec_of(&v).unwrap_err()).contains("HyperConnection"));
+    let mut v = raw();
+    ql(&mut v).insert("mtp.layers.48.mlp.experts".into(), json!({"quant_algo": "NVFP4", "group_size": 16}));
+    assert!(format!("{:#}", spec_of(&v).unwrap_err()).contains("one MTP layer"));
+}

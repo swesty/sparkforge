@@ -1,6 +1,6 @@
 //! The planner: turns a ModelSpec into concrete per-shape kernel decisions for GB10.
 //! Every number here is derived from the config + target, nothing is hand-tuned per model.
-use crate::config::{Hybrid, LayerKind, ModelSpec, WeightFormat};
+use crate::config::{strip_text_prefix, Hybrid, LayerKind, ModelSpec, WeightFormat, TEXT_PREFIXES};
 use crate::target::Target;
 use serde::Serialize;
 use std::cell::RefCell;
@@ -177,10 +177,11 @@ impl<'a> Formats<'a> {
         best
     }
 
-    /// Format of `rel` (for example `linear_attn.in_proj_qkv`) in main-model layer `layer`.
+    /// Format of `rel` (for example `linear_attn.in_proj_qkv`) in main-model layer `layer`. Only
+    /// language-model paths match, so another tower's `layers.N` (vision, MTP) never does.
     pub fn layer(&self, layer: u32, rel: &str) -> WeightFormat {
         let tail = format!("layers.{layer}.{rel}");
-        self.find(|k| !k.starts_with("mtp.") && (*k == tail || k.ends_with(&format!(".{tail}")))).unwrap_or(self.m.weights)
+        self.find(|k| TEXT_PREFIXES.iter().any(|p| k.strip_prefix(p) == Some(tail.as_str()))).unwrap_or(self.m.weights)
     }
 
     /// The formats of a module class across `layers`, with how many layers use each, most common
@@ -203,9 +204,13 @@ impl<'a> Formats<'a> {
         self.find(|k| k.starts_with("mtp.") && k.ends_with(&format!(".{rel}"))).unwrap_or(self.m.weights)
     }
 
-    /// Format of a once-per-model module whose path ends with `suffix`.
+    /// Format of a once-per-model language-model module whose path ends with `suffix`.
     pub fn model(&self, suffix: &str) -> WeightFormat {
-        self.find(|k| !k.starts_with("mtp.") && k.ends_with(suffix)).unwrap_or(self.m.weights)
+        let text = |k: &str| {
+            let r = strip_text_prefix(k);
+            !(k.starts_with("mtp.") || r.starts_with("visual") || r.starts_with("vision") || r.starts_with("audio"))
+        };
+        self.find(|k| text(k) && k.ends_with(suffix)).unwrap_or(self.m.weights)
     }
 
     pub fn unused(&self) -> Vec<String> {
@@ -283,11 +288,17 @@ fn hybrid_linears_noted(m: &ModelSpec, h: &Hybrid, f: &Formats, notes: &mut Vec<
         v.extend(class_linears("expert_gate_up", 2 * e.expert_intermediate, m.hidden, e.num_experts, e.experts_per_tok, &ef, notes));
         v.extend(class_linears("expert_down", m.hidden, e.expert_intermediate, e.num_experts, e.experts_per_tok, &ef, notes));
         if e.shared_intermediate > 0 {
-            let sg = f.class(&all, "mlp.shared_expert.gate_proj");
-            if sg != f.class(&all, "mlp.shared_expert.up_proj") {
-                notes.push("shared expert gate_proj and up_proj have different formats; they cannot share one fused GEMV".into());
+            // gate and up fuse into one GEMV only where both are in the same format; otherwise each
+            // is planned (and counted) on its own.
+            let same = all.iter().all(|&l| f.layer(l, "mlp.shared_expert.gate_proj") == f.layer(l, "mlp.shared_expert.up_proj"));
+            if same {
+                v.extend(class("shared_gate_up", 2 * e.shared_intermediate, m.hidden, &all, "mlp.shared_expert.gate_proj", notes));
+                f.class(&all, "mlp.shared_expert.up_proj");
+            } else {
+                notes.push("shared expert gate_proj and up_proj differ in format in some layers; they are planned as separate GEMVs".into());
+                v.extend(class("shared_gate", e.shared_intermediate, m.hidden, &all, "mlp.shared_expert.gate_proj", notes));
+                v.extend(class("shared_up", e.shared_intermediate, m.hidden, &all, "mlp.shared_expert.up_proj", notes));
             }
-            v.extend(class_linears("shared_gate_up", 2 * e.shared_intermediate, m.hidden, 1, 1, &sg, notes));
             v.extend(class("shared_down", m.hidden, e.shared_intermediate, &all, "mlp.shared_expert.down_proj", notes));
             v.extend(class("shared_expert_gate", 1, m.hidden, &all, "mlp.shared_expert_gate", notes));
         }
@@ -333,6 +344,22 @@ fn hybrid_other_ops(m: &ModelSpec, h: &Hybrid, f: &Formats) -> Vec<OpClass> {
             None, nqsa, 0.0),
         op("moe_route_topk", "select", "other", format!("top {} of {}", m.moe.as_ref().map_or(0, |e| e.experts_per_tok), m.moe.as_ref().map_or(0, |e| e.num_experts)),
             None, m.layers, 0.0),
+    ]
+}
+
+/// Resident non-GEMV parameters of the hybrid, by component (bytes): norm weights, conv filters
+/// and per-head gate parameters. Recurrent state is fixed memory, not a parameter.
+pub fn hybrid_param_bytes(m: &ModelSpec, h: &Hybrid) -> Vec<(&'static str, f64)> {
+    let (g, q) = (&h.gdn, &h.qsa);
+    let res = (h.hc.streams * m.hidden) as f64;
+    let ngdn = h.count(LayerKind::LinearAttention) as f64;
+    let nqsa = h.count(LayerKind::FullAttention) as f64;
+    vec![
+        ("hc_norms", h.hc_mixers() as f64 * res * 4.0),
+        ("ple_conv_and_norms", res * h.ple.conv_kernel as f64 * 2.0 + 3.0 * res * 4.0),
+        ("gdn_conv_filters", ngdn * g.qkv_dim() as f64 * g.conv_kernel as f64 * 2.0),
+        ("gdn_norm_and_gates", ngdn * (g.value_head_dim as f64 * 4.0 + 2.0 * g.value_heads as f64 * 4.0)),
+        ("qsa_norms", nqsa * (2.0 * m.head_dim as f64 * 4.0 + 2.0 * q.indexer_head_dim as f64 * 4.0)),
     ]
 }
 
@@ -518,8 +545,10 @@ pub fn build(m: &ModelSpec, t: &Target, o: &PlanOpts) -> Plan {
             let linear_total: f64 = ls.iter().chain(std::iter::once(&lm)).map(|l| l.bytes_one() * l.copies as f64 * l.per_token as f64).sum();
             let table = formats.model("ple_embedding.ngram_embedding");
             let ple_table = h.ple.table_rows() as f64 * h.ple.head_dim() as f64 * table.bytes_per_elem();
-            let small: f64 = ops.iter().filter(|o| o.kind != "gemv" && o.group != "gdn_state").map(|o| o.bytes_per_token).sum();
-            let weights = linear_total + emb + ple_table + mtp_weight_bytes(m, h, &formats) + small;
+            let small: f64 = hybrid_param_bytes(m, h).iter().map(|(_, b)| b).sum();
+            // A tied lm_head is the embedding matrix itself; count it once.
+            let lm_resident = if m.tie_embeddings { lm.bytes_one() } else { 0.0 };
+            let weights = linear_total - lm_resident + emb + ple_table + mtp_weight_bytes(m, h, &formats) + small;
             let fixed = h.count(LayerKind::LinearAttention) as f64 * (h.gdn.state_bytes() + h.gdn.conv_state_bytes()) as f64;
             let decode: f64 = ops.iter().map(|o| o.bytes_per_token).sum();
             notes.push(format!("{}: every decode op in this plan is planned, not generated; kernels arrive with the milestone M2 tickets, and `emit`/`verify` produce no kernels for this model yet", m.arch));

@@ -29,6 +29,15 @@
 - [x] 4.5 Name every unused format-map entry. Verify: `cargo test` with four injected entries.
 - [x] 4.6 Keep dense plan JSON unchanged. Verify: `cargo test` compares against golden files from `main` at `8aa1a73`, and the CLI output is byte-identical.
 
+## 5. codex-review round 2
+
+- [x] 5.1 Fuse shared gate/up only where formats match. Verify: `cargo test` checks that BF16 up projections give `shared_gate` and `shared_up`, and both budgets grow by 76,185,600 B.
+- [x] 5.2 A null nested `quantization_config` falls back to the top level; different non-null values fail. Verify: `cargo test`.
+- [x] 5.3 Scope text lookups to language-model paths and reject conflicting aliases (text prefixes, the single MTP layer's indices). Verify: `cargo test` checks that a vision entry leaves formats and budget unchanged and is reported unused, and that a conflicting alias fails.
+- [x] 5.4 Reject zero dimensions, more than one MTP layer, and quantized HyperConnection weights. Verify: `cargo test`.
+- [x] 5.5 `qwen4_exp` always takes the hybrid path, and a missing `layer_types` fails. Verify: `cargo test` checks that an all-full-attention variant emits only planned entries.
+- [x] 5.6 Count a tied embedding once and the conv filters in resident weights. Verify: `cargo test` checks the tie (one matrix fewer resident, decode unchanged), the conv filters (2,949,120 B), and the fixed state at ctx 0.
+
 ## Workflow follow-up
 
 - Archive with `openspec archive add-qwen4-exp-config` after merge.

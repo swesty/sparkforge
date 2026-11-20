@@ -43,9 +43,19 @@ See proposal.md (Why). Sources for every number:
    - A positive `full_attention_interval`.
    - The MTP count from either field, with an error when they disagree.
 
-8. **Dense output is unchanged.** Hybrid-only fields are omitted when empty: `ops`, the context-free budget figure, `formats`, `hybrid`, and a zero shared-expert width. The internal per-token count on `Linear` is not serialized. Golden files of `main`'s dense plan JSON (`tests/golden/`) pin this.
+8. **Lookups are scoped, and pairs fuse only when compatible** (codex-review round 2).
+   - Text-layer lookups match only language-model prefixes (`""`, `model.`, `model.language_model.`, `language_model.`, `language_model.model.`). A vision or MTP entry with the same `layers.N` suffix can't set a text layer's format.
+   - The parser rejects two paths for one module that disagree, including the single MTP layer's duplicate indices.
+   - The shared expert's gate and up fuse into one GEMV only when every layer's pair has the same format; otherwise they become `shared_gate` and `shared_up`.
+   - HyperConnection weights are modelled as BF16, so a map that quantizes them is rejected.
+   - Resident weights count norm and conv-filter parameters explicitly (`hybrid_param_bytes`), and a tied embedding once. Gated DeltaNet state stays fixed memory.
+   - A `null` nested `quantization_config` falls back to the top level, and two different non-null values are an error.
+   - `qwen4_exp` always takes the hybrid path, even with no linear-attention layers.
+   - Every hybrid dimension must be positive, and more than one MTP layer is rejected.
 
-9. **Nothing is generated for the hybrid layout yet.**
+9. **Dense output is unchanged.** Hybrid-only fields are omitted when empty: `ops`, the context-free budget figure, `formats`, `hybrid`, and a zero shared-expert width. The internal per-token count on `Linear` is not serialized. Golden files of `main`'s dense plan JSON (`tests/golden/`) pin this.
+
+10. **Nothing is generated for the hybrid layout yet.**
    - Codegen's dense kernels would be wrong for it: full-head RoPE, dense attention, BF16-only GEMVs. So every op class is listed as `planned` with no source.
    - `verify` refuses any plan with no generated kernel, and `bind` refuses hybrid or mixed-precision checkpoints.
    - The hybrid cache key hashes the serialized plan, so variants with the same op names (for example with and without the format map) emit to different directories.

@@ -130,6 +130,20 @@ pub struct FormatMap {
     pub modules: BTreeMap<String, WeightFormat>,
 }
 
+/// Prefixes under which a checkpoint may place its language model's modules.
+pub const TEXT_PREFIXES: [&str; 5] = ["", "model.", "model.language_model.", "language_model.", "language_model.model."];
+
+/// A module path with any language-model prefix removed (`model.language_model.layers.0.x` ->
+/// `layers.0.x`). Paths of other towers keep their tower name (`model.visual.x` -> `visual.x`).
+pub fn strip_text_prefix(path: &str) -> &str {
+    for p in ["model.language_model.", "language_model.model.", "language_model.", "model."] {
+        if let Some(r) = path.strip_prefix(p) {
+            return r;
+        }
+    }
+    path
+}
+
 impl FormatMap {
     pub fn is_empty(&self) -> bool { self.modules.is_empty() }
     /// Format of the module at exactly `path`, if the map lists it.
@@ -321,8 +335,14 @@ fn detect_format(q: &Option<RawQuant>) -> Result<(WeightFormat, FormatMap)> {
             let layers = q.quantized_layers.as_ref().filter(|m| !m.is_empty())
                 .context("modelopt MIXED_PRECISION without a quantized_layers map; pass --format to override")?;
             let mut map = FormatMap::default();
+            // Two paths for one module (with and without a language-model prefix) must agree.
+            let mut by_module: BTreeMap<&str, (&str, WeightFormat)> = BTreeMap::new();
             for (module, lq) in layers {
-                map.modules.insert(module.clone(), layer_format(module, lq)?);
+                let f = layer_format(module, lq)?;
+                if let Some((other, g)) = by_module.insert(strip_text_prefix(module), (module, f)) {
+                    ensure!(g == f, "quantized_layers lists {other} as {g:?} and {module} as {f:?}: conflicting formats for one module");
+                }
+                map.modules.insert(module.clone(), f);
             }
             Ok((WeightFormat::Bf16, map))
         }
@@ -342,8 +362,11 @@ fn text_config(v: serde_json::Value) -> Result<serde_json::Value> {
     let Some(tc) = top.remove("text_config") else { return Ok(serde_json::Value::Object(top)) };
     let serde_json::Value::Object(mut text) = tc else { bail!("text_config is not a JSON object") };
     for k in ["quantization_config", "architectures"] {
-        if let Some(x) = top.remove(k) {
-            text.entry(k).or_insert(x);
+        let Some(x) = top.remove(k).filter(|x| !x.is_null()) else { continue };
+        match text.get(k) {
+            None | Some(serde_json::Value::Null) => { text.insert(k.into(), x); }
+            Some(nested) if *nested == x => {}
+            Some(_) => bail!("config.json declares different {k} values at the top level and in text_config"),
         }
     }
     Ok(serde_json::Value::Object(text))
@@ -353,19 +376,34 @@ fn need<T>(v: Option<T>, field: &str) -> Result<T> {
     v.with_context(|| format!("qwen4_exp config is missing {field}"))
 }
 
+/// A required dimension: present and positive (zero would divide by zero or underflow later).
+fn dim(v: Option<u32>, field: &str) -> Result<u32> {
+    let x = need(v, field)?;
+    ensure!(x > 0, "qwen4_exp config field {field} must be positive, got 0");
+    Ok(x)
+}
+
 fn parse_hybrid(r: &RawConfig, body: &serde_json::Value, head_dim: u32, partial_rotary: Option<f64>) -> Result<Option<Hybrid>> {
-    let Some(types) = &r.layer_types else { return Ok(None) };
+    let model_type = r.model_type.as_deref().unwrap_or("unknown");
+    let qwen4 = model_type == "qwen4_exp_text" || model_type == "qwen4_exp";
+    // A qwen4_exp model always takes the hybrid path, even with no linear-attention layers: its
+    // HyperConnection, PLE and gated sparse attention exist in every variant, and the dense
+    // kernels implement none of them.
+    let types = match (&r.layer_types, qwen4) {
+        (Some(t), _) => t,
+        (None, true) => bail!("qwen4_exp config is missing layer_types"),
+        (None, false) => return Ok(None),
+    };
     let schedule = types.iter().map(|t| match t.as_str() {
         "linear_attention" => Ok(LayerKind::LinearAttention),
         "full_attention" => Ok(LayerKind::FullAttention),
         other => bail!("layer type {other:?} is not supported (linear_attention, full_attention)"),
     }).collect::<Result<Vec<_>>>()?;
-    if schedule.iter().all(|&k| k == LayerKind::FullAttention) {
+    if !qwen4 {
+        ensure!(schedule.iter().all(|&k| k == LayerKind::FullAttention),
+            "hybrid linear-attention model {model_type:?} is not supported (only qwen4_exp, Qwen3.8 Flash Next)");
         return Ok(None);
     }
-    let model_type = r.model_type.as_deref().unwrap_or("unknown");
-    ensure!(model_type == "qwen4_exp_text" || model_type == "qwen4_exp",
-        "hybrid linear-attention model {model_type:?} is not supported (only qwen4_exp, Qwen3.8 Flash Next)");
     ensure!(schedule.len() as u32 == r.num_hidden_layers,
         "layer_types has {} entries but num_hidden_layers is {}", schedule.len(), r.num_hidden_layers);
     let h: RawHybrid = serde_json::from_value(body.clone()).context("parsing qwen4_exp fields")?;
@@ -385,10 +423,10 @@ fn parse_hybrid(r: &RawConfig, body: &serde_json::Value, head_dim: u32, partial_
         "mrope_section {sections:?} covers {} dims, but partial_rotary_factor {factor} rotates {rotary} of {head_dim}", 2 * sections.iter().sum::<u32>());
     let ple = Ple {
         layer_ids: need(h.ple_layer_ids, "ple_layer_ids")?,
-        embed_dim: need(h.ple_embed_dim, "ple_embed_dim")?,
-        conv_kernel: need(h.ple_conv_kernel_size, "ple_conv_kernel_size")?,
-        ngram_size: need(h.ngram_size, "ngram_size")?,
-        heads_per_ngram: need(h.heads_per_ngram, "heads_per_ngram")?,
+        embed_dim: dim(h.ple_embed_dim, "ple_embed_dim")?,
+        conv_kernel: dim(h.ple_conv_kernel_size, "ple_conv_kernel_size")?,
+        ngram_size: dim(h.ngram_size, "ngram_size")?,
+        heads_per_ngram: dim(h.heads_per_ngram, "heads_per_ngram")?,
         vocab_base: need(h.ngram_vocab_size_base, "ngram_vocab_size_base")?,
     };
     ensure!(ple.ngram_size >= 2 && ple.embed_dim % ple.heads() == 0,
@@ -405,32 +443,58 @@ fn parse_hybrid(r: &RawConfig, body: &serde_json::Value, head_dim: u32, partial_
     }
     let gate = need(h.output_gate_type, "output_gate_type")?;
     ensure!(gate == "sigmoid", "output_gate_type {gate:?} is not supported (sigmoid)");
+    let mtp_layers = h.mtp_num_hidden_layers.or(nested_mtp).unwrap_or(0);
+    // The MTP budget resolves one set of formats for the draft layer; more layers could each carry
+    // their own, so they are rejected until they are budgeted per layer.
+    ensure!(mtp_layers <= 1, "{mtp_layers} MTP layers: at most one MTP layer is planned so far");
     Ok(Some(Hybrid {
         schedule,
         gdn: Gdn {
-            key_heads: need(h.linear_num_key_heads, "linear_num_key_heads")?,
-            value_heads: need(h.linear_num_value_heads, "linear_num_value_heads")?,
-            key_head_dim: need(h.linear_key_head_dim, "linear_key_head_dim")?,
-            value_head_dim: need(h.linear_value_head_dim, "linear_value_head_dim")?,
-            conv_kernel: need(h.linear_conv_kernel_dim, "linear_conv_kernel_dim")?,
+            key_heads: dim(h.linear_num_key_heads, "linear_num_key_heads")?,
+            value_heads: dim(h.linear_num_value_heads, "linear_num_value_heads")?,
+            key_head_dim: dim(h.linear_key_head_dim, "linear_key_head_dim")?,
+            value_head_dim: dim(h.linear_value_head_dim, "linear_value_head_dim")?,
+            conv_kernel: dim(h.linear_conv_kernel_dim, "linear_conv_kernel_dim")?,
         },
         qsa: Qsa {
             output_gate: true,
-            indexer_heads: need(h.indexer_n_heads, "indexer_n_heads")?,
-            indexer_head_dim: need(h.indexer_head_dim, "indexer_head_dim")?,
-            indexer_kv_heads: need(h.indexer_kv_heads, "indexer_kv_heads")?,
-            compress_ratio: need(h.indexer_compress_ratio, "indexer_compress_ratio")?,
-            budget: need(h.indexer_budget, "indexer_budget")?,
+            indexer_heads: dim(h.indexer_n_heads, "indexer_n_heads")?,
+            indexer_head_dim: dim(h.indexer_head_dim, "indexer_head_dim")?,
+            indexer_kv_heads: dim(h.indexer_kv_heads, "indexer_kv_heads")?,
+            compress_ratio: dim(h.indexer_compress_ratio, "indexer_compress_ratio")?,
+            budget: dim(h.indexer_budget, "indexer_budget")?,
         },
-        hc: HyperConnection { streams: need(h.hc_count, "hc_count")?, lowrank: need(h.hc_lowrank, "hc_lowrank")? },
+        hc: HyperConnection { streams: dim(h.hc_count, "hc_count")?, lowrank: dim(h.hc_lowrank, "hc_lowrank")? },
         ple,
         mrope: Mrope {
             partial_rotary_factor: factor,
             sections,
             interleaved: rp.and_then(|p| p.get("mrope_interleaved")).and_then(|b| b.as_bool()).unwrap_or(false),
         },
-        mtp_layers: h.mtp_num_hidden_layers.or(nested_mtp).unwrap_or(0),
+        mtp_layers,
     }))
+}
+
+/// Format-map rules the hybrid planner relies on.
+fn check_hybrid_formats(formats: &FormatMap, h: &Hybrid) -> Result<()> {
+    for path in formats.modules.keys() {
+        // HyperConnection mixers are planned as BF16 GEMVs (down merged with the injection rows).
+        ensure!(!path.contains("hyper_connection"),
+            "quantized_layers lists {path}: quantized HyperConnection weights are not planned yet (they are BF16 in the planner)");
+    }
+    // With one MTP layer, every `mtp.layers.<n>.<module>` entry names that layer's module, so
+    // duplicate entries (the checkpoint lists the experts under two indices) must agree.
+    if h.mtp_layers == 1 {
+        let mut seen: BTreeMap<&str, (&str, WeightFormat)> = BTreeMap::new();
+        for (path, f) in &formats.modules {
+            let Some(rest) = path.strip_prefix("mtp.layers.") else { continue };
+            let Some((_, module)) = rest.split_once('.') else { continue };
+            if let Some((other, g)) = seen.insert(module, (path, *f)) {
+                ensure!(g == *f, "quantized_layers lists {other} as {g:?} and {path} as {f:?}: conflicting formats for the one MTP layer");
+            }
+        }
+    }
+    Ok(())
 }
 
 impl ModelSpec {
@@ -476,6 +540,9 @@ impl ModelSpec {
             Some(f) => (f, FormatMap::default()),
             None => detect_format(&r.quantization_config)?,
         };
+        if let Some(h) = &hybrid {
+            check_hybrid_formats(&formats, h)?;
+        }
         // Only the hybrid planner reads per-module formats; a dense plan would treat every listed
         // module as the default format, so a dense mixed-precision checkpoint is rejected.
         ensure!(formats.is_empty() || hybrid.is_some(),
