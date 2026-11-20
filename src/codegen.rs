@@ -311,8 +311,10 @@ pub fn generate(p: &Plan) -> Generated {
             kernels.push(KernelEntry { entry: o.name.clone(), file: "model.cu".into(), grid: [grid, 1, 1], block, dyn_smem: 0, status: "planned", args: vec![] });
         }
         let mut h = Sha256::new();
+        // Nothing is generated, so the plan itself (formats, budget) is what distinguishes two
+        // variants; key on it so their emitted artifacts never share a directory.
         h.update(p.target.arch.as_bytes()); h.update(src.as_bytes());
-        for k in &kernels { h.update(k.entry.as_bytes()); }
+        h.update(serde_json::to_string(p).unwrap_or_default().as_bytes());
         let key = h.finalize().iter().take(8).map(|b| format!("{b:02x}")).collect::<String>();
         return Generated { arch: p.target.arch.into(), cache_key: key, files: vec![("model.cu".into(), src)], kernels };
     }

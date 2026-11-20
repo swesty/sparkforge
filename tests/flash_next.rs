@@ -55,9 +55,10 @@ fn flash_next_config_parses_into_a_hybrid_spec() {
 fn flash_next_decode_bytes_match_the_checkpoint_headers() {
     let p = plan_of(&spec_of(&raw()).unwrap());
     // Context-free decode bytes per token from the safetensors headers: 7,338 MB.
-    assert!(close(p.budget.decode_bytes_per_token_ctx_free_gb, 7.338, 0.01), "{}", p.budget.decode_bytes_per_token_ctx_free_gb);
+    let free = p.budget.decode_bytes_per_token_ctx_free_gb.unwrap();
+    assert!(close(free, 7.338, 0.01), "{free}");
     // At 32K: plus FP8 KV for 2,051 selected positions and the indexer scan, in 12 layers.
-    let ctx_mb = (p.budget.decode_bytes_per_token_gb - p.budget.decode_bytes_per_token_ctx_free_gb) * 1e3;
+    let ctx_mb = (p.budget.decode_bytes_per_token_gb - free) * 1e3;
     assert!(close(ctx_mb, 2051.0 * 1024.0 * 12.0 / 1e6 + 8192.0 * 128.0 * 12.0 / 1e6, 0.001), "{ctx_mb}");
     // Per-group figures from the headers, in MB per token.
     let g = plan::bytes_by_group(&p);
@@ -110,8 +111,9 @@ fn mixed_precision_needs_a_layer_map_with_known_schemes() {
     assert!(err(base(json!({"quant_method": "modelopt", "quant_algo": "MIXED_PRECISION"}))).contains("quantized_layers"));
     assert!(err(base(q(json!({"model.layers.0.mlp": {"quant_algo": "FP8"}})))).contains("model.layers.0.mlp"));
     assert!(err(base(q(json!({"model.layers.0.mlp": {"quant_algo": "MXFP8", "group_size": 16}})))).contains("group_size 16"));
-    let ok = spec_of(&base(q(json!({"model.layers.0.mlp": {"quant_algo": "MXFP8", "group_size": 32}})))).unwrap();
-    assert_eq!(ok.formats.get("model.layers.0.mlp"), Some(WeightFormat::Mxfp8));
+    // A valid map on a dense model is refused: the dense planner does not read per-module formats,
+    // so planning it would report every listed module at the default format.
+    assert!(err(base(q(json!({"model.layers.0.self_attn.o_proj": {"quant_algo": "MXFP8", "group_size": 32}})))).contains("only for qwen4_exp"));
     // An explicit --format replaces detection, map included.
     let over = ModelSpec::from_json(&base(q(json!({"model.layers.0.mlp": {"quant_algo": "FP8"}}))).to_string(), Some(WeightFormat::Bf16)).unwrap();
     assert!(over.formats.is_empty());
@@ -142,6 +144,20 @@ fn other_hybrid_layouts_and_inconsistent_schedules_are_rejected() {
     assert!(format!("{:#}", spec_of(&v).unwrap_err()).contains("hc_count"));
 
     let mut v = raw();
+    v["text_config"]["full_attention_interval"] = json!(0);
+    assert!(format!("{:#}", spec_of(&v).unwrap_err()).contains("full_attention_interval"));
+
+    for ids in [json!([]), json!([2, 5])] {
+        let mut v = raw();
+        v["text_config"]["ple_layer_ids"] = ids;
+        assert!(format!("{:#}", spec_of(&v).unwrap_err()).contains("exactly one PLE layer"));
+    }
+
+    let mut v = raw();
+    v["text_config"]["mtp_num_hidden_layers"] = json!(2);
+    assert!(format!("{:#}", spec_of(&v).unwrap_err()).contains("disagrees"));
+
+    let mut v = raw();
     v["text_config"]["rope_parameters"]["mrope_section"] = json!([16, 16, 16]);
     assert!(format!("{:#}", spec_of(&v).unwrap_err()).contains("mrope_section"));
 
@@ -167,9 +183,61 @@ fn partial_rotary_is_rejected_on_dense_models() {
 #[test]
 fn unused_format_map_entries_are_reported() {
     let mut v = raw();
-    v["quantization_config"]["quantized_layers"]["model.decoder.blocks.0.ffn"] = json!({"quant_algo": "MXFP8", "group_size": 32});
+    for i in 0..4 {
+        v["quantization_config"]["quantized_layers"][format!("model.decoder.blocks.{i}.ffn")] = json!({"quant_algo": "MXFP8", "group_size": 32});
+    }
     let p = plan_of(&spec_of(&v).unwrap());
-    assert!(p.notes.iter().any(|n| n.contains("not used by the plan") && n.contains("model.decoder.blocks.0.ffn")), "{:#?}", p.notes);
+    let note = p.notes.iter().find(|n| n.contains("not used by the plan")).expect("unused entries noted");
+    for i in 0..4 {
+        assert!(note.contains(&format!("model.decoder.blocks.{i}.ffn")), "every unused path is named: {note}");
+    }
     // The checkpoint's own map is fully consumed, including its duplicate MTP expert entry.
     assert!(!plan_of(&spec_of(&raw()).unwrap()).notes.iter().any(|n| n.contains("not used by the plan")));
+}
+
+#[test]
+fn the_mtp_count_can_come_from_the_nested_mtp_config() {
+    let mut v = raw();
+    v["text_config"].as_object_mut().unwrap().remove("mtp_num_hidden_layers");
+    let s = spec_of(&v).unwrap();
+    assert_eq!(s.hybrid.as_ref().unwrap().mtp_layers, 1);
+    let with = plan_of(&spec_of(&raw()).unwrap()).budget.weight_gib;
+    assert_eq!(plan_of(&s).budget.weight_gib, with, "draft weights stay in the resident budget");
+}
+
+#[test]
+fn layers_with_different_formats_are_counted_at_their_own_size() {
+    let mut v = raw();
+    v["quantization_config"]["quantized_layers"].as_object_mut().unwrap().remove("model.language_model.layers.0.linear_attn.in_proj_qkv");
+    let p = plan_of(&spec_of(&v).unwrap());
+    let op = |n: &str| p.ops.iter().find(|o| o.name == n).unwrap_or_else(|| panic!("missing {n}"));
+    assert_eq!((op("gdn_in_proj_qkv").per_token, op("gdn_in_proj_qkv").format), (35, Some(WeightFormat::Mxfp8)));
+    assert_eq!((op("gdn_in_proj_qkv_bf16").per_token, op("gdn_in_proj_qkv_bf16").format), (1, Some(WeightFormat::Bf16)));
+    // One BF16 instance adds (2 - 1.03125) bytes per element of one 10240 x 2560 matrix, nothing more.
+    let base = plan_of(&spec_of(&raw()).unwrap()).budget.decode_bytes_per_token_ctx_free_gb.unwrap();
+    let delta = p.budget.decode_bytes_per_token_ctx_free_gb.unwrap() - base;
+    assert!(close(delta, 10240.0 * 2560.0 * (2.0 - 1.03125) / 1e9, 1e-6), "{delta}");
+}
+
+#[test]
+fn different_hybrid_plans_emit_to_different_directories() {
+    let mut v = raw();
+    v.as_object_mut().unwrap().remove("quantization_config");
+    let a = codegen::generate(&plan_of(&spec_of(&raw()).unwrap()));
+    let b = codegen::generate(&plan_of(&spec_of(&v).unwrap()));
+    assert_ne!(a.cache_key, b.cache_key, "the same op names with different formats must not share an artifact directory");
+}
+
+#[test]
+fn dense_plan_json_is_unchanged_from_the_base_revision() {
+    // Golden files: `sparkforge plan <config> --json` from main at 8aa1a73, before this change.
+    // Update them only for an intentional change to the dense plan.
+    for c in ["llama-3.1-8b", "qwen3-30b-a3b"] {
+        let s = ModelSpec::from_json(&std::fs::read_to_string(format!("configs/{c}.json")).unwrap(), None).unwrap();
+        // Both sides go through the same text round trip: serde_json's default float parser can
+        // differ from the in-memory value by one ulp, so parse the current plan's JSON text too.
+        let got: Value = serde_json::from_str(&serde_json::to_string_pretty(&plan_of(&s)).unwrap()).unwrap();
+        let want: Value = serde_json::from_str(&std::fs::read_to_string(format!("tests/golden/{c}.plan.json")).unwrap()).unwrap();
+        assert_eq!(got, want, "{c}: dense plan JSON changed");
+    }
 }

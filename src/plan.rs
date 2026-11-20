@@ -18,7 +18,8 @@ pub struct Linear {
     pub active: u32,
     pub format: WeightFormat,
     /// Instances read per decode token: the layers that contain this linear (or 1 for once-per-token
-    /// linears such as `lm_head`).
+    /// linears such as `lm_head`). Internal; the hybrid `ops` list carries it in the plan JSON.
+    #[serde(skip)]
     pub per_token: u32,
 }
 
@@ -100,7 +101,9 @@ pub struct Budget {
     pub max_ctx_that_fits: u64,
     pub decode_bytes_per_token_gb: f64,
     /// Decode bytes per token that do not depend on context length (weights and recurrent state).
-    pub decode_bytes_per_token_ctx_free_gb: f64,
+    /// Reported for hybrid plans.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub decode_bytes_per_token_ctx_free_gb: Option<f64>,
     pub decode_tok_s_ceiling: f64,
 }
 
@@ -114,7 +117,8 @@ pub struct Plan {
     pub attn: AttnPlan,
     pub norm: NormPlan,
     pub budget: Budget,
-    /// Every distinct decode op, with shapes and bytes per token.
+    /// Every distinct decode op of a hybrid plan, with shapes and bytes per token.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub ops: Vec<OpClass>,
     pub notes: Vec<String>,
 }
@@ -179,17 +183,19 @@ impl<'a> Formats<'a> {
         self.find(|k| !k.starts_with("mtp.") && (*k == tail || k.ends_with(&format!(".{tail}")))).unwrap_or(self.m.weights)
     }
 
-    /// One format for a module class across `layers`; mixed formats count at the largest size.
-    pub fn class(&self, layers: &[u32], rel: &str, notes: &mut Vec<String>) -> WeightFormat {
-        let fs: Vec<WeightFormat> = layers.iter().map(|&l| self.layer(l, rel)).collect();
-        let mut best = *fs.first().unwrap_or(&self.m.weights);
-        for f in &fs {
-            if *f != best {
-                notes.push(format!("{rel} has more than one weight format across layers; the budget counts the largest"));
-                if f.bytes_per_elem() > best.bytes_per_elem() { best = *f; }
+    /// The formats of a module class across `layers`, with how many layers use each, most common
+    /// first. Each format becomes its own op class, so the budget counts every instance at its own size.
+    pub fn class(&self, layers: &[u32], rel: &str) -> Vec<(WeightFormat, u32)> {
+        let mut groups: Vec<(WeightFormat, u32)> = vec![];
+        for &l in layers {
+            let f = self.layer(l, rel);
+            match groups.iter_mut().find(|(g, _)| *g == f) {
+                Some(g) => g.1 += 1,
+                None => groups.push((f, 1)),
             }
         }
-        best
+        groups.sort_by_key(|g| std::cmp::Reverse(g.1));
+        groups
     }
 
     /// Format of `rel` in the MTP draft layers.
@@ -216,6 +222,28 @@ fn lin(name: &str, n: u32, k: u32, format: WeightFormat, per_token: u32) -> Line
     Linear { name: name.into(), n, k, copies: 1, active: 1, format, per_token }
 }
 
+fn format_slug(f: WeightFormat) -> String {
+    match f {
+        WeightFormat::Bf16 => "bf16".into(),
+        WeightFormat::W4A16 { group } => format!("w4a16g{group}"),
+        WeightFormat::Nvfp4 => "nvfp4".into(),
+        WeightFormat::Nvfp4WeightOnly => "nvfp4wo".into(),
+        WeightFormat::Mxfp8 => "mxfp8".into(),
+    }
+}
+
+/// One linear per format group of a class: the most common format keeps the plain name, the
+/// others get a format suffix (for example `gdn_in_proj_qkv_bf16`).
+fn class_linears(name: &str, n: u32, k: u32, copies: u32, active: u32, groups: &[(WeightFormat, u32)], notes: &mut Vec<String>) -> Vec<Linear> {
+    if groups.len() > 1 {
+        notes.push(format!("{name} uses {} weight formats across layers; each is planned as its own op class", groups.len()));
+    }
+    groups.iter().enumerate().map(|(i, &(format, count))| Linear {
+        name: if i == 0 { name.into() } else { format!("{name}_{}", format_slug(format)) },
+        n, k, copies, active, format, per_token: count,
+    }).collect()
+}
+
 /// Linears of the Qwen3.8 Flash Next hybrid (one entry per distinct shape and format).
 pub fn hybrid_linears(m: &ModelSpec, h: &Hybrid, f: &Formats) -> Vec<Linear> {
     hybrid_linears_noted(m, h, f, &mut vec![])
@@ -229,36 +257,39 @@ fn hybrid_linears_noted(m: &ModelSpec, h: &Hybrid, f: &Formats, notes: &mut Vec<
     let res = h.hc.streams * m.hidden;
     let mixers = h.hc_mixers();
     let bf = WeightFormat::Bf16;
+    // HyperConnection: down projection merged with the 4 injection logits for the next combine
+    // (all but the final mixer), and the up projection whose epilogue does the gated mean.
     let mut v = vec![
-        // HyperConnection: down projection merged with the 4 injection logits for the next combine
-        // (all but the final mixer), and the up projection whose epilogue does the gated mean.
         lin("hc_down_inject", h.hc.lowrank + h.hc.streams, res, bf, mixers - 1),
         lin("hc_down_final", h.hc.lowrank, res, bf, 1),
         lin("hc_up", res, h.hc.lowrank, bf, mixers),
-        lin("gdn_in_proj_qkv", g.qkv_dim(), m.hidden, f.class(&gdn, "linear_attn.in_proj_qkv", notes), gdn.len() as u32),
-        lin("gdn_in_proj_z", g.value_dim(), m.hidden, f.class(&gdn, "linear_attn.in_proj_z", notes), gdn.len() as u32),
-        lin("gdn_in_proj_a", g.value_heads, m.hidden, f.class(&gdn, "linear_attn.in_proj_a", notes), gdn.len() as u32),
-        lin("gdn_in_proj_b", g.value_heads, m.hidden, f.class(&gdn, "linear_attn.in_proj_b", notes), gdn.len() as u32),
-        lin("gdn_out_proj", m.hidden, g.value_dim(), f.class(&gdn, "linear_attn.out_proj", notes), gdn.len() as u32),
-        lin("qsa_q_proj", m.q_dim() * (1 + u32::from(q.output_gate)), m.hidden, f.class(&qsa, "self_attn.q_proj", notes), qsa.len() as u32),
-        lin("qsa_k_proj", m.kv_dim(), m.hidden, f.class(&qsa, "self_attn.k_proj", notes), qsa.len() as u32),
-        lin("qsa_v_proj", m.kv_dim(), m.hidden, f.class(&qsa, "self_attn.v_proj", notes), qsa.len() as u32),
-        lin("qsa_index_qk_proj", q.index_qk_dim(), m.hidden, f.class(&qsa, "self_attn.indexer.index_qk_proj", notes), qsa.len() as u32),
-        lin("qsa_o_proj", m.hidden, m.q_dim(), f.class(&qsa, "self_attn.o_proj", notes), qsa.len() as u32),
     ];
+    let class = |name: &str, n: u32, k: u32, layers: &[u32], rel: &str, notes: &mut Vec<String>| {
+        class_linears(name, n, k, 1, 1, &f.class(layers, rel), notes)
+    };
+    v.extend(class("gdn_in_proj_qkv", g.qkv_dim(), m.hidden, &gdn, "linear_attn.in_proj_qkv", notes));
+    v.extend(class("gdn_in_proj_z", g.value_dim(), m.hidden, &gdn, "linear_attn.in_proj_z", notes));
+    v.extend(class("gdn_in_proj_a", g.value_heads, m.hidden, &gdn, "linear_attn.in_proj_a", notes));
+    v.extend(class("gdn_in_proj_b", g.value_heads, m.hidden, &gdn, "linear_attn.in_proj_b", notes));
+    v.extend(class("gdn_out_proj", m.hidden, g.value_dim(), &gdn, "linear_attn.out_proj", notes));
+    v.extend(class("qsa_q_proj", m.q_dim() * (1 + u32::from(q.output_gate)), m.hidden, &qsa, "self_attn.q_proj", notes));
+    v.extend(class("qsa_k_proj", m.kv_dim(), m.hidden, &qsa, "self_attn.k_proj", notes));
+    v.extend(class("qsa_v_proj", m.kv_dim(), m.hidden, &qsa, "self_attn.v_proj", notes));
+    v.extend(class("qsa_index_qk_proj", q.index_qk_dim(), m.hidden, &qsa, "self_attn.indexer.index_qk_proj", notes));
+    v.extend(class("qsa_o_proj", m.hidden, m.q_dim(), &qsa, "self_attn.o_proj", notes));
     if let Some(e) = &m.moe {
-        let l = m.layers;
-        v.push(lin("router", e.num_experts, m.hidden, f.class(&all, "mlp.gate", notes), l));
-        let ef = f.class(&all, "mlp.experts", notes);
-        v.push(Linear { name: "expert_gate_up".into(), n: 2 * e.expert_intermediate, k: m.hidden, copies: e.num_experts, active: e.experts_per_tok, format: ef, per_token: l });
-        v.push(Linear { name: "expert_down".into(), n: m.hidden, k: e.expert_intermediate, copies: e.num_experts, active: e.experts_per_tok, format: ef, per_token: l });
+        v.extend(class("router", e.num_experts, m.hidden, &all, "mlp.gate", notes));
+        let ef = f.class(&all, "mlp.experts");
+        v.extend(class_linears("expert_gate_up", 2 * e.expert_intermediate, m.hidden, e.num_experts, e.experts_per_tok, &ef, notes));
+        v.extend(class_linears("expert_down", m.hidden, e.expert_intermediate, e.num_experts, e.experts_per_tok, &ef, notes));
         if e.shared_intermediate > 0 {
-            let sg = f.class(&all, "mlp.shared_expert.gate_proj", notes);
-            let su = f.class(&all, "mlp.shared_expert.up_proj", notes);
-            if sg != su { notes.push("shared expert gate_proj and up_proj have different formats; they cannot share one fused GEMV".into()); }
-            v.push(lin("shared_gate_up", 2 * e.shared_intermediate, m.hidden, sg, l));
-            v.push(lin("shared_down", m.hidden, e.shared_intermediate, f.class(&all, "mlp.shared_expert.down_proj", notes), l));
-            v.push(lin("shared_expert_gate", 1, m.hidden, f.class(&all, "mlp.shared_expert_gate", notes), l));
+            let sg = f.class(&all, "mlp.shared_expert.gate_proj");
+            if sg != f.class(&all, "mlp.shared_expert.up_proj") {
+                notes.push("shared expert gate_proj and up_proj have different formats; they cannot share one fused GEMV".into());
+            }
+            v.extend(class_linears("shared_gate_up", 2 * e.shared_intermediate, m.hidden, 1, 1, &sg, notes));
+            v.extend(class("shared_down", m.hidden, e.shared_intermediate, &all, "mlp.shared_expert.down_proj", notes));
+            v.extend(class("shared_expert_gate", 1, m.hidden, &all, "mlp.shared_expert_gate", notes));
         }
     }
     // PLE projections run once per token (at the PLE layer). key_proj widens to the HC residual.
@@ -352,7 +383,7 @@ fn group_of(name: &str) -> &'static str {
         n if n.starts_with("expert_") => "routed_experts",
         n if n.starts_with("shared_") => "shared_experts",
         n if n.starts_with("ple_") => "ple",
-        "router" => "routers",
+        n if n.starts_with("router") => "routers",
         "lm_head" => "lm_head",
         _ => "dense",
     }
@@ -467,8 +498,11 @@ pub fn build(m: &ModelSpec, t: &Target, o: &PlanOpts) -> Plan {
         format: if m.hybrid.is_some() { formats.model("lm_head") } else { WeightFormat::Bf16 }, per_token: 1 };
     let emb = m.vocab as f64 * m.hidden as f64 * 2.0;
     let usable = t.usable_mem_gib * (1u64 << 30) as f64;
-    let mut ops: Vec<OpClass> = ls.iter().map(|l| linear_op(l, group_of(&l.name))).collect();
-    ops.push(linear_op(&lm, "lm_head"));
+    let mut ops: Vec<OpClass> = vec![];
+    if m.hybrid.is_some() {
+        ops = ls.iter().map(|l| linear_op(l, group_of(&l.name))).collect();
+        ops.push(linear_op(&lm, "lm_head"));
+    }
 
     let (weight_bytes, fixed_state, kv_per_token, ctx_bytes, decode_ctx_free) = match &m.hybrid {
         None => {
@@ -498,7 +532,7 @@ pub fn build(m: &ModelSpec, t: &Target, o: &PlanOpts) -> Plan {
             let unused = formats.unused();
             if !unused.is_empty() {
                 notes.push(format!("{} quantized_layers entr{} not used by the plan (path layout not understood): {}",
-                    unused.len(), if unused.len() == 1 { "y is" } else { "ies are" }, unused.iter().take(3).cloned().collect::<Vec<_>>().join(", ")));
+                    unused.len(), if unused.len() == 1 { "y is" } else { "ies are" }, unused.join(", ")));
             }
             (weights, fixed, hybrid_kv_bytes_per_token(m, h), hybrid_ctx_bytes(m, h, o.ctx), decode)
         }
@@ -550,7 +584,7 @@ pub fn build(m: &ModelSpec, t: &Target, o: &PlanOpts) -> Plan {
             kv_gib_at_ctx: kv / (1u64 << 30) as f64,
             ctx: o.ctx, fits: weight_bytes + kv <= usable, max_ctx_that_fits: max_ctx,
             decode_bytes_per_token_gb: decode_bytes / 1e9,
-            decode_bytes_per_token_ctx_free_gb: decode_ctx_free / 1e9,
+            decode_bytes_per_token_ctx_free_gb: m.hybrid.as_ref().map(|_| decode_ctx_free / 1e9),
             decode_tok_s_ceiling: tok_s,
         },
         ops,

@@ -6,7 +6,7 @@
 
 For a hybrid plan, code generation SHALL list every op class as `planned` and SHALL emit no CUDA
 kernel source, because the dense kernels assume full-head RoPE, dense attention and uniform
-weights.
+weights. Its cache key SHALL include the plan, so two hybrid plans never share an output directory.
 
 #### Scenario: Flash Next emit
 - **WHEN** `sparkforge emit configs/qwen3.8-flash-next-nvfp4.json` runs

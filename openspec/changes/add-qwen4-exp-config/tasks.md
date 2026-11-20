@@ -20,6 +20,15 @@
 - [x] 3.2 Dense plans and kernels are unchanged. Verify: Llama 3.1 8B and Qwen3-30B-A3B plan JSON and `emit` cache keys are identical to `main` (`a8d62dd6088f7ef1`, `36838cb28f25286c`).
 - [x] 3.3 No kernel changed, so `sparkforge verify --bench` on a GB10 for both example configs is unaffected. Verify: run it on spark-5 and record the numbers in the PR.
 
+## 4. codex-review round 1
+
+- [x] 4.1 Reject dense MIXED_PRECISION configs. Verify: `cargo test` fails a dense map with "only for qwen4_exp".
+- [x] 4.2 Key hybrid emit directories on the plan. Verify: `cargo test` gives different cache keys with and without the format map.
+- [x] 4.3 Split format groups into separate op classes. Verify: `cargo test` checks that a BF16 layer 0 gives `gdn_in_proj_qkv` ×35 MXFP8 plus `gdn_in_proj_qkv_bf16` ×1, and the budget grows by exactly one matrix's difference.
+- [x] 4.4 Require exactly one PLE placement, a positive attention interval, and agreeing MTP counts (read from either field). Verify: `cargo test`.
+- [x] 4.5 Name every unused format-map entry. Verify: `cargo test` with four injected entries.
+- [x] 4.6 Keep dense plan JSON unchanged. Verify: `cargo test` compares against golden files from `main` at `8aa1a73`, and the CLI output is byte-identical.
+
 ## Workflow follow-up
 
 - Archive with `openspec archive add-qwen4-exp-config` after merge.

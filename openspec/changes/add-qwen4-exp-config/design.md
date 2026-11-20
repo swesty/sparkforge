@@ -23,10 +23,13 @@ See proposal.md (Why). Sources for every number:
    | `MXFP8` | `Mxfp8` (1 + 1/32 B per element) | 32 |
 
    Any other scheme or group size is an error naming the module. `--format` still replaces detection entirely, map included.
+
+   Only the hybrid planner reads the map. A dense model with a map is rejected: planning it would report every listed module at the default format (codex-review round 1).
 4. **The planner looks up formats by path suffix and reports what it never used.**
    - Main-model lookups match `layers.{i}.{module}` outside `mtp.`. MTP and model-level modules match by suffix.
    - Every map entry a lookup touches is marked used. The checkpoint lists the MTP experts under two paths, and both count.
-   - A remaining entry becomes a plan note. A checkpoint with an unfamiliar path layout therefore can't fall back to BF16 silently.
+   - A remaining entry becomes a plan note that names every unused path. A checkpoint with an unfamiliar path layout therefore can't fall back to BF16 silently.
+   - Layers of one class in different formats become separate op classes. The most common format keeps the plain name, and the others get a suffix, such as `gdn_in_proj_qkv_bf16`. Each is counted at its own size, not the largest.
 5. **One op class per distinct kernel.** The checkpoint has about 900 per-layer op instances per decode token, but they collapse into 34 classes with identical shape and format, so one generated kernel serves each class.
    - **HyperConnection:** `hc_down_inject` (N = 324: the 320 low-rank rows plus the 4 injection logits for the next combine, ×96), `hc_down_final` (N = 320, ×1, because the final mixer has no `block_inject_weight`), and `hc_up` (×97).
    - **PLE projections:** run once per token. `key_proj` widens to the residual width (`streams × hidden` = 10,240, matching the checkpoint's `[10240, 2560]`).
@@ -35,9 +38,17 @@ See proposal.md (Why). Sources for every number:
    - **Per context token:** FP8 KV gathered for `min(ctx, budget + compress_ratio − 1)` positions, plus the indexer scan of `ceil(ctx / compress_ratio)` FP8 keys, in each sparse-attention layer.
    - **Resident:** all expert copies, the PLE table (`heads × ngram_vocab_size_base` rows, which is within a few ppm of the checkpoint's prime-sized tables), the MTP layer and the small parameters. Gated DeltaNet state is fixed memory.
    - **KV:** planned as FP8 (the checkpoint sets no `kv_cache_quant_algo`, and the fleet engine runs FP8 KV).
-7. **Nothing is generated for the hybrid layout yet.**
+7. **What the planner models is what the parser accepts.**
+   - Exactly one PLE placement, which costs one application and one table per token.
+   - A positive `full_attention_interval`.
+   - The MTP count from either field, with an error when they disagree.
+
+8. **Dense output is unchanged.** Hybrid-only fields are omitted when empty: `ops`, the context-free budget figure, `formats`, `hybrid`, and a zero shared-expert width. The internal per-token count on `Linear` is not serialized. Golden files of `main`'s dense plan JSON (`tests/golden/`) pin this.
+
+9. **Nothing is generated for the hybrid layout yet.**
    - Codegen's dense kernels would be wrong for it: full-head RoPE, dense attention, BF16-only GEMVs. So every op class is listed as `planned` with no source.
-   - `verify` refuses the model, and `bind` refuses hybrid or mixed-precision checkpoints.
+   - `verify` refuses any plan with no generated kernel, and `bind` refuses hybrid or mixed-precision checkpoints.
+   - The hybrid cache key hashes the serialized plan, so variants with the same op names (for example with and without the format map) emit to different directories.
    - Dense plans and generated code are unchanged: the Llama and Qwen3-30B-A3B cache keys equal `main`'s.
 
 ## Risks / Trade-offs

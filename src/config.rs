@@ -57,6 +57,7 @@ struct RawConfig {
     layer_types: Option<Vec<String>>,
 }
 fn default_eps() -> f64 { 1e-6 }
+fn is_zero(x: &u32) -> bool { *x == 0 }
 
 /// Fields only the `qwen4_exp` (Qwen3.8 Flash Next) hybrid carries. All are required for it.
 #[derive(Debug, Deserialize)]
@@ -85,8 +86,14 @@ struct RawHybrid {
     ngram_size: Option<u32>,
     heads_per_ngram: Option<u32>,
     ngram_vocab_size_base: Option<u64>,
-    // Multi-token prediction draft layers
+    // Multi-token prediction draft layers (also given as `mtp.num_hidden_layers`)
     mtp_num_hidden_layers: Option<u32>,
+    mtp: Option<RawMtp>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawMtp {
+    num_hidden_layers: Option<u32>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize)]
@@ -118,6 +125,7 @@ impl WeightFormat {
 /// Per-module weight formats from a ModelOpt `MIXED_PRECISION` checkpoint. Modules absent from
 /// the map are BF16 (or F32 for norms and state parameters).
 #[derive(Debug, Clone, Default, Serialize)]
+#[serde(transparent)]
 pub struct FormatMap {
     pub modules: BTreeMap<String, WeightFormat>,
 }
@@ -141,6 +149,7 @@ pub struct Moe {
     pub expert_intermediate: u32,
     pub shared_experts: u32,
     /// Total width of the shared expert(s); 0 without shared experts.
+    #[serde(skip_serializing_if = "is_zero")]
     pub shared_intermediate: u32,
 }
 
@@ -261,12 +270,14 @@ pub struct ModelSpec {
     /// Format of every weight not listed in `formats` (all weights when `formats` is empty).
     pub weights: WeightFormat,
     /// Per-module formats of a mixed-precision checkpoint.
+    #[serde(skip_serializing_if = "FormatMap::is_empty")]
     pub formats: FormatMap,
     /// Per-head RMSNorm on q and k before RoPE (Qwen3). Not generated yet.
     pub qk_norm: bool,
     /// Bias on the q/k/v projections (Qwen2, some Llama variants). Not generated yet.
     pub qkv_bias: bool,
     /// Hybrid linear/sparse-attention layout (Qwen3.8 Flash Next). Planned, not generated.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub hybrid: Option<Hybrid>,
 }
 
@@ -359,6 +370,7 @@ fn parse_hybrid(r: &RawConfig, body: &serde_json::Value, head_dim: u32, partial_
         "layer_types has {} entries but num_hidden_layers is {}", schedule.len(), r.num_hidden_layers);
     let h: RawHybrid = serde_json::from_value(body.clone()).context("parsing qwen4_exp fields")?;
     if let Some(n) = h.full_attention_interval {
+        ensure!(n > 0, "full_attention_interval must be positive, got 0");
         for (i, k) in schedule.iter().enumerate() {
             let want = if (i as u32 + 1) % n == 0 { LayerKind::FullAttention } else { LayerKind::LinearAttention };
             ensure!(*k == want, "layer {i} is {k:?}, but full_attention_interval {n} puts {want:?} there");
@@ -381,8 +393,15 @@ fn parse_hybrid(r: &RawConfig, body: &serde_json::Value, head_dim: u32, partial_
     };
     ensure!(ple.ngram_size >= 2 && ple.embed_dim % ple.heads() == 0,
         "PLE embed_dim {} is not divisible into {} heads (orders 2..={})", ple.embed_dim, ple.heads(), ple.ngram_size);
+    // The planner charges one PLE application and one table per token; other placements are not
+    // modelled, so they are rejected rather than mis-budgeted.
+    ensure!(ple.layer_ids.len() == 1, "ple_layer_ids {:?}: exactly one PLE layer is supported", ple.layer_ids);
     for &l in &ple.layer_ids {
         ensure!(l < r.num_hidden_layers, "ple_layer_ids names layer {l}, but there are {}", r.num_hidden_layers);
+    }
+    let nested_mtp = h.mtp.as_ref().and_then(|m| m.num_hidden_layers);
+    if let (Some(a), Some(b)) = (h.mtp_num_hidden_layers, nested_mtp) {
+        ensure!(a == b, "mtp_num_hidden_layers {a} disagrees with mtp.num_hidden_layers {b}");
     }
     let gate = need(h.output_gate_type, "output_gate_type")?;
     ensure!(gate == "sigmoid", "output_gate_type {gate:?} is not supported (sigmoid)");
@@ -410,7 +429,7 @@ fn parse_hybrid(r: &RawConfig, body: &serde_json::Value, head_dim: u32, partial_
             sections,
             interleaved: rp.and_then(|p| p.get("mrope_interleaved")).and_then(|b| b.as_bool()).unwrap_or(false),
         },
-        mtp_layers: h.mtp_num_hidden_layers.unwrap_or(0),
+        mtp_layers: h.mtp_num_hidden_layers.or(nested_mtp).unwrap_or(0),
     }))
 }
 
@@ -457,6 +476,10 @@ impl ModelSpec {
             Some(f) => (f, FormatMap::default()),
             None => detect_format(&r.quantization_config)?,
         };
+        // Only the hybrid planner reads per-module formats; a dense plan would treat every listed
+        // module as the default format, so a dense mixed-precision checkpoint is rejected.
+        ensure!(formats.is_empty() || hybrid.is_some(),
+            "modelopt MIXED_PRECISION is supported only for qwen4_exp (Qwen3.8 Flash Next) so far; dense planning does not read per-module formats yet. Pass --format to override");
         let arch = r.architectures.first().cloned().unwrap_or_else(|| "unknown".into());
         let rope_theta = r.rope_theta
             .or_else(|| rp.and_then(|p| p.get("rope_theta")).and_then(|x| x.as_f64()))

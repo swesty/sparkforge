@@ -71,6 +71,33 @@ the rotated dims.
 - **WHEN** every entry of `layer_types` is `full_attention`
 - **THEN** the model is parsed as an ordinary dense model
 
+### Requirement: Hybrid configs are validated against what the planner models
+
+A qwen4_exp config MUST have a positive `full_attention_interval` when present and exactly one
+`ple_layer_ids` entry. The MTP layer count SHALL come from `mtp_num_hidden_layers` or
+`mtp.num_hidden_layers`, and parsing MUST fail when both are present and differ.
+
+#### Scenario: Zero attention interval
+- **WHEN** `full_attention_interval` is 0
+- **THEN** parsing fails naming `full_attention_interval` instead of panicking
+
+#### Scenario: No PLE placement
+- **WHEN** `ple_layer_ids` is empty
+- **THEN** parsing fails stating that exactly one PLE layer is supported
+
+#### Scenario: Nested MTP count only
+- **WHEN** `mtp_num_hidden_layers` is absent and `mtp.num_hidden_layers` is 1
+- **THEN** the spec has 1 MTP layer and the resident budget still includes it
+
+### Requirement: Mixed precision is accepted only for the hybrid layout
+
+A dense model with a MIXED_PRECISION map MUST be rejected unless a format override is given,
+because the dense planner does not read per-module formats.
+
+#### Scenario: Dense mixed-precision config
+- **WHEN** a dense config's MIXED_PRECISION map lists `model.layers.0.self_attn.o_proj` as MXFP8
+- **THEN** parsing fails stating that mixed precision is supported only for qwen4_exp
+
 ### Requirement: RoPE parameters may come from rope_parameters
 
 `rope_theta`, the RoPE type and `partial_rotary_factor` SHALL also be read from `rope_parameters`.

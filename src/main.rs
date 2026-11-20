@@ -106,8 +106,9 @@ fn print_plan(p: &plan::Plan) {
     if !m.formats.is_empty() { println!("mixed precision: {} quantized modules, everything else {:?}", m.formats.modules.len(), m.weights); }
     let b = &p.budget;
     println!("\nMemory: weights {:.1} GiB + KV/state {:.1} GiB @ {} ctx -> fits: {} (max ctx ~{})", b.weight_gib, b.kv_gib_at_ctx, b.ctx, b.fits, b.max_ctx_that_fits);
-    println!("Decode roofline: {:.3} GB/token ({:.3} GB context-free) -> ceiling {:.1} tok/s at {:.0} GB/s effective",
-        b.decode_bytes_per_token_gb, b.decode_bytes_per_token_ctx_free_gb, b.decode_tok_s_ceiling, p.target.dram_bw_effective_gbs);
+    println!("Decode roofline: {:.3} GB/token{} -> ceiling {:.1} tok/s at {:.0} GB/s effective",
+        b.decode_bytes_per_token_gb, b.decode_bytes_per_token_ctx_free_gb.map_or(String::new(), |c| format!(" ({c:.3} GB context-free)")),
+        b.decode_tok_s_ceiling, p.target.dram_bw_effective_gbs);
     if m.hybrid.is_some() {
         println!("\nDecode ops ({} distinct):", p.ops.len());
         for o in &p.ops {
