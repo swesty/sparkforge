@@ -1,5 +1,6 @@
 //! Emits CUDA C++ with every model dimension baked in as `constexpr`, so NVRTC can fully
 //! unroll loops, drop bounds checks, and pick register allocations per shape.
+use crate::config::{ModelSpec, RopeScaling};
 use crate::plan::Plan;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -83,7 +84,8 @@ rmsnorm(const bf16* __restrict__ x, const bf16* __restrict__ w, bf16* __restrict
 const ROPE_KV: &str = r#"
 namespace rope_ns {
 constexpr int HD = @HD@, HEADS = @HEADS@, KVH = @KVH@;
-constexpr float LOG2_THETA = @LOG2_THETA@f;
+// inv_freq[i] = 1 / theta^(2i/HD), computed on the host in f32 exactly as HF transformers does.
+__constant__ float INV_FREQ[HD / 2] = {@INV_FREQ@};
 }
 // Decode step, one token: rotates q and k in the fused qkv buffer (NeoX half-split layout)
 // and appends k/v into the cache at `pos`. Grid = HEADS + 2*KVH, block = HD/2.
@@ -93,8 +95,11 @@ rope_kv_append(bf16* __restrict__ qkv, bf16* __restrict__ k_cache, bf16* __restr
   const int h = blockIdx.x, i = threadIdx.x;
   bf16* base = qkv + (size_t)h * HD;
   if (h < HEADS + KVH) {
-    const float inv_freq = exp2f(-(2.0f * i / HD) * LOG2_THETA);
-    float s, c; sincosf((float)pos * inv_freq, &s, &c);
+    // The angle is formed in f32 (as HF does), but sin/cos must be precise: under --use_fast_math
+    // sincosf becomes __sincosf, whose error grows with |angle| (pos * inv_freq reaches ~1e5 rad).
+    // Double sincos is not affected by fast-math, and 64 threads x 1 call is negligible.
+    double sd, cd; sincos((double)((float)pos * INV_FREQ[i]), &sd, &cd);
+    const float s = (float)sd, c = (float)cd;
     const float x1 = __bfloat162float(base[i]), x2 = __bfloat162float(base[i + HD / 2]);
     const bf16 r1 = __float2bfloat16(x1 * c - x2 * s), r2 = __float2bfloat16(x2 * c + x1 * s);
     base[i] = r1; base[i + HD / 2] = r2;
@@ -258,6 +263,33 @@ extern "C" __global__ void __launch_bounds__(@NS@::WARPS * 32)
 }
 "#;
 
+/// RoPE inverse frequencies exactly as HF transformers computes them in f32:
+/// `1.0 / (base ** (arange(0, dim, 2).float() / dim))`, then `rope_scaling` if present.
+pub fn rope_inv_freq(m: &ModelSpec) -> Vec<f32> {
+    let (theta, hd) = (m.rope_theta as f32, m.head_dim);
+    (0..hd / 2)
+        .map(|i| {
+            let f = 1.0f32 / theta.powf((2 * i) as f32 / hd as f32);
+            match m.rope_scaling {
+                None => f,
+                // transformers `_compute_llama3_parameters`
+                Some(RopeScaling::Llama3 { factor, low_freq_factor, high_freq_factor, original_max_pos }) => {
+                    let (factor, lo, hi, old) = (factor as f32, low_freq_factor as f32, high_freq_factor as f32, original_max_pos as f32);
+                    let wavelen = 2.0 * std::f32::consts::PI / f;
+                    if wavelen < old / hi {
+                        f
+                    } else if wavelen > old / lo {
+                        f / factor
+                    } else {
+                        let smooth = (old / wavelen - lo) / (hi - lo);
+                        (1.0 - smooth) * f / factor + smooth * f
+                    }
+                }
+            }
+        })
+        .collect()
+}
+
 fn fill(t: &str, kv: &[(&str, String)]) -> String {
     let mut s = t.to_string();
     for (k, v) in kv { s = s.replace(&format!("@{k}@"), v); }
@@ -272,7 +304,7 @@ pub fn generate(p: &Plan) -> Generated {
     src += &fill(RMSNORM, &[("HIDDEN", m.hidden.to_string()), ("THREADS", p.norm.threads.to_string()), ("ITERS", p.norm.iters.to_string())]);
     kernels.push(KernelEntry { entry: "rmsnorm".into(), file: "model.cu".into(), grid: [1, 1, 1], block: p.norm.threads, dyn_smem: 0, status: "generated", args: vec!["x", "w", "y", "eps"] });
 
-    src += &fill(ROPE_KV, &[("HD", m.head_dim.to_string()), ("HEADS", m.heads.to_string()), ("KVH", m.kv_heads.to_string()), ("LOG2_THETA", format!("{:.8}", m.rope_theta.log2()))]);
+    src += &fill(ROPE_KV, &[("HD", m.head_dim.to_string()), ("HEADS", m.heads.to_string()), ("KVH", m.kv_heads.to_string()), ("INV_FREQ", rope_inv_freq(m).iter().map(|v| format!("{v:e}f")).collect::<Vec<_>>().join(", "))]);
     kernels.push(KernelEntry { entry: "rope_kv_append".into(), file: "model.cu".into(), grid: [m.heads + 2 * m.kv_heads, 1, 1], block: m.head_dim / 2, dyn_smem: 0, status: "generated", args: vec!["qkv", "k_cache", "v_cache", "pos"] });
 
     let a = &p.attn;

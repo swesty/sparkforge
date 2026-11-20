@@ -37,16 +37,19 @@ that would otherwise be runtime heuristics.
 
 | Module | Role | Status |
 |---|---|---|
-| `config.rs` | Parses HF configs (Llama/Qwen/Mistral-style dense, Qwen3-MoE/Mixtral/DeepSeek-style MoE aliases, quantization_config) into a `ModelSpec`. | Working |
+| `config.rs` | Parses HF configs (Llama/Qwen/Mistral-style dense, Qwen3-MoE/Mixtral MoE aliases, `quantization_config`, Llama 3 `rope_scaling`) into a `ModelSpec`. Anything it cannot plan correctly is an error, not a silent default (see below). | Working |
 | `target.rs` | GB10 hardware model: SMs, smem, regs, L2, effective bandwidth, usable unified memory. | Working |
 | `plan.rs` | Derives every linear (fused QKV, fused gate/up, experts, lm_head), picks decode GEMV grids, prefill GEMM tiles (smem/regs/wave-quantization scoring), flash-decoding split count, RMSNorm threading, memory budget, and decode roofline. | Working |
 | `codegen.rs` | Emits `model.cu` + `gemm_tiles.cuh` with shapes baked in, plus `manifest.json` (entry, grid, block, dyn smem, args). | Working |
-| `runtime.rs` | NVRTC compile for `sm_121a`, checks cc 12.1, loads every generated entry point via `cudarc`. | Builds; needs a Spark to run |
+| `runtime.rs` | NVRTC compile for `sm_121a`, checks cc 12.1, loads every generated entry point via `cudarc`, opts kernels above 48 KB into larger dynamic smem. | Verified on GB10 |
+| `verify.rs` | Runs every generated kernel on random bf16 inputs, diffs against an f64 CPU reference, and optionally times it with weights rotated out of L2. | Verified on GB10 |
 
-Generated kernels (all verified to compile for `sm_121a` with NVRTC 13, no register spills):
+Generated kernels (all compile for `sm_121a` with NVRTC 13 and match the CPU reference; see "Measured on GB10"):
 
 - `rmsnorm` — one CTA per row, 16-byte vector loads, thread count chosen so `hidden = threads × iters × 8` exactly.
-- `rope_kv_append` — NeoX RoPE on q/k in the fused QKV buffer, fused with K/V cache append.
+- `rope_kv_append` — NeoX RoPE on q/k in the fused QKV buffer, fused with K/V cache append. `inv_freq` is a
+  host-computed `__constant__` table (HF's f32 formula, plus Llama 3 scaling); sin/cos use double `sincos`
+  because fast-math `__sincosf` loses accuracy at large angles (error 0.55 at position 131071 before the fix).
 - `attn_decode_split` + `attn_decode_combine` — GQA-aware flash-decoding. One CTA per (kv_head, split) serves
   all query heads in the group, so each K/V row is read once per split. Split count is chosen so
   `kv_heads × splits ≥ 2 × 48 SMs`.
@@ -65,6 +68,7 @@ cargo build --release
 
 # On a Spark:
 cargo run --release --features cuda -- load configs/llama-3.1-8b.json --cuda-include /usr/local/cuda/include
+cargo run --release --features cuda -- verify configs/llama-3.1-8b.json --bench   # correctness + timing per kernel
 cargo test
 ```
 
@@ -72,6 +76,40 @@ Example plan output (Llama 3.1 8B, BF16): weights 15.0 GiB, decode needs about 1
 ceiling is about 12 tok/s at 235 GB/s. Attention runs 8 kv-heads × 12 splits = 96 CTAs. Prefill tiles land on
 128×128×32, 3 stages, 48 KB smem. Qwen3-30B-A3B in NVFP4: about 5.4 GB per token, ceiling about 43 tok/s,
 with grouped-GEMM tiles sized for about 128 tokens per expert at a 2,048-token prompt.
+
+## Measured on GB10
+
+One DGX Spark, GB10 (cc 12.1), CUDA 13.0, driver 580.178.04, 2026-11-20, with another vLLM engine resident on
+the same GPU (idle during the run). `verify --bench`; times are isolated kernels, back-to-back launches,
+no CUDA graph.
+
+| Kernel (Llama 3.1 8B BF16) | Max error | µs | GB/s |
+|---|---|---|---|
+| `gemv_lm_head` (1.05 GB of weights, cleanest bandwidth number) | 3.8e-3 | 4286 | 245 |
+| `gemv_gate_up_proj` | 3.8e-3 | 951 | 247 |
+| `gemv_down_proj` | 3.6e-3 | 500 | 235 |
+| `attn_decode` split+combine, seq 32768 | 3.7e-3 | 603 | 223 |
+| `rmsnorm`, `rope_kv_append`, `silu_mul` | ≤3.8e-3 | 2–4 each | launch-bound |
+
+- **Correctness:** every generated kernel is within 3.8e-3 of the f64 reference on both example models
+  (tolerance 1/64 ≈ two bf16 ulps). RoPE is checked at positions up to `max_position_embeddings - 1`.
+- **Speed:** the summed kernel times give 12.4 tok/s for Llama 3.1 8B BF16 at a 32K context (planner ceiling 12.2)
+  and 24.7 tok/s for Qwen3-30B-A3B run in BF16 (ceiling 25.3). The BF16 GEMV is already at about 90% of the
+  273 GB/s spec, so the remaining decode gains come from fewer bytes (NVFP4/W4A16) and fewer launches, not a
+  faster BF16 GEMV. Run-to-run variation was about 2%.
+- **ptxas (`-Xptxas -v`, nvcc 13.0):** `gemv_down_proj` at K=14336 spills 8 bytes; `attn_decode_split` with GQA
+  group 8 uses exactly 128 registers, the `__launch_bounds__(256, 2)` cap, so group 16 would spill.
+- Small MoE GEMVs are latency-bound (`gemv_router` 95 GB/s; each expert GEMV is a separate launch), so one
+  launch covering all top-k experts is the obvious MoE decode fix.
+
+## Not supported yet (rejected or flagged, never silently wrong)
+
+- Rejected at parse time: `rope_scaling` other than `llama3` (yarn, dynamic, linear, longrope); MLA attention
+  (`kv_lora_rank`, DeepSeek V2/V3); GPTQ/AWQ with per-channel scales (`group_size: -1`); modelopt quant
+  algorithms other than NVFP4; any other `quant_method`. `--format` overrides the quantization check.
+- Flagged in `plan` notes, output wrong until implemented: Qwen3 per-head q/k RMSNorm (`q_norm`/`k_norm`),
+  q/k/v projection bias (Qwen2, `attention_bias: true`).
+- Also ignored today: sliding-window attention (Mistral v0.1) and DeepSeek-style dense-first layers.
 
 ## Roadmap
 

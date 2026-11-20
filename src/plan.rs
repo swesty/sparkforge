@@ -221,6 +221,8 @@ pub fn build(m: &ModelSpec, t: &Target, o: &PlanOpts) -> Plan {
     let tok_s = t.dram_bw_effective_gbs * 1e9 / decode_bytes;
 
     if m.head_dim % 32 != 0 { notes.push(format!("head_dim {} not a multiple of 32; attention kernel needs a padded path", m.head_dim)); }
+    if m.qk_norm { notes.push("q/k per-head RMSNorm (q_norm/k_norm) is not generated yet: decode output is wrong for this model until it is".into()); }
+    if m.qkv_bias { notes.push("q/k/v projection bias is not generated yet: decode output is wrong for this model until it is".into()); }
     if m.hidden % 8 != 0 { notes.push("hidden not a multiple of 8; vectorized 16B loads disabled".into()); }
     if matches!(m.weights, WeightFormat::Nvfp4) {
         notes.push("NVFP4 weights: decode GEMV dequantizes in registers (W4A16-style); prefill should use mma.sync kind::mxf4nvf4 with on-the-fly activation quantization to actually use FP4 tensor cores".into());

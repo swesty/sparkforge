@@ -32,6 +32,19 @@ enum Cmd {
         #[arg(long, default_value = "/usr/local/cuda/include")]
         cuda_include: String,
     },
+    /// Run every generated kernel on the GPU against a CPU reference (needs --features cuda on a Spark).
+    #[cfg(feature = "cuda")]
+    Verify {
+        #[command(flatten)]
+        c: Common,
+        #[arg(long, default_value = "/usr/local/cuda/include")]
+        cuda_include: String,
+        /// Also time each kernel (weights rotated so they cannot sit in L2).
+        #[arg(long)]
+        bench: bool,
+        #[arg(long, default_value_t = 0x5eed)]
+        seed: u64,
+    },
 }
 
 #[derive(clap::Args)]
@@ -101,6 +114,30 @@ fn main() -> Result<()> {
             let g = codegen::generate(&build(&c)?);
             let e = sparkforge::runtime::Engine::load(&g, &cuda_include)?;
             println!("loaded {} kernels for sm_121a", e.funcs.len());
+        }
+        #[cfg(feature = "cuda")]
+        Cmd::Verify { c, cuda_include, bench, seed } => {
+            use sparkforge::verify;
+            let p = build(&c)?;
+            let g = codegen::generate(&p);
+            let e = sparkforge::runtime::Engine::load(&g, &cuda_include)?;
+            let rows = verify::run(&p, &g, &e, &verify::Opts { bench, seed })?;
+            println!("{:<28} {:<26} {:>10} {:>5} {:>10} {:>8}", "kernel", "case", "max err", "ok", "us", "GB/s");
+            let mut fails = 0;
+            for r in &rows {
+                let ok = r.err < verify::TOL;
+                fails += !ok as usize;
+                let us = r.us.map_or("-".into(), |t| format!("{t:.1}"));
+                let gbs = r.gbs.map_or("-".into(), |b| format!("{b:.0}"));
+                println!("{:<28} {:<26} {:>10.2e} {:>5} {:>10} {:>8}", r.kernel, r.case, r.err, if ok { "yes" } else { "NO" }, us, gbs);
+            }
+            let skipped: Vec<_> = g.kernels.iter().filter(|k| k.status != "generated").map(|k| k.entry.as_str()).collect();
+            if !skipped.is_empty() { println!("not generated yet (skipped): {}", skipped.join(", ")); }
+            if let Some(t) = verify::token_estimate_us(&p, &rows) {
+                println!("decode token, sum of isolated kernel times @ ctx {}: {:.2} ms -> {:.1} tok/s (planner ceiling {:.1})",
+                    p.budget.ctx, t / 1e3, 1e6 / t, p.budget.decode_tok_s_ceiling);
+            }
+            anyhow::ensure!(fails == 0, "{fails} check(s) above tolerance {:.4}", verify::TOL);
         }
     }
     Ok(())

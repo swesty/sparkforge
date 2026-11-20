@@ -11,3 +11,5 @@ pub mod target;
 
 #[cfg(feature = "cuda")]
 pub mod runtime;
+#[cfg(feature = "cuda")]
+pub mod verify;
