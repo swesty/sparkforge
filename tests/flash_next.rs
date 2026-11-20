@@ -431,3 +431,48 @@ fn a_format_override_can_skip_a_malformed_layer_map() {
     assert_eq!((s.weights, s.formats.is_empty(), s.declared_mixed), (WeightFormat::Bf16, true, true));
     assert!(format!("{:#}", spec_of(&cfg).unwrap_err()).contains("layers.0.self_attn.o_proj"));
 }
+
+// ---- SHA-783 round 1 follow-ups ----
+
+#[test]
+fn a_format_override_skips_malformed_quantization_fields() {
+    let cfg = json!({"hidden_size": 2048, "num_hidden_layers": 2, "num_attention_heads": 16, "vocab_size": 1000,
+        "quantization_config": {"quant_method": "awq", "bits": "4", "group_size": 128}});
+    assert_eq!(ModelSpec::from_json(&cfg.to_string(), Some(WeightFormat::Bf16)).unwrap().weights, WeightFormat::Bf16);
+    assert!(format!("{:#}", spec_of(&cfg).unwrap_err()).contains("quantization_config"));
+    // A mixed checkpoint with a malformed field is still recognized as mixed under an override.
+    let mixed = json!({"hidden_size": 2048, "num_hidden_layers": 2, "num_attention_heads": 16, "vocab_size": 1000,
+        "quantization_config": {"quant_method": "modelopt", "quant_algo": "MIXED_PRECISION", "group_size": "x"}});
+    assert!(ModelSpec::from_json(&mixed.to_string(), Some(WeightFormat::Bf16)).unwrap().declared_mixed);
+}
+
+#[test]
+fn each_mtp_shared_expert_projection_is_priced_at_its_own_format() {
+    let base = plan_of(&spec_of(&raw()).unwrap()).budget.weight_gib;
+    let one = 640.0 * 2560.0 * (2.0 - 1.03125); // one 640 x 2560 matrix, BF16 -> MXFP8
+    for proj in ["gate_proj", "up_proj", "down_proj"] {
+        let mut v = raw();
+        ql(&mut v).insert(format!("mtp.layers.0.mlp.shared_expert.{proj}"), json!({"quant_algo": "MXFP8", "group_size": 32}));
+        let p = plan_of(&spec_of(&v).unwrap());
+        let delta = (base - p.budget.weight_gib) * (1u64 << 30) as f64;
+        assert!((delta - one).abs() < 1.0, "{proj}: {delta}");
+        assert!(!p.notes.iter().any(|n| n.contains("not used by the plan")), "{proj} entry consumed");
+    }
+}
+
+#[test]
+fn auxiliary_paths_never_stand_in_for_ple_or_mtp_modules() {
+    let base = plan_of(&spec_of(&raw()).unwrap());
+    for aux in ["model.language_model.layers.0.aux.ple.key_proj", "mtp.layers.0.aux.self_attn.v_proj"] {
+        let mut v = raw();
+        ql(&mut v).insert(aux.into(), json!({"quant_algo": "MXFP8", "group_size": 32}));
+        let p = plan_of(&spec_of(&v).unwrap());
+        assert_eq!((p.budget.weight_gib, p.budget.decode_bytes_per_token_gb), (base.budget.weight_gib, base.budget.decode_bytes_per_token_gb), "{aux}");
+        assert!(p.notes.iter().any(|n| n.contains("not used by the plan") && n.contains(aux)), "{aux} reported unused");
+    }
+    // The genuine paths are honored.
+    let mut v = raw();
+    ql(&mut v).insert("model.language_model.layers.1.ple.key_proj".into(), json!({"quant_algo": "MXFP8", "group_size": 32}));
+    let p = plan_of(&spec_of(&v).unwrap());
+    assert_eq!(p.ops.iter().find(|o| o.name == "ple_key_proj").unwrap().format, Some(WeightFormat::Mxfp8));
+}

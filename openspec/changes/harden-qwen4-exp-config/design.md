@@ -14,6 +14,11 @@ See proposal.md (Why). Each decision below answers one codex-review finding on s
 6. **MoE top-k range** (`fp:1246d9fbf482`). `1 ≤ num_experts_per_tok ≤ num_experts` applies to every MoE family. It holds for the two example configs.
 7. **Refuse before CUDA** (`fp:6cddef73fc82`). The host-side `codegen::require_generated` runs in `main` before `Engine::load`, and again inside `verify::run` for library callers. Checked on a Mac with no CUDA: Flash Next `verify` prints the planned-only error.
 
+8. **Round 1 of codex-review on this change.**
+   - The whole `quantization_config` is raw JSON, decoded into `RawQuant` only during format detection. `declared_mixed` reads the raw `quant_method`/`quant_algo` strings, so it holds even when other fields are malformed.
+   - PLE lookups (`Formats::ple`) match only `ple.<m>` or `layers.<n>.ple.<m>` under a text prefix. MTP lookups match only `mtp.layers.<n>.<m>`. The suffix-based `Formats::model` is removed.
+   - The MTP shared expert's gate, up and down, and its router, are priced at their own formats.
+
 ## Risks / Trade-offs
 
 - **[Lazy decoding means a bad map entry surfaces later]** → It still surfaces at parse time whenever no override is given, naming the entry.

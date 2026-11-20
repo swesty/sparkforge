@@ -5,9 +5,9 @@
 ### Requirement: Format lookups are scoped to the language model
 
 Per-layer format lookups SHALL match only language-model module paths, so an entry of another tower
-(vision, MTP) with the same layer suffix never sets a text layer's format. `lm_head` SHALL match
-only at its model-level paths, other model-level modules only on a module boundary, and each MTP
-projection SHALL be looked up by its own path.
+(vision, MTP) with the same layer suffix never sets a text layer's format. `lm_head`, PLE modules
+(`ple.<m>` or `layers.<n>.ple.<m>`) and MTP modules (`mtp.layers.<n>.<m>`) SHALL match only at
+those exact paths, and each projection SHALL be looked up by its own path.
 
 #### Scenario: Vision experts in the map
 - **WHEN** the map also lists `model.visual.layers.0.mlp.experts` as MXFP8
@@ -16,6 +16,10 @@ projection SHALL be looked up by its own path.
 #### Scenario: Auxiliary head in a layer
 - **WHEN** the map lists `model.language_model.layers.0.aux_lm_head` as NVFP4
 - **THEN** `lm_head` stays BF16, both budgets are unchanged, and the entry is reported as unused
+
+#### Scenario: Auxiliary PLE or MTP path
+- **WHEN** the map lists `model.language_model.layers.0.aux.ple.key_proj` or `mtp.layers.0.aux.self_attn.v_proj`
+- **THEN** neither budget changes and the entry is reported as unused
 
 #### Scenario: MTP value projection
 - **WHEN** the map lists `mtp.layers.0.self_attn.v_proj` as MXFP8 and not `k_proj`

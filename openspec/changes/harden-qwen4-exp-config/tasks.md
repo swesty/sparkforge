@@ -10,6 +10,12 @@
 - [x] 1.6 Validate MoE top-k. Verify: `cargo test` checks that 0 and 513 fail.
 - [x] 1.7 Refuse a planned-only model before CUDA. Verify: `cargo test` covers `require_generated`, and `cargo run --features cuda -- verify configs/qwen3.8-flash-next-nvfp4.json` on a Mac without CUDA prints the planned-only error.
 
+## 1b. codex-review round 1
+
+- [x] 1b.1 Decode the whole `quantization_config` only during format detection. Verify: `cargo test` checks that a string `bits` plans as BF16 with `--format`, fails without it, and that a malformed mixed config still sets `declared_mixed`.
+- [x] 1b.2 Price the MTP shared expert's gate, up and down separately. Verify: `cargo test` checks that quantizing any one changes resident bytes by exactly one matrix's delta, and the entry is consumed.
+- [x] 1b.3 Match PLE and MTP modules at exact paths. Verify: `cargo test` checks that auxiliary `aux.ple.key_proj` and `aux.self_attn.v_proj` entries are reported unused and change no budget, while the real PLE key projection is honored.
+
 ## 2. Unchanged behavior
 
 - [x] 2.1 The dense example plans stay byte-identical. Verify: the golden-file test passes, and `plan --json` diffs empty.

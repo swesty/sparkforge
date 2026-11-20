@@ -46,7 +46,9 @@ struct RawConfig {
     moe_intermediate_size: Option<u32>,
     n_shared_experts: Option<u32>,
     shared_expert_intermediate_size: Option<u32>,
-    quantization_config: Option<RawQuant>,
+    /// Raw JSON, decoded only during format detection: with `--format` it is never interpreted,
+    /// so malformed quantization metadata cannot block an override.
+    quantization_config: Option<serde_json::Value>,
     rope_scaling: Option<serde_json::Value>,
     /// Newer HF configs put `rope_theta`, `rope_type` and partial-rotary fields here.
     rope_parameters: Option<serde_json::Value>,
@@ -330,8 +332,10 @@ fn layer_format(module: &str, q: &RawLayerQuant) -> Result<WeightFormat> {
     Ok(fmt)
 }
 
-fn detect_format(q: &Option<RawQuant>) -> Result<(WeightFormat, FormatMap)> {
-    let Some(q) = q else { return Ok((WeightFormat::Bf16, FormatMap::default())) };
+fn detect_format(q: &Option<serde_json::Value>) -> Result<(WeightFormat, FormatMap)> {
+    let Some(q) = q.as_ref().filter(|v| !v.is_null()) else { return Ok((WeightFormat::Bf16, FormatMap::default())) };
+    let q: RawQuant = serde_json::from_value(q.clone())
+        .context("quantization_config is malformed; pass --format to override")?;
     let method = q.quant_method.as_deref().unwrap_or("");
     let uniform = |f| Ok((f, FormatMap::default()));
     match (method, q.quant_algo.as_deref(), q.bits) {
@@ -571,8 +575,12 @@ impl ModelSpec {
         let rope_theta = r.rope_theta
             .or_else(|| rp.and_then(|p| p.get("rope_theta")).and_then(|x| x.as_f64()))
             .unwrap_or(10_000.0);
-        let declared_mixed = r.quantization_config.as_ref()
-            .is_some_and(|q| q.quant_method.as_deref() == Some("modelopt") && q.quant_algo.as_deref() == Some("MIXED_PRECISION"));
+        // Read from the raw strings, independently of format detection, so an override never
+        // hides that the checkpoint itself is mixed precision.
+        let declared_mixed = r.quantization_config.as_ref().is_some_and(|q| {
+            q.get("quant_method").and_then(|v| v.as_str()) == Some("modelopt")
+                && q.get("quant_algo").and_then(|v| v.as_str()) == Some("MIXED_PRECISION")
+        });
         Ok(ModelSpec {
             declared_mixed,
             qk_norm: arch.starts_with("Qwen3"),

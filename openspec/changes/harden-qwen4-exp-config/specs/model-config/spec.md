@@ -39,12 +39,16 @@ them to null; different non-null values at both levels MUST be rejected. A missi
 ### Requirement: An explicit format override replaces detection
 
 An explicit format override (CLI `--format`) SHALL replace detection entirely, so an unrecognized
-or malformed `quantization_config`, including a `quantized_layers` map this parser cannot read, is
-not an error when an override is given.
+or malformed `quantization_config` (any field, including a `quantized_layers` map this parser
+cannot read) is not an error when an override is given.
 
 #### Scenario: Override wins
 - **WHEN** `quantization_config` names modelopt FP8 and the caller passes BF16 as the format
 - **THEN** parsing succeeds with BF16 weights
+
+#### Scenario: Malformed field with an override
+- **WHEN** `quantization_config` is `{"quant_method": "awq", "bits": "4", "group_size": 128}` and the caller passes BF16
+- **THEN** parsing succeeds with BF16 weights, and without the override it fails naming `quantization_config`
 
 #### Scenario: Malformed layer map with an override
 - **WHEN** a MIXED_PRECISION `quantized_layers` entry is null and the caller passes BF16
