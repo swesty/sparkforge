@@ -16,8 +16,9 @@ struct RawQuant {
     bits: Option<u32>,
     /// GPTQ uses -1 for per-channel scales, so this must be signed.
     group_size: Option<i64>,
-    /// ModelOpt `MIXED_PRECISION`: module path -> that module's scheme.
-    quantized_layers: Option<BTreeMap<String, RawLayerQuant>>,
+    /// ModelOpt `MIXED_PRECISION`: module path -> that module's scheme. Kept as raw JSON and read
+    /// only during format detection, so `--format` can override a map this parser would reject.
+    quantized_layers: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -45,7 +46,9 @@ struct RawConfig {
     moe_intermediate_size: Option<u32>,
     n_shared_experts: Option<u32>,
     shared_expert_intermediate_size: Option<u32>,
-    quantization_config: Option<RawQuant>,
+    /// Raw JSON, decoded only during format detection: with `--format` it is never interpreted,
+    /// so malformed quantization metadata cannot block an override.
+    quantization_config: Option<serde_json::Value>,
     rope_scaling: Option<serde_json::Value>,
     /// Newer HF configs put `rope_theta`, `rope_type` and partial-rotary fields here.
     rope_parameters: Option<serde_json::Value>,
@@ -290,6 +293,10 @@ pub struct ModelSpec {
     pub qk_norm: bool,
     /// Bias on the q/k/v projections (Qwen2, some Llama variants). Not generated yet.
     pub qkv_bias: bool,
+    /// The checkpoint declares ModelOpt MIXED_PRECISION, whatever format the planner was told to
+    /// use. Loading refuses such checkpoints even when `--format` overrode the planning format.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub declared_mixed: bool,
     /// Hybrid linear/sparse-attention layout (Qwen3.8 Flash Next). Planned, not generated.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hybrid: Option<Hybrid>,
@@ -325,15 +332,24 @@ fn layer_format(module: &str, q: &RawLayerQuant) -> Result<WeightFormat> {
     Ok(fmt)
 }
 
-fn detect_format(q: &Option<RawQuant>) -> Result<(WeightFormat, FormatMap)> {
-    let Some(q) = q else { return Ok((WeightFormat::Bf16, FormatMap::default())) };
+fn detect_format(q: &Option<serde_json::Value>) -> Result<(WeightFormat, FormatMap)> {
+    let Some(q) = q.as_ref().filter(|v| !v.is_null()) else { return Ok((WeightFormat::Bf16, FormatMap::default())) };
+    let q: RawQuant = serde_json::from_value(q.clone())
+        .context("quantization_config is malformed; pass --format to override")?;
     let method = q.quant_method.as_deref().unwrap_or("");
     let uniform = |f| Ok((f, FormatMap::default()));
     match (method, q.quant_algo.as_deref(), q.bits) {
         ("nvfp4", _, _) | ("modelopt", Some("NVFP4"), _) => uniform(WeightFormat::Nvfp4),
         ("modelopt", Some("MIXED_PRECISION"), _) => {
-            let layers = q.quantized_layers.as_ref().filter(|m| !m.is_empty())
+            let raw = q.quantized_layers.as_ref().and_then(|m| m.as_object()).filter(|m| !m.is_empty())
                 .context("modelopt MIXED_PRECISION without a quantized_layers map; pass --format to override")?;
+            let mut layers: BTreeMap<String, RawLayerQuant> = BTreeMap::new();
+            for (module, v) in raw {
+                let lq = serde_json::from_value(v.clone())
+                    .with_context(|| format!("quantized_layers entry {module}: expected {{\"quant_algo\": ..., \"group_size\": ...}}; pass --format to override"))?;
+                layers.insert(module.clone(), lq);
+            }
+            let layers = &layers;
             let mut map = FormatMap::default();
             // Two paths for one module (with and without a language-model prefix) must agree.
             let mut by_module: BTreeMap<&str, (&str, WeightFormat)> = BTreeMap::new();
@@ -367,6 +383,13 @@ fn text_config(v: serde_json::Value) -> Result<serde_json::Value> {
             None | Some(serde_json::Value::Null) => { text.insert(k.into(), x); }
             Some(nested) if *nested == x => {}
             Some(_) => bail!("config.json declares different {k} values at the top level and in text_config"),
+        }
+    }
+    // The family discriminator: the nested one is more specific (`qwen4_exp_text` under
+    // `qwen4_exp`), so the top level only fills a missing or null nested value.
+    if let Some(mt) = top.remove("model_type").filter(|x| !x.is_null()) {
+        if text.get("model_type").is_none_or(|x| x.is_null()) {
+            text.insert("model_type".into(), mt);
         }
     }
     Ok(serde_json::Value::Object(text))
@@ -520,6 +543,7 @@ impl ModelSpec {
         }
         let moe = match (r.num_experts, r.num_experts_per_tok) {
             (Some(e), Some(k)) if e > 1 => {
+                ensure!((1..=e).contains(&k), "num_experts_per_tok {k} must be between 1 and num_experts ({e})");
                 let expert_intermediate = r.moe_intermediate_size.or(r.intermediate_size)
                     .context("MoE model without moe_intermediate_size")?;
                 let shared_intermediate = r.shared_expert_intermediate_size
@@ -551,7 +575,14 @@ impl ModelSpec {
         let rope_theta = r.rope_theta
             .or_else(|| rp.and_then(|p| p.get("rope_theta")).and_then(|x| x.as_f64()))
             .unwrap_or(10_000.0);
+        // Read from the raw strings, independently of format detection, so an override never
+        // hides that the checkpoint itself is mixed precision.
+        let declared_mixed = r.quantization_config.as_ref().is_some_and(|q| {
+            q.get("quant_method").and_then(|v| v.as_str()) == Some("modelopt")
+                && q.get("quant_algo").and_then(|v| v.as_str()) == Some("MIXED_PRECISION")
+        });
         Ok(ModelSpec {
+            declared_mixed,
             qk_norm: arch.starts_with("Qwen3"),
             qkv_bias: r.attention_bias.unwrap_or(arch.starts_with("Qwen2")),
             rope_scaling: parse_rope_scaling(if r.rope_scaling.is_some() { &r.rope_scaling } else { &r.rope_parameters })?,

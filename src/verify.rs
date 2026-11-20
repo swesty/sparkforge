@@ -322,8 +322,7 @@ impl Ctx<'_> {
 
 /// Runs every check; returns the result rows. Callers decide pass/fail with `TOL`.
 pub fn run(p: &Plan, g: &Generated, e: &Engine, o: &Opts) -> Result<Vec<Row>> {
-    anyhow::ensure!(g.kernels.iter().any(|k| k.status == "generated"),
-        "{}: no kernels are generated for this model yet (its op classes are planned; see `sparkforge plan`)", p.model.arch);
+    crate::codegen::require_generated(g, &p.model.arch)?;
     // One stream, no cross-stream hazards: skip cudarc's per-argument event bookkeeping.
     unsafe { e.ctx.disable_event_tracking() };
     let mut c = Ctx { p, g, e, o, rng: Rng(o.seed | 1), rows: vec![] };

@@ -363,3 +363,165 @@ fn formats_the_planner_cannot_honor_are_rejected() {
     ql(&mut v).insert("mtp.layers.48.mlp.experts".into(), json!({"quant_algo": "NVFP4", "group_size": 16}));
     assert!(format!("{:#}", spec_of(&v).unwrap_err()).contains("one MTP layer"));
 }
+
+// ---- SHA-783: codex-review round 3 follow-ups on the qwen4_exp plan ----
+
+#[test]
+fn a_planned_only_model_is_refused_before_any_cuda_call() {
+    // `require_generated` is host-only; `verify` calls it before creating the CUDA engine.
+    let g = codegen::generate(&plan_of(&spec_of(&raw()).unwrap()));
+    let err = format!("{:#}", codegen::require_generated(&g, "Qwen4ExpForConditionalGeneration").unwrap_err());
+    assert!(err.contains("Qwen4ExpForConditionalGeneration") && err.contains("no kernels are generated"), "{err}");
+    let llama = ModelSpec::from_json(&std::fs::read_to_string("configs/llama-3.1-8b.json").unwrap(), None).unwrap();
+    assert!(codegen::require_generated(&codegen::generate(&plan_of(&llama)), "llama").is_ok());
+}
+
+#[test]
+fn only_the_model_level_lm_head_sets_the_head_format() {
+    let base = plan_of(&spec_of(&raw()).unwrap());
+    let mut v = raw();
+    ql(&mut v).insert("model.language_model.layers.0.aux_lm_head".into(), json!({"quant_algo": "NVFP4", "group_size": 16}));
+    let p = plan_of(&spec_of(&v).unwrap());
+    let head = p.ops.iter().find(|o| o.name == "lm_head").unwrap();
+    assert_eq!(head.format, Some(WeightFormat::Bf16));
+    assert_eq!((p.budget.weight_gib, p.budget.decode_bytes_per_token_gb), (base.budget.weight_gib, base.budget.decode_bytes_per_token_gb));
+    assert!(p.notes.iter().any(|n| n.contains("not used by the plan") && n.contains("aux_lm_head")), "{:#?}", p.notes);
+    // A real head entry is honored.
+    let mut v = raw();
+    ql(&mut v).insert("lm_head".into(), json!({"quant_algo": "MXFP8", "group_size": 32}));
+    let p = plan_of(&spec_of(&v).unwrap());
+    assert_eq!(p.ops.iter().find(|o| o.name == "lm_head").unwrap().format, Some(WeightFormat::Mxfp8));
+}
+
+#[test]
+fn mtp_key_and_value_projections_are_priced_separately() {
+    let base = plan_of(&spec_of(&raw()).unwrap());
+    let mut v = raw();
+    ql(&mut v).insert("mtp.layers.0.self_attn.v_proj".into(), json!({"quant_algo": "MXFP8", "group_size": 32}));
+    let p = plan_of(&spec_of(&v).unwrap());
+    // v_proj is 512 x 2560: BF16 (2 B) -> MXFP8 (1.03125 B) saves 1,269,760 B; k_proj stays BF16.
+    let delta = (base.budget.weight_gib - p.budget.weight_gib) * (1u64 << 30) as f64;
+    assert!((delta - 512.0 * 2560.0 * (2.0 - 1.03125)).abs() < 1.0, "{delta}");
+    assert!(!p.notes.iter().any(|n| n.contains("not used by the plan")), "the v_proj entry is consumed: {:#?}", p.notes);
+}
+
+#[test]
+fn the_top_level_model_type_identifies_qwen4_exp() {
+    let mut v = raw();
+    v["text_config"].as_object_mut().unwrap().remove("model_type");
+    let p = plan_of(&spec_of(&v).unwrap());
+    assert!(p.model.hybrid.is_some());
+    assert!(codegen::generate(&p).kernels.iter().all(|k| k.status == "planned"));
+}
+
+#[test]
+fn moe_top_k_must_be_between_one_and_the_expert_count() {
+    for k in [0, 513] {
+        let mut v = raw();
+        v["text_config"]["num_experts_per_tok"] = json!(k);
+        assert!(format!("{:#}", spec_of(&v).unwrap_err()).contains("num_experts_per_tok"), "top-k {k}");
+    }
+}
+
+#[test]
+fn a_format_override_can_skip_a_malformed_layer_map() {
+    let cfg = json!({"hidden_size": 2048, "num_hidden_layers": 2, "num_attention_heads": 16, "vocab_size": 1000,
+        "quantization_config": {"quant_method": "modelopt", "quant_algo": "MIXED_PRECISION", "quantized_layers": {"layers.0.self_attn.o_proj": null}}});
+    let s = ModelSpec::from_json(&cfg.to_string(), Some(WeightFormat::Bf16)).unwrap();
+    assert_eq!((s.weights, s.formats.is_empty(), s.declared_mixed), (WeightFormat::Bf16, true, true));
+    assert!(format!("{:#}", spec_of(&cfg).unwrap_err()).contains("layers.0.self_attn.o_proj"));
+}
+
+// ---- SHA-783 round 1 follow-ups ----
+
+#[test]
+fn a_format_override_skips_malformed_quantization_fields() {
+    let cfg = json!({"hidden_size": 2048, "num_hidden_layers": 2, "num_attention_heads": 16, "vocab_size": 1000,
+        "quantization_config": {"quant_method": "awq", "bits": "4", "group_size": 128}});
+    assert_eq!(ModelSpec::from_json(&cfg.to_string(), Some(WeightFormat::Bf16)).unwrap().weights, WeightFormat::Bf16);
+    assert!(format!("{:#}", spec_of(&cfg).unwrap_err()).contains("quantization_config"));
+    // A mixed checkpoint with a malformed field is still recognized as mixed under an override.
+    let mixed = json!({"hidden_size": 2048, "num_hidden_layers": 2, "num_attention_heads": 16, "vocab_size": 1000,
+        "quantization_config": {"quant_method": "modelopt", "quant_algo": "MIXED_PRECISION", "group_size": "x"}});
+    assert!(ModelSpec::from_json(&mixed.to_string(), Some(WeightFormat::Bf16)).unwrap().declared_mixed);
+}
+
+#[test]
+fn each_mtp_shared_expert_projection_is_priced_at_its_own_format() {
+    let base = plan_of(&spec_of(&raw()).unwrap()).budget.weight_gib;
+    let one = 640.0 * 2560.0 * (2.0 - 1.03125); // one 640 x 2560 matrix, BF16 -> MXFP8
+    for proj in ["gate_proj", "up_proj", "down_proj"] {
+        let mut v = raw();
+        ql(&mut v).insert(format!("mtp.layers.0.mlp.shared_expert.{proj}"), json!({"quant_algo": "MXFP8", "group_size": 32}));
+        let p = plan_of(&spec_of(&v).unwrap());
+        let delta = (base - p.budget.weight_gib) * (1u64 << 30) as f64;
+        assert!((delta - one).abs() < 1.0, "{proj}: {delta}");
+        assert!(!p.notes.iter().any(|n| n.contains("not used by the plan")), "{proj} entry consumed");
+    }
+}
+
+#[test]
+fn auxiliary_paths_never_stand_in_for_ple_or_mtp_modules() {
+    let base = plan_of(&spec_of(&raw()).unwrap());
+    for aux in ["model.language_model.layers.0.aux.ple.key_proj", "mtp.layers.0.aux.self_attn.v_proj"] {
+        let mut v = raw();
+        ql(&mut v).insert(aux.into(), json!({"quant_algo": "MXFP8", "group_size": 32}));
+        let p = plan_of(&spec_of(&v).unwrap());
+        assert_eq!((p.budget.weight_gib, p.budget.decode_bytes_per_token_gb), (base.budget.weight_gib, base.budget.decode_bytes_per_token_gb), "{aux}");
+        assert!(p.notes.iter().any(|n| n.contains("not used by the plan") && n.contains(aux)), "{aux} reported unused");
+    }
+    // The genuine paths are honored.
+    let mut v = raw();
+    ql(&mut v).insert("model.language_model.layers.1.ple.key_proj".into(), json!({"quant_algo": "MXFP8", "group_size": 32}));
+    let p = plan_of(&spec_of(&v).unwrap());
+    assert_eq!(p.ops.iter().find(|o| o.name == "ple_key_proj").unwrap().format, Some(WeightFormat::Mxfp8));
+}
+
+// ---- SHA-783 round 2 follow-ups ----
+
+#[test]
+fn the_ple_table_is_recognized_at_its_model_level_path() {
+    let mut v = raw();
+    ql(&mut v).remove("model.language_model.layers.1.ple.ple_embedding.ngram_embedding").unwrap();
+    let bf16 = plan_of(&spec_of(&v).unwrap());
+    ql(&mut v).insert("model.language_model.ple_embedding.ngram_embedding".into(), json!({"quant_algo": "MXFP8", "group_size": 32}));
+    let p = plan_of(&spec_of(&v).unwrap());
+    assert!(!p.notes.iter().any(|n| n.contains("not used by the plan")), "the model-level table entry is consumed: {:#?}", p.notes);
+    // 320,000,000 rows x 160 elements, BF16 (2 B) -> MXFP8 (1.03125 B), resident; 16 rows per token decoded.
+    let gib = (1u64 << 30) as f64;
+    let resident = (bf16.budget.weight_gib - p.budget.weight_gib) * gib;
+    assert!((resident - 320_000_000.0 * 160.0 * (2.0 - 1.03125)).abs() < 1e3, "{resident}");
+    let decode = (bf16.budget.decode_bytes_per_token_gb - p.budget.decode_bytes_per_token_gb) * 1e9;
+    assert!((decode - 16.0 * 160.0 * (2.0 - 1.03125)).abs() < 1e-3, "{decode}");
+}
+
+#[test]
+fn ple_entries_only_count_at_the_configured_ple_layer() {
+    let base = plan_of(&spec_of(&raw()).unwrap());
+    let mut v = raw();
+    ql(&mut v).insert("model.language_model.layers.999.ple.key_proj".into(), json!({"quant_algo": "MXFP8", "group_size": 32}));
+    let p = plan_of(&spec_of(&v).unwrap());
+    assert_eq!((p.budget.weight_gib, p.budget.decode_bytes_per_token_gb), (base.budget.weight_gib, base.budget.decode_bytes_per_token_gb));
+    assert!(p.notes.iter().any(|n| n.contains("not used by the plan") && n.contains("layers.999.ple.key_proj")));
+    // The configured placement (ple_layer_ids [2]) and the layer the checkpoint files it under (1) both count.
+    for l in [1, 2] {
+        let mut v = raw();
+        ql(&mut v).insert(format!("model.language_model.layers.{l}.ple.key_proj"), json!({"quant_algo": "MXFP8", "group_size": 32}));
+        let p = plan_of(&spec_of(&v).unwrap());
+        assert_eq!(p.ops.iter().find(|o| o.name == "ple_key_proj").unwrap().format, Some(WeightFormat::Mxfp8), "layer {l}");
+    }
+}
+
+#[test]
+fn an_absent_mtp_shared_expert_leaves_its_entries_unused() {
+    let mut v = raw();
+    v["text_config"]["shared_expert_intermediate_size"] = json!(0);
+    for l in 0..48 {
+        for proj in ["gate_proj", "up_proj", "down_proj"] {
+            ql(&mut v).remove(&format!("model.language_model.layers.{l}.mlp.shared_expert.{proj}"));
+        }
+    }
+    ql(&mut v).insert("mtp.layers.0.mlp.shared_expert.up_proj".into(), json!({"quant_algo": "MXFP8", "group_size": 32}));
+    let p = plan_of(&spec_of(&v).unwrap());
+    assert!(p.notes.iter().any(|n| n.contains("not used by the plan") && n.contains("mtp.layers.0.mlp.shared_expert.up_proj")), "{:#?}", p.notes);
+}

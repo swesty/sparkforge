@@ -42,3 +42,12 @@ when a required kernel was not generated.
 #### Scenario: BF16 GEMV bandwidth
 - **WHEN** `verify --bench` runs for Llama 3.1 8B on a GB10
 - **THEN** `gemv_lm_head` (1.05 GB of weights) reports about 245-251 GB/s
+
+### Requirement: Verification refuses a model with no generated kernels
+
+`sparkforge verify` MUST fail with a message naming the model when its plan generates no kernels,
+rather than reporting an empty pass.
+
+#### Scenario: Flash Next verify
+- **WHEN** `sparkforge verify configs/qwen3.8-flash-next-nvfp4.json` runs
+- **THEN** it fails stating that no kernels are generated for this model yet

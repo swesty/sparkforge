@@ -90,3 +90,13 @@ The cache key SHALL be the first 8 bytes, as 16 hex characters, of SHA-256 over 
 #### Scenario: Emit layout
 - **WHEN** `sparkforge emit configs/llama-3.1-8b.json --out build` runs
 - **THEN** the four files exist under `build/<16-hex-char key>/`
+
+### Requirement: Hybrid plans generate no kernels until their op classes exist
+
+For a hybrid plan, code generation SHALL list every op class as `planned` and SHALL emit no CUDA
+kernel source, because the dense kernels assume full-head RoPE, dense attention and uniform
+weights. Its cache key SHALL include the plan, so two hybrid plans never share an output directory.
+
+#### Scenario: Flash Next emit
+- **WHEN** `sparkforge emit configs/qwen3.8-flash-next-nvfp4.json` runs
+- **THEN** the manifest has one `planned` entry per op class and the source contains no `__global__` function

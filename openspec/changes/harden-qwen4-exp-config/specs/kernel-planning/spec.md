@@ -1,0 +1,30 @@
+# Spec Delta
+
+## MODIFIED Requirements
+
+### Requirement: Format lookups are scoped to the language model
+
+Per-layer format lookups SHALL match only language-model module paths, so an entry of another tower
+(vision, MTP) with the same layer suffix never sets a text layer's format. `lm_head`, PLE modules
+(`ple.<m>`, or `layers.<n>.ple.<m>` with n a configured PLE layer p or p−1) and MTP modules
+(`mtp.layers.<n>.<m>`) SHALL match only at those paths, and each projection by its own path.
+
+#### Scenario: Vision experts in the map
+- **WHEN** the map also lists `model.visual.layers.0.mlp.experts` as MXFP8
+- **THEN** the text experts stay NVFP4, the budget is unchanged, and the vision entry is reported as unused
+
+#### Scenario: Auxiliary head in a layer
+- **WHEN** the map lists `model.language_model.layers.0.aux_lm_head` as NVFP4
+- **THEN** `lm_head` stays BF16, both budgets are unchanged, and the entry is reported as unused
+
+#### Scenario: Auxiliary PLE or MTP path
+- **WHEN** the map lists `model.language_model.layers.0.aux.ple.key_proj` or `mtp.layers.0.aux.self_attn.v_proj`
+- **THEN** neither budget changes and the entry is reported as unused
+
+#### Scenario: PLE entry at the wrong layer
+- **WHEN** the map lists `model.language_model.layers.999.ple.key_proj` as MXFP8
+- **THEN** neither budget changes and the entry is reported as unused
+
+#### Scenario: MTP value projection
+- **WHEN** the map lists `mtp.layers.0.self_attn.v_proj` as MXFP8 and not `k_proj`
+- **THEN** resident weights fall by 1,269,760 bytes and the entry is consumed
