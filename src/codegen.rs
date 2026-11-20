@@ -301,6 +301,24 @@ pub fn generate(p: &Plan) -> Generated {
     let mut kernels = vec![];
     let mut src = fill(PRELUDE, &[("MODEL", m.arch.clone()), ("ARCH", p.target.arch.into())]);
 
+    // The hybrid layout (Gated DeltaNet, sparse attention, HyperConnection) has none of the dense
+    // kernels below: RoPE rotates part of each head, attention reads selected positions, and most
+    // weights are MXFP8 or NVFP4. Every op class is listed as planned, with no source, until its
+    // kernel exists.
+    if m.hybrid.is_some() {
+        for o in &p.ops {
+            let (grid, block) = p.gemv.iter().find(|g| g.linear == o.name).map_or((1, 0), |g| (g.grid, g.warps_per_block * 32));
+            kernels.push(KernelEntry { entry: o.name.clone(), file: "model.cu".into(), grid: [grid, 1, 1], block, dyn_smem: 0, status: "planned", args: vec![] });
+        }
+        let mut h = Sha256::new();
+        // Nothing is generated, so the plan itself (formats, budget) is what distinguishes two
+        // variants; key on it so their emitted artifacts never share a directory.
+        h.update(p.target.arch.as_bytes()); h.update(src.as_bytes());
+        h.update(serde_json::to_string(p).unwrap_or_default().as_bytes());
+        let key = h.finalize().iter().take(8).map(|b| format!("{b:02x}")).collect::<String>();
+        return Generated { arch: p.target.arch.into(), cache_key: key, files: vec![("model.cu".into(), src)], kernels };
+    }
+
     src += &fill(RMSNORM, &[("HIDDEN", m.hidden.to_string()), ("THREADS", p.norm.threads.to_string()), ("ITERS", p.norm.iters.to_string())]);
     kernels.push(KernelEntry { entry: "rmsnorm".into(), file: "model.cu".into(), grid: [1, 1, 1], block: p.norm.threads, dyn_smem: 0, status: "generated", args: vec!["x", "w", "y", "eps"] });
 

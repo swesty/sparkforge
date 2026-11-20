@@ -102,10 +102,24 @@ fn print_plan(p: &plan::Plan) {
     println!("== {} on {} ({}) ==", m.arch, p.target.name, p.target.arch);
     println!("hidden {}  layers {}  heads {}/{} kv (group {})  head_dim {}  vocab {}  weights {:?}",
         m.hidden, m.layers, m.heads, m.kv_heads, m.gqa_group(), m.head_dim, m.vocab, m.weights);
-    if let Some(e) = &m.moe { println!("MoE: {} experts, top-{}, expert_inter {}", e.num_experts, e.experts_per_tok, e.expert_intermediate); }
+    if let Some(e) = &m.moe { println!("MoE: {} experts, top-{}, expert_inter {}, shared {}", e.num_experts, e.experts_per_tok, e.expert_intermediate, e.shared_intermediate); }
+    if !m.formats.is_empty() { println!("mixed precision: {} quantized modules, everything else {:?}", m.formats.modules.len(), m.weights); }
     let b = &p.budget;
-    println!("\nMemory: weights {:.1} GiB + KV {:.1} GiB @ {} ctx -> fits: {} (max ctx ~{})", b.weight_gib, b.kv_gib_at_ctx, b.ctx, b.fits, b.max_ctx_that_fits);
-    println!("Decode roofline: {:.2} GB/token -> ceiling {:.1} tok/s at {:.0} GB/s effective", b.decode_bytes_per_token_gb, b.decode_tok_s_ceiling, p.target.dram_bw_effective_gbs);
+    println!("\nMemory: weights {:.1} GiB + KV/state {:.1} GiB @ {} ctx -> fits: {} (max ctx ~{})", b.weight_gib, b.kv_gib_at_ctx, b.ctx, b.fits, b.max_ctx_that_fits);
+    println!("Decode roofline: {:.3} GB/token{} -> ceiling {:.1} tok/s at {:.0} GB/s effective",
+        b.decode_bytes_per_token_gb, b.decode_bytes_per_token_ctx_free_gb.map_or(String::new(), |c| format!(" ({c:.3} GB context-free)")),
+        b.decode_tok_s_ceiling, p.target.dram_bw_effective_gbs);
+    if m.hybrid.is_some() {
+        println!("\nDecode ops ({} distinct):", p.ops.len());
+        for o in &p.ops {
+            println!("  {:<28} {:<11} x{:<3} {:<42} {:>9.1} MB/token{}", o.name, o.kind, o.per_token, o.shape, o.bytes_per_token / 1e6,
+                o.format.map_or(String::new(), |f| format!("  {f:?}")));
+        }
+        println!("\nContext-free bytes per token by group:");
+        for (g, bytes) in plan::bytes_by_group(p) { println!("  {:<18} {:>9.1} MB", g, bytes / 1e6); }
+        for n in &p.notes { println!("note: {n}"); }
+        return;
+    }
     println!("\nDecode GEMV (memory-bound):");
     for g in &p.gemv { println!("  {:<16} N={:<6} K={:<6} warps/blk {} rows/warp {} grid {:<5} ~{:.1} us", g.linear, g.n, g.k, g.warps_per_block, g.rows_per_warp, g.grid, g.est_us); }
     println!("\nPrefill GEMM tiles (mma.sync, smem <= {} B):", p.target.smem_per_block_optin);

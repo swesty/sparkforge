@@ -443,6 +443,9 @@ pub struct Binding {
 
 /// Validates the checkpoint against the spec and returns which tensors make each linear.
 pub fn bind(ck: &Checkpoint, m: &ModelSpec) -> Result<Binding> {
+    if m.hybrid.is_some() || !m.formats.is_empty() {
+        bail!("{} checkpoints (hybrid layout or mixed-precision weights) do not load yet; the mixed-format loader is a later ticket", m.arch);
+    }
     if m.moe.is_some() {
         bail!("MoE weight loading is not supported yet ({})", m.arch);
     }
