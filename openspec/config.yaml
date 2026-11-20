@@ -18,6 +18,8 @@ context: |
   - kernel-codegen: CUDA source with baked-in shapes, kernel manifest, cache key.
   - gpu-runtime: NVRTC compile for sm_121a and module/function loading (`--features cuda`).
   - gpu-verification: on-GPU kernel checks against an f64 CPU reference, plus timing.
+  - weight-loading: HF safetensors checkpoints opened, validated against the plan, and copied into
+    GPU memory under a serialized MemAvailable guard; real-weight GEMV checks (`verify-weights`).
 
   GB10 facts every proposal must respect: 48 SMs; 101,376 B dynamic smem per block after opt-in
   (48 KB without); 1536 threads and 64K registers per SM; 24 MB L2; ~273 GB/s nominal LPDDR5X,
