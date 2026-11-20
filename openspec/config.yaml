@@ -1,0 +1,48 @@
+schema: spec-driven
+
+context: |
+  sparkforge (github.com/swesty/sparkforge, public, Rust 2021) is a model-specialized LLM kernel
+  generator for exactly one target: NVIDIA DGX Spark, GB10, compute capability 12.1, `sm_121a`.
+  It reads a Hugging Face config.json, derives every tensor shape, plans kernel launch and tile
+  configurations under GB10's limits, and generates CUDA C++ with every dimension `constexpr`,
+  compiled at run time by NVRTC.
+
+  Capabilities (openspec/specs/<name>):
+  - model-config: HF config.json -> ModelSpec; what is supported, rejected, or flagged.
+  - kernel-planning: per-shape decode GEMV grids, prefill tiles, attention splits, memory and
+    roofline budget, all derived from the config plus the GB10 target model.
+  - kernel-codegen: CUDA source with baked-in shapes, kernel manifest, cache key.
+  - gpu-runtime: NVRTC compile for sm_121a and module/function loading (`--features cuda`).
+  - gpu-verification: on-GPU kernel checks against an f64 CPU reference, plus timing.
+
+  GB10 facts every proposal must respect: 48 SMs; 101,376 B dynamic smem per block after opt-in
+  (48 KB without); 1536 threads and 64K registers per SM; 24 MB L2; ~273 GB/s nominal LPDDR5X,
+  ~245-251 GB/s measured by the BF16 GEMV here. Warp-level `mma.sync` only (BF16 m16n8k16, FP8
+  m16n8k32, block-scaled FP4 `kind::mxf4nvf4` m16n8k64); NO tcgen05, TMEM or WGMMA. Batch-1 decode
+  is DRAM-bandwidth bound, so decode wins come from fewer bytes and fewer launches.
+
+  Conventions:
+  - Every planner number comes from the config or target.rs; no per-model hand tuning.
+  - A config the engine cannot compute correctly is an error or a plan note, never a silent
+    default.
+  - A kernel is not done until `sparkforge verify` passes on a GB10 (tolerance 1/64 against an
+    f64 reference). CI cannot run it (no GPU); record the host, CUDA version and numbers in the
+    PR. `cargo test` covers host-side logic and runs in CI.
+  - Under --use_fast_math, sin/cos/exp lose accuracy for large arguments; any kernel that feeds
+    them large values must justify its precision (see the RoPE requirement in kernel-codegen).
+
+  Delivery: Code Factory enrolled (automatic codex-review, advisory). Linear team SHA, project
+  "sparkforge". Branch from the Linear issue, `wt step commit`, `wt ready`; merge on GitHub only.
+
+  PAI relationship: worked from Claude Code sessions governed by the global PAI framework
+  (~/.claude/CLAUDE.md). OpenSpec owns the DURABLE spec (openspec/specs = source of truth). The
+  PAI Algorithm owns EXECUTION and ISC verification. Loop: /opsx:propose -> OBSERVE (tasks.md
+  seeds ISC); /opsx:apply -> BUILD/EXECUTE; PAI VERIFY -> ISC pass; /opsx:archive + git -> LEARN.
+  PAI PRD.md REFERENCES openspec artifacts; it never duplicates spec content.
+
+rules:
+  proposal:
+    - State the expected decode or prefill effect on GB10 in tok/s, GB/s or microseconds, and how it will be measured.
+    - Include a Non-goals section.
+  tasks:
+    - Include a task that runs `sparkforge verify --bench` on a GB10 for every new or changed kernel.
