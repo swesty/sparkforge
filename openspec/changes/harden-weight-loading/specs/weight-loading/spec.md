@@ -26,6 +26,10 @@ dtype and shape.
 - **WHEN** the canonical directory is moved aside and replaced by another generation after the config is read
 - **THEN** the index and shards still come from the generation the config came from
 
+#### Scenario: Shard linked through an alias
+- **WHEN** a shard entry is a symlink whose target passes through another symlink, such as a `current` alias
+- **THEN** opening fails naming the shard, while a link straight to the file still opens
+
 #### Scenario: Dangling index link
 - **WHEN** `model.safetensors.index.json` is a dangling symlink beside a valid `model.safetensors`
 - **THEN** opening fails naming the index instead of loading the single file
@@ -81,6 +85,10 @@ chosen by ownership, never by environment.
 #### Scenario: Lock open to every account
 - **WHEN** the node-wide lock file grants access to every account
 - **THEN** admission refuses it, naming the mode, instead of letting any account hold it
+
+#### Scenario: Lock in the wrong group
+- **WHEN** the node-wide lock is mode 0640 but belongs to a group other than `sparkforge`
+- **THEN** admission refuses it, naming both groups
 
 #### Scenario: Login during a load
 - **WHEN** a user's load is admitted and a login then creates that user's runtime directory

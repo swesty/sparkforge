@@ -17,6 +17,15 @@
 - [x] 2.6 Confirm the admission in `upload` against the bytes copied and re-read `MemAvailable`. Verify: `cargo test` refuses a larger binding and a drop below the guard after admission.
 - [x] 2.7 `verify-weights` on Llama 3.1 8B still passes on a GB10. Verify: spark-5, 87 tests pass; checks 3.63e-3 to 3.79e-3 at 228–238 GB/s, 225 MB peak RSS; two concurrent 1B loads queue on the home-directory user lock.
 
+## 3. codex-review cycle 2 follow-ups
+
+- [x] 3.1 Walk checkpoint paths without following symlinks, except one link at the entry whose target passes through none. Verify: `cargo test` refuses absolute and relative shard links through a `current` alias and opens direct links and the HF snapshot layout.
+- [x] 3.2 Require the node lock's group to be `sparkforge`. Verify: `cargo test` refuses a 0640 lock in another group and a missing group, and a group member takes the lock.
+- [x] 3.3 Lock an older loader's existing lock during upgrades. Verify: `cargo test` holds the old `$XDG_RUNTIME_DIR` lock and the new admission waits until it is released.
+- [x] 3.4 Open this user's locks read-write. Verify: `cargo test` fails a user lock this user cannot write.
+- [x] 3.5 Confirm verification overhead in `upload`. Verify: `cargo test` refuses a load-only admission for verification.
+- [x] 3.6 `verify-weights` on Llama 3.1 8B still passes on a GB10. Verify: spark-5, 92 tests pass; checks 3.63e-3 to 3.79e-3 at 235–238 GB/s, 226 MB peak RSS; two concurrent 1B loads queue on the user lock.
+
 ## Workflow follow-up
 
 - Add the `/run/sparkforge` provisioning step (group `sparkforge`, lock mode 0640, drain running loads first) to the fleet runbook (homelab-build), then apply it on the GB10 nodes (needs root).

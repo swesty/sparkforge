@@ -354,10 +354,10 @@ fn concurrent_loads_cannot_both_pass_the_memory_guard() {
     let lock = dir("admission").join("admission.lock");
     // 20 GiB available; each load needs 14 GiB, so either fits alone but not both.
     let avail = Arc::new(AtomicU64::new(20 * GIB));
-    let first = admit(&[&lock], 14 * GIB, 0, || Some(avail.load(Ordering::SeqCst)), ADMISSION_WAIT).expect("first load fits");
+    let first = admit(&user_lock(&lock), 14 * GIB, 0, || Some(avail.load(Ordering::SeqCst)), ADMISSION_WAIT).expect("first load fits");
     let second = {
         let (lock, avail) = (lock.clone(), avail.clone());
-        std::thread::spawn(move || admit(&[&lock], 14 * GIB, 0, || Some(avail.load(Ordering::SeqCst)), ADMISSION_WAIT).map(|_| ()))
+        std::thread::spawn(move || admit(&user_lock(&lock), 14 * GIB, 0, || Some(avail.load(Ordering::SeqCst)), ADMISSION_WAIT).map(|_| ()))
     };
     // The second load is blocked on the lock while the first allocates its 14 GiB.
     std::thread::sleep(std::time::Duration::from_millis(100));
@@ -491,6 +491,14 @@ fn a_quantized_checkpoint_behind_a_bf16_config_is_refused_before_gpu_work() {
 fn my_uid() -> u32 { unsafe { libc::geteuid() } }
 
 #[cfg(unix)]
+fn my_gid() -> u32 { unsafe { libc::getegid() } }
+
+/// A single per-user lock, as `admit` takes it.
+fn user_lock(p: &std::path::Path) -> Vec<sparkforge::weights::LockFile> {
+    vec![sparkforge::weights::LockFile { path: p.to_path_buf(), kind: sparkforge::weights::LockKind::User }]
+}
+
+#[cfg(unix)]
 fn chmod(p: &std::path::Path, mode: u32) {
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(p, std::fs::Permissions::from_mode(mode)).unwrap();
@@ -513,17 +521,17 @@ fn the_node_lock_is_shared_by_every_user_and_needs_trusted_provisioning() {
     let node = root.join("run-sparkforge");
     provision_node(&node, 0o640);
     // Provisioned and owned by the trusted owner: every uid resolves to the same node-wide lock.
-    let a = admission_locks_in(&node, my_uid(), 1000, || None).unwrap();
-    let b = admission_locks_in(&node, my_uid(), 1001, || None).unwrap();
+    let a = admission_locks_in(&node, my_uid(), || Some(my_gid()), 1000, || None, &[]).unwrap();
+    let b = admission_locks_in(&node, my_uid(), || Some(my_gid()), 1001, || None, &[]).unwrap();
     assert_eq!(a, b);
     assert_eq!((a.node.clone(), a.scope()), (Some(node.join("admission.lock")), LockScope::Node));
     // Writable by others: refused, not silently replaced by a per-user lock.
     chmod(&node, 0o777);
-    let err = format!("{:#}", admission_locks_in(&node, my_uid(), 1000, || None).unwrap_err());
+    let err = format!("{:#}", admission_locks_in(&node, my_uid(), || Some(my_gid()), 1000, || None, &[]).unwrap_err());
     assert!(err.contains("not a directory owned by"), "{err}");
     // Owned by someone other than the trusted owner: refused too.
     chmod(&node, 0o755);
-    assert!(admission_locks_in(&node, my_uid() + 1, 1000, || None).is_err());
+    assert!(admission_locks_in(&node, my_uid() + 1, || Some(my_gid()), 1000, || None, &[]).is_err());
 }
 
 #[cfg(unix)]
@@ -536,10 +544,10 @@ fn an_unrelated_account_cannot_hold_the_node_lock() {
     let root = dir("node-lock-other");
     let node = root.join("run-sparkforge");
     provision_node(&node, 0o644);
-    let err = format!("{:#}", admission_locks_in(&node, my_uid(), 1000, || None).unwrap_err());
+    let err = format!("{:#}", admission_locks_in(&node, my_uid(), || Some(my_gid()), 1000, || None, &[]).unwrap_err());
     assert!(err.contains("grants access to every account"), "{err}");
     chmod(&node.join("admission.lock"), 0o640);
-    assert!(admission_locks_in(&node, my_uid(), 1000, || None).is_ok());
+    assert!(admission_locks_in(&node, my_uid(), || Some(my_gid()), 1000, || None, &[]).is_ok());
 }
 
 #[cfg(unix)]
@@ -547,9 +555,9 @@ fn an_unrelated_account_cannot_hold_the_node_lock() {
 fn a_holder_cannot_stall_admission_forever() {
     use sparkforge::weights::admit;
     let lock = dir("wait-limit").join("admission.lock");
-    let _held = admit(&[&lock], 0, 0, || Some(64 << 30), std::time::Duration::from_secs(1)).unwrap();
+    let _held = admit(&user_lock(&lock), 0, 0, || Some(64 << 30), std::time::Duration::from_secs(1)).unwrap();
     let t0 = std::time::Instant::now();
-    let err = format!("{:#}", admit(&[&lock], 0, 0, || Some(64 << 30), std::time::Duration::from_millis(200)).err().expect("must time out"));
+    let err = format!("{:#}", admit(&user_lock(&lock), 0, 0, || Some(64 << 30), std::time::Duration::from_millis(200)).err().expect("must time out"));
     assert!(err.contains("gave up after"), "{err}");
     assert!(t0.elapsed() < std::time::Duration::from_secs(5));
 }
@@ -563,7 +571,7 @@ fn without_a_node_lock_the_user_lock_comes_from_ownership_not_the_environment() 
     let home = root.join("home");
     std::fs::create_dir(&home).unwrap();
     // The function reads no environment: the home directory comes from the caller (getpwuid_r in production).
-    let locks = admission_locks_in(&node, 0, my_uid(), || Some(home.clone())).unwrap();
+    let locks = admission_locks_in(&node, 0, || Some(my_gid()), my_uid(), || Some(home.clone()), &[]).unwrap();
     assert_eq!(locks.scope(), LockScope::User);
     let p = locks.user.clone().unwrap();
     assert_eq!(p.parent().unwrap(), home.join(".local/state/sparkforge"));
@@ -572,7 +580,7 @@ fn without_a_node_lock_the_user_lock_comes_from_ownership_not_the_environment() 
     // The old shared fallback (<tmp>/sparkforge-<uid>) is never used, so a pre-claimed entry there cannot block loads.
     assert!(!p.starts_with(std::env::temp_dir().join(format!("sparkforge-{}", my_uid()))));
     // No password entry and no node lock: nowhere to coordinate, so refuse.
-    let err = format!("{:#}", admission_locks_in(&node, 0, my_uid(), || None).unwrap_err());
+    let err = format!("{:#}", admission_locks_in(&node, 0, || Some(my_gid()), my_uid(), || None, &[]).unwrap_err());
     assert!(err.contains("password database"), "{err}");
 }
 
@@ -586,12 +594,12 @@ fn a_login_does_not_split_one_users_admission() {
     let root = dir("login-split");
     let (node, home) = (root.join("absent-node-dir"), root.join("home"));
     std::fs::create_dir(&home).unwrap();
-    let before = admission_locks_in(&node, 0, my_uid(), || Some(home.clone())).unwrap();
-    let _first = admit(&before.paths(), 0, 0, || Some(64 << 30), std::time::Duration::from_secs(1)).unwrap();
+    let before = admission_locks_in(&node, 0, || Some(my_gid()), my_uid(), || Some(home.clone()), &[]).unwrap();
+    let _first = admit(&before.files(), 0, 0, || Some(64 << 30), std::time::Duration::from_secs(1)).unwrap();
     std::fs::create_dir(root.join("run-user")).unwrap(); // the login's runtime directory appears
-    let after = admission_locks_in(&node, 0, my_uid(), || Some(home.clone())).unwrap();
+    let after = admission_locks_in(&node, 0, || Some(my_gid()), my_uid(), || Some(home.clone()), &[]).unwrap();
     assert_eq!(before, after);
-    let err = format!("{:#}", admit(&after.paths(), 0, 0, || Some(64 << 30), std::time::Duration::from_millis(200)).err().expect("must wait"));
+    let err = format!("{:#}", admit(&after.files(), 0, 0, || Some(64 << 30), std::time::Duration::from_millis(200)).err().expect("must wait"));
     assert!(err.contains("gave up after"), "{err}");
 }
 
@@ -604,14 +612,14 @@ fn turning_on_the_node_lock_mid_load_does_not_bypass_an_admission() {
     let root = dir("cutover");
     let (node, home) = (root.join("run-sparkforge"), root.join("home"));
     std::fs::create_dir(&home).unwrap();
-    let pre = admission_locks_in(&node, my_uid(), my_uid(), || Some(home.clone())).unwrap();
+    let pre = admission_locks_in(&node, my_uid(), || Some(my_gid()), my_uid(), || Some(home.clone()), &[]).unwrap();
     assert_eq!(pre.scope(), LockScope::User);
-    let _first = admit(&pre.paths(), 0, 0, || Some(64 << 30), std::time::Duration::from_secs(1)).unwrap();
+    let _first = admit(&pre.files(), 0, 0, || Some(64 << 30), std::time::Duration::from_secs(1)).unwrap();
     provision_node(&node, 0o640);
-    let post = admission_locks_in(&node, my_uid(), my_uid(), || Some(home.clone())).unwrap();
+    let post = admission_locks_in(&node, my_uid(), || Some(my_gid()), my_uid(), || Some(home.clone()), &[]).unwrap();
     assert_eq!(post.scope(), LockScope::Node);
-    assert_eq!(post.paths()[0], pre.user.as_deref().unwrap(), "the user lock is taken first");
-    let err = format!("{:#}", admit(&post.paths(), 0, 0, || Some(64 << 30), std::time::Duration::from_millis(200)).err().expect("must wait"));
+    assert_eq!(post.files()[0].path, pre.user.clone().unwrap(), "the user lock is taken first");
+    let err = format!("{:#}", admit(&post.files(), 0, 0, || Some(64 << 30), std::time::Duration::from_millis(200)).err().expect("must wait"));
     assert!(err.contains("gave up after"), "{err}");
 }
 
@@ -621,7 +629,7 @@ fn a_missing_password_entry_still_reaches_a_provisioned_node_lock() {
     use sparkforge::weights::{admission_locks_in, LockScope};
     let node = dir("no-passwd").join("run-sparkforge");
     provision_node(&node, 0o640);
-    let locks = admission_locks_in(&node, my_uid(), 4242, || None).unwrap();
+    let locks = admission_locks_in(&node, my_uid(), || Some(my_gid()), 4242, || None, &[]).unwrap();
     assert_eq!((locks.scope(), locks.user), (LockScope::Node, None));
 }
 
@@ -634,7 +642,7 @@ fn a_fifo_admission_lock_fails_promptly() {
     assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
-        let r = admit(&[&lock], 0, 0, || Some(64 << 30), std::time::Duration::from_secs(1));
+        let r = admit(&user_lock(&lock), 0, 0, || Some(64 << 30), std::time::Duration::from_secs(1));
         let _ = tx.send(r.err().map(|e| format!("{e:#}")));
     });
     let err = rx.recv_timeout(std::time::Duration::from_secs(5)).expect("a FIFO lock must not block").expect("must fail");
@@ -647,9 +655,9 @@ fn an_admission_only_covers_the_workload_it_checked() {
     use sparkforge::weights::admit;
     const GIB: u64 = 1 << 30;
     let lock = dir("admission-scope").join("admission.lock");
-    let small = admit(&[&lock], GIB, 0, || Some(64 * GIB), std::time::Duration::from_secs(1)).unwrap();
-    assert!(small.confirm(GIB, || Some(64 * GIB)).is_ok());
-    let err = small.confirm(2 * GIB, || Some(64 * GIB)).unwrap_err().to_string();
+    let small = admit(&user_lock(&lock), GIB, 0, || Some(64 * GIB), std::time::Duration::from_secs(1)).unwrap();
+    assert!(small.confirm(GIB, 0, || Some(64 * GIB)).is_ok());
+    let err = small.confirm(2 * GIB, 0, || Some(64 * GIB)).unwrap_err().to_string();
     assert!(err.contains("admission covers only"), "{err}");
 }
 
@@ -659,8 +667,8 @@ fn memory_used_after_admission_is_rechecked_before_allocating() {
     use sparkforge::weights::admit;
     const GIB: u64 = 1 << 30;
     let lock = dir("admission-recheck").join("admission.lock");
-    let adm = admit(&[&lock], 14 * GIB, 0, || Some(20 * GIB), std::time::Duration::from_secs(1)).expect("fits at admission");
-    let err = adm.confirm(14 * GIB, || Some(17 * GIB)).unwrap_err().to_string();
+    let adm = admit(&user_lock(&lock), 14 * GIB, 0, || Some(20 * GIB), std::time::Duration::from_secs(1)).expect("fits at admission");
+    let err = adm.confirm(14 * GIB, 0, || Some(17 * GIB)).unwrap_err().to_string();
     assert!(err.contains("refusing to copy"), "{err}");
 }
 
@@ -685,9 +693,9 @@ fn admission_is_decided_on_the_host_before_any_cuda_call() {
     let b = bind(&ck, &spec(false)).unwrap();
     let lock = dir("admit-host-lock").join("admission.lock");
     // A machine with 1 GiB available refuses before anything touches the GPU.
-    let err = admit_load_with(&ck, &b, true, &[&lock], || Some(1 << 30)).err().expect("over budget").to_string();
+    let err = admit_load_with(&ck, &b, true, &user_lock(&lock), || Some(1 << 30)).err().expect("over budget").to_string();
     assert!(err.contains("refusing to copy"), "{err}");
-    assert!(admit_load_with(&ck, &b, true, &[&lock], || Some(64 << 30)).is_ok());
+    assert!(admit_load_with(&ck, &b, true, &user_lock(&lock), || Some(64 << 30)).is_ok());
 }
 
 #[cfg(unix)]
@@ -790,4 +798,102 @@ fn an_untied_model_without_lm_head_is_refused() {
     assert!(err.contains("lm_head.weight"), "{err}");
     // With tying on, the same checkpoint binds lm_head to the embedding.
     assert!(bind(&Checkpoint::open(&d).unwrap(), &spec(true)).is_ok());
+}
+
+// ---- SHA-765: codex-review cycle 2 follow-ups ----
+
+#[cfg(unix)]
+#[test]
+fn a_shard_link_through_a_switchable_alias_is_refused() {
+    // In generation A, the shard links through `current`, an alias a publisher can switch to B
+    // between the config read and the shard open. The link is refused, not followed.
+    let root = std::fs::canonicalize(dir("alias-link")).unwrap();
+    let data = root.join("data-a");
+    std::fs::create_dir(&data).unwrap();
+    write_shard(&data.join("weights.safetensors"), &bf16(tensors(false)), 0);
+    std::os::unix::fs::symlink(&data, root.join("current")).unwrap();
+    for (name, target) in [("abs", root.join("current/weights.safetensors")), ("rel", "../current/weights.safetensors".into())] {
+        let g = root.join(format!("gen-{name}"));
+        std::fs::create_dir(&g).unwrap();
+        std::os::unix::fs::symlink(&target, g.join("model.safetensors")).unwrap();
+        let err = format!("{:#}", Checkpoint::open(&g).err().expect("an alias link must fail"));
+        assert!(err.contains("passes through another symlink"), "{name}: {err}");
+    }
+    // A link straight to the file (absolute or relative, no symlink on the way) still opens.
+    for (name, target) in [("direct-abs", data.join("weights.safetensors")), ("direct-rel", "../data-a/weights.safetensors".into())] {
+        let g = root.join(format!("gen-{name}"));
+        std::fs::create_dir(&g).unwrap();
+        std::os::unix::fs::symlink(&target, g.join("model.safetensors")).unwrap();
+        bind(&Checkpoint::open(&g).unwrap_or_else(|e| panic!("{name}: {e:#}")), &spec(false)).unwrap();
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn the_node_lock_must_belong_to_the_loader_group() {
+    use sparkforge::weights::admission_locks_in;
+    let node = dir("node-group").join("run-sparkforge");
+    provision_node(&node, 0o640);
+    // Mode 0640 but owned by some other group (for example `users`): refused.
+    let err = format!("{:#}", admission_locks_in(&node, my_uid(), || Some(my_gid() + 1), 1000, || None, &[]).unwrap_err());
+    assert!(err.contains("not group sparkforge"), "{err}");
+    // The group doesn't exist on this node: refused.
+    let err = format!("{:#}", admission_locks_in(&node, my_uid(), || None, 1000, || None, &[]).unwrap_err());
+    assert!(err.contains("does not exist"), "{err}");
+    // A member of the right group takes it.
+    use sparkforge::weights::admit;
+    let locks = admission_locks_in(&node, my_uid(), || Some(my_gid()), 1000, || None, &[]).unwrap();
+    assert!(admit(&locks.files(), 0, 0, || Some(64 << 30), std::time::Duration::from_secs(1)).is_ok());
+}
+
+#[cfg(unix)]
+#[test]
+fn an_older_loaders_lock_still_blocks_a_new_load_during_an_upgrade() {
+    use sparkforge::weights::{admission_locks_in, admit, LockKind};
+    let root = dir("legacy");
+    let (node, home, run) = (root.join("absent-node-dir"), root.join("home"), root.join("run-user"));
+    std::fs::create_dir(&home).unwrap();
+    std::fs::create_dir(&run).unwrap();
+    chmod(&run, 0o700);
+    // The old binary (before this change) holds its $XDG_RUNTIME_DIR lock while allocating.
+    let old = std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(false).open(run.join("sparkforge-gpu-admission.lock")).unwrap();
+    old.lock().unwrap();
+    let locks = admission_locks_in(&node, 0, || None, my_uid(), || Some(home.clone()), std::slice::from_ref(&run)).unwrap();
+    assert_eq!(locks.files()[0].kind, LockKind::Legacy);
+    let err = format!("{:#}", admit(&locks.files(), 0, 0, || Some(64 << 30), std::time::Duration::from_millis(200)).err().expect("must wait"));
+    assert!(err.contains("gave up after"), "{err}");
+    drop(old);
+    assert!(admit(&locks.files(), 0, 0, || Some(64 << 30), std::time::Duration::from_secs(1)).is_ok());
+    // A legacy directory others can write is ignored, and nothing is created in it.
+    chmod(&run, 0o777);
+    assert!(admission_locks_in(&node, 0, || None, my_uid(), || Some(home.clone()), std::slice::from_ref(&run)).unwrap().legacy.is_empty());
+}
+
+#[cfg(unix)]
+#[test]
+fn the_user_lock_opens_read_write() {
+    // An exclusive lock over an NFS home needs a writable descriptor, so the user lock is opened
+    // read-write: a lock file this user cannot write is an error, not a read-only fallback.
+    if my_uid() == 0 {
+        return; // root writes anything
+    }
+    use sparkforge::weights::admit;
+    let lock = dir("rw-lock").join("sparkforge-gpu-admission.lock");
+    std::fs::write(&lock, b"").unwrap();
+    chmod(&lock, 0o400);
+    let err = format!("{:#}", admit(&user_lock(&lock), 0, 0, || Some(64 << 30), std::time::Duration::from_secs(1)).err().expect("read-only lock must fail"));
+    assert!(err.contains("cannot open the admission lock"), "{err}");
+}
+
+#[test]
+fn a_load_only_admission_cannot_authorize_verification() {
+    use sparkforge::weights::{admit_load_with, bytes_to_copy, load_overhead_bytes};
+    let d = single("verify-scope", bf16(tensors(false)));
+    let ck = Checkpoint::open(&d).unwrap();
+    let b = bind(&ck, &spec(false)).unwrap();
+    let lock = dir("verify-scope-lock").join("admission.lock");
+    let adm = admit_load_with(&ck, &b, false, &user_lock(&lock), || Some(64 << 30)).unwrap();
+    assert!(adm.confirm(bytes_to_copy(&ck, &b), load_overhead_bytes(&b, false), || Some(64 << 30)).is_ok());
+    let err = adm.confirm(bytes_to_copy(&ck, &b), load_overhead_bytes(&b, true), || Some(64 << 30)).unwrap_err().to_string();
+    assert!(err.contains("admission covers only"), "{err}");
 }

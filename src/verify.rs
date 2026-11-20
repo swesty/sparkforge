@@ -385,7 +385,7 @@ pub fn verify_weights(
     let s = e.stream.clone();
     let mut rng = Rng(seed | 1);
     let last = p.model.layers.saturating_sub(1);
-    let dw = upload(&s, ck, b, admission)?;
+    let dw = upload(&s, ck, b, admission, true)?;
     let mut rep = WeightReport {
         rows: vec![],
         load_secs: dw.load_secs,

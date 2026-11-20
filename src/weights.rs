@@ -100,16 +100,35 @@ impl CheckpointDir {
     }
 
     /// Opens `name` inside the directory without blocking (a FIFO with no writer would otherwise
-    /// hang `open`) and requires the opened descriptor to be a regular file. Symlinks are followed:
-    /// a Hugging Face cache snapshot links each shard to `../../blobs/<hash>`.
+    /// hang `open`) and requires the opened descriptor to be a regular file.
+    ///
+    /// No symlink on the way is followed, except one at the entry itself: a Hugging Face cache
+    /// snapshot links each shard to `../../blobs/<hash>`. That link's target is walked the same way,
+    /// one component at a time with `O_NOFOLLOW`, so a target that passes through another symlink
+    /// (for example a `current` alias that a publisher switches) is refused rather than followed
+    /// into whatever generation the alias names now (codex-review of SHA-765).
     fn open(&self, name: &str) -> Result<File> {
         let path = self.entry(name);
         #[cfg(unix)]
         let opened = {
-            use std::os::fd::{AsRawFd, FromRawFd};
-            let c = std::ffi::CString::new(name).with_context(|| format!("{name:?} contains a NUL byte"))?;
-            let fd = unsafe { libc::openat(self.fd.as_raw_fd(), c.as_ptr(), libc::O_RDONLY | libc::O_NONBLOCK | libc::O_CLOEXEC) };
-            if fd < 0 { Err(std::io::Error::last_os_error()) } else { Ok(unsafe { File::from_raw_fd(fd) }) }
+            use std::io::ErrorKind;
+            let (parent, last) = nofollow::walk(&self.fd, Path::new(name))
+                .map_err(|e| nofollow::explain(e, &path, "passes through a symlink or a missing directory"))?;
+            match nofollow::open_file(&parent, &last) {
+                Err(e) if e.raw_os_error() == Some(libc::ELOOP) => {
+                    let target = nofollow::readlink(&parent, &last).with_context(|| format!("reading the link {}", path.display()))?;
+                    let hop = nofollow::walk(&parent, &target).and_then(|(p, l)| nofollow::open_file(&p, &l));
+                    match hop {
+                        Err(e) if e.kind() == ErrorKind::NotFound => Err(e),
+                        Err(e) if matches!(e.raw_os_error(), Some(libc::ELOOP) | Some(libc::ENOTDIR)) => bail!(
+                            "{} links to {}, which passes through another symlink, so the generation it names can change mid-load; link straight to the file",
+                            path.display(), target.display()
+                        ),
+                        r => r,
+                    }
+                }
+                r => r,
+            }
         };
         #[cfg(not(unix))]
         let opened = File::open(&path);
@@ -151,6 +170,75 @@ impl CheckpointDir {
         ensure!(len <= MAX_METADATA_BYTES, "{} is {len} bytes, above the {MAX_METADATA_BYTES}-byte metadata limit", path.display());
         read_capped(file, MAX_METADATA_BYTES, &path.display().to_string())
     }
+}
+
+/// Path walking that never follows a symlink (`O_NOFOLLOW` on every component).
+#[cfg(unix)]
+mod nofollow {
+    use std::ffi::CString;
+    use std::fs::File;
+    use std::io;
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::ffi::OsStrExt;
+    use std::path::{Component, Path, PathBuf};
+
+    fn openat(dir: &File, name: &std::ffi::CStr, flags: i32) -> io::Result<File> {
+        let fd = unsafe { libc::openat(dir.as_raw_fd(), name.as_ptr(), flags | libc::O_NOFOLLOW | libc::O_CLOEXEC) };
+        if fd < 0 { Err(io::Error::last_os_error()) } else { Ok(unsafe { File::from_raw_fd(fd) }) }
+    }
+
+    fn cstr(s: &std::ffi::OsStr) -> io::Result<CString> {
+        CString::new(s.as_bytes()).map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains a NUL byte"))
+    }
+
+    /// Opens every directory of `path` from `start` (or from `/` for an absolute path) without
+    /// following symlinks, and returns the last directory with the final component's name.
+    pub fn walk(start: &File, path: &Path) -> io::Result<(File, CString)> {
+        let comps: Vec<Component> = path.components().filter(|c| !matches!(c, Component::CurDir)).collect();
+        let Some((last, dirs)) = comps.split_last() else { return Err(io::Error::new(io::ErrorKind::InvalidInput, "empty path")) };
+        let Component::Normal(last) = last else { return Err(io::Error::new(io::ErrorKind::InvalidInput, "path does not end in a file name")) };
+        let mut cur = start.try_clone()?;
+        for c in dirs {
+            let name = match c {
+                Component::RootDir => {
+                    cur = File::open("/")?;
+                    continue;
+                }
+                Component::ParentDir => cstr("..".as_ref())?,
+                Component::Normal(n) => cstr(n)?,
+                _ => return Err(io::Error::new(io::ErrorKind::InvalidInput, "unsupported path component")),
+            };
+            cur = openat(&cur, &name, libc::O_RDONLY | libc::O_DIRECTORY)?;
+        }
+        Ok((cur, cstr(last)?))
+    }
+
+    /// Opens a file non-blocking; a symlink there fails with `ELOOP`.
+    pub fn open_file(dir: &File, name: &std::ffi::CStr) -> io::Result<File> {
+        openat(dir, name, libc::O_RDONLY | libc::O_NONBLOCK)
+    }
+
+    pub fn readlink(dir: &File, name: &std::ffi::CStr) -> io::Result<PathBuf> {
+        let mut buf = vec![0u8; libc::PATH_MAX as usize];
+        let n = unsafe { libc::readlinkat(dir.as_raw_fd(), name.as_ptr(), buf.as_mut_ptr().cast(), buf.len()) };
+        if n < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        buf.truncate(n as usize);
+        Ok(PathBuf::from(std::ffi::OsString::from_vec(buf)))
+    }
+
+    /// Error for a failed walk: missing stays "missing", a symlink on the way is named as such.
+    pub fn explain(e: io::Error, path: &Path, what: &str) -> anyhow::Error {
+        if e.kind() == io::ErrorKind::NotFound {
+            anyhow::anyhow!("{} is missing", path.display())
+        } else if matches!(e.raw_os_error(), Some(libc::ELOOP) | Some(libc::ENOTDIR)) {
+            anyhow::anyhow!("{} {what}", path.display())
+        } else {
+            anyhow::Error::new(e).context(format!("opening {}", path.display()))
+        }
+    }
+    use std::os::unix::ffi::OsStringExt;
 }
 
 /// Reads at most `cap` bytes of UTF-8. A source that yields more (a file that grew after its size
@@ -657,16 +745,17 @@ impl Admission {
     }
 
     /// Re-checks, under the held locks and right before allocating, that this admission covers the
-    /// workload actually being copied, and that `MemAvailable` still leaves the headroom: CUDA
-    /// startup between admission and upload uses memory too (codex-review of SHA-765).
-    pub fn confirm(&self, copy_bytes: u64, mem: impl Fn() -> Option<u64>) -> Result<()> {
+    /// workload actually being run (its copied bytes and its overhead, which includes verification
+    /// scratch when verifying), and that `MemAvailable` still leaves the headroom: CUDA startup
+    /// between admission and upload uses memory too (codex-review of SHA-765).
+    pub fn confirm(&self, copy_bytes: u64, overhead: u64, mem: impl Fn() -> Option<u64>) -> Result<()> {
         ensure!(
-            copy_bytes <= self.copy_bytes,
-            "this upload copies {copy_bytes} bytes but its admission covers only {} bytes; take admission for the binding being uploaded",
-            self.copy_bytes
+            copy_bytes <= self.copy_bytes && overhead <= self.overhead,
+            "this load needs {copy_bytes} bytes copied plus {overhead} of overhead but its admission covers only {} plus {}; take admission for the binding and mode being run",
+            self.copy_bytes, self.overhead
         );
         let avail = mem().context("cannot read MemAvailable from /proc/meminfo; refusing to allocate without the memory guard")?;
-        check_headroom(copy_bytes + self.overhead, avail)
+        check_headroom(copy_bytes + overhead, avail)
     }
 }
 
@@ -674,13 +763,14 @@ impl Admission {
 /// turns into an error instead of an indefinite hang.
 pub const ADMISSION_WAIT: std::time::Duration = std::time::Duration::from_secs(30 * 60);
 
-/// Opens an admission lock read-only (enough for `flock`) without following a final symlink and
-/// without blocking, and requires a regular file: a FIFO there fails promptly. A missing per-user
-/// lock is created private to this user first.
-fn open_lock(path: &Path) -> Result<File> {
+/// Opens an admission lock without following a final symlink and without blocking, and requires a
+/// regular file: a FIFO there fails promptly. A missing per-user lock is created private to this
+/// user first. This user's own locks open read-write, since an exclusive lock over NFS needs a
+/// writable descriptor; the root-owned node lock opens read-only, which `flock` on tmpfs accepts.
+fn open_lock(path: &Path, writable: bool, create: bool) -> Result<File> {
     #[cfg(unix)]
     use std::os::unix::fs::OpenOptionsExt;
-    if matches!(std::fs::symlink_metadata(path), Err(e) if e.kind() == std::io::ErrorKind::NotFound) {
+    if create && matches!(std::fs::symlink_metadata(path), Err(e) if e.kind() == std::io::ErrorKind::NotFound) {
         let mut create = std::fs::OpenOptions::new();
         create.write(true).create_new(true);
         #[cfg(unix)]
@@ -692,7 +782,7 @@ fn open_lock(path: &Path) -> Result<File> {
         }
     }
     let mut opts = std::fs::OpenOptions::new();
-    opts.read(true);
+    opts.read(true).write(writable);
     #[cfg(unix)]
     opts.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
     let lock = match opts.open(path) {
@@ -708,9 +798,10 @@ fn open_lock(path: &Path) -> Result<File> {
     Ok(lock)
 }
 
-/// Takes the `flock` on `path`, waiting at most `wait` for the current holder.
-fn take_lock(path: &Path, wait: std::time::Duration) -> Result<File> {
-    let lock = open_lock(path)?;
+/// Takes the `flock` on one lock, waiting at most `wait` for the current holder.
+fn take_lock(l: &LockFile, wait: std::time::Duration) -> Result<File> {
+    let path = l.path.as_path();
+    let lock = open_lock(path, l.kind != LockKind::Node, l.kind == LockKind::User)?;
     let deadline = std::time::Instant::now() + wait;
     let mut told = false;
     loop {
@@ -730,23 +821,25 @@ fn take_lock(path: &Path, wait: std::time::Duration) -> Result<File> {
     }
 }
 
-/// Takes every lock in `locks`, in order (see `AdmissionLocks::paths`), then runs the memory guard
+/// Takes every lock in `locks`, in order (see `AdmissionLocks::files`), then runs the memory guard
 /// against `mem()` for `copy_bytes + overhead`. The locks are advisory `flock`s, so they coordinate
 /// sparkforge processes; other programs are seen only through `MemAvailable`.
-pub fn admit(locks: &[&Path], copy_bytes: u64, overhead: u64, mem: impl Fn() -> Option<u64>, wait: std::time::Duration) -> Result<Admission> {
+pub fn admit(locks: &[LockFile], copy_bytes: u64, overhead: u64, mem: impl Fn() -> Option<u64>, wait: std::time::Duration) -> Result<Admission> {
     ensure!(!locks.is_empty(), "no admission lock to take");
-    let held = locks.iter().map(|p| take_lock(p, wait)).collect::<Result<Vec<_>>>()?;
+    let held = locks.iter().map(|l| take_lock(l, wait)).collect::<Result<Vec<_>>>()?;
     let avail = mem().context("cannot read MemAvailable from /proc/meminfo; refusing to allocate without the memory guard")?;
     check_headroom(copy_bytes + overhead, avail)?;
     Ok(Admission { _locks: held, copy_bytes, overhead })
 }
 
 /// Root-provisioned directory holding the node-wide admission lock (a deploy step on each GB10).
-/// The lock is shared through a group, never with every account, so a local account outside that
-/// group cannot hold it and stall other users' loads. `/run` is tmpfs, so a boot-time
+/// The lock is shared through the `sparkforge` group, never with every account, so a local account
+/// outside that group cannot hold it and stall other users' loads. `/run` is tmpfs, so a boot-time
 /// `tmpfiles.d` entry recreates it:
 /// `d /run/sparkforge 0755 root root -` and `f /run/sparkforge/admission.lock 0640 root sparkforge -`.
 pub const NODE_LOCK_DIR: &str = "/run/sparkforge";
+/// The group the node lock is shared through.
+pub const NODE_LOCK_GROUP: &str = "sparkforge";
 const NODE_LOCK_NAME: &str = "admission.lock";
 const USER_LOCK_NAME: &str = "sparkforge-gpu-admission.lock";
 
@@ -760,9 +853,30 @@ pub enum LockScope {
     User,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LockKind {
+    /// A lock an older loader (before SHA-765) left in this user's runtime or temp directory; taken
+    /// while it exists so a load by the old binary still blocks a new one during an upgrade. Never
+    /// created.
+    Legacy,
+    /// This user's lock under the password-database home directory.
+    User,
+    /// The node-wide lock.
+    Node,
+}
+
+/// One lock an admission takes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LockFile {
+    pub path: PathBuf,
+    pub kind: LockKind,
+}
+
 /// The locks one admission takes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AdmissionLocks {
+    /// Locks of older loaders that exist now, owned by this user in private directories.
+    pub legacy: Vec<PathBuf>,
     /// This user's lock under the password-database home directory. It doesn't depend on a login
     /// session, so a background job and a login shell always meet here. Optional only when the
     /// node lock is available.
@@ -776,25 +890,39 @@ impl AdmissionLocks {
         if self.node.is_some() { LockScope::Node } else { LockScope::User }
     }
 
-    /// The order they are taken: user, then node. Taking the user lock first also covers turning
-    /// the node lock on while this user's earlier load (which held only the user lock) is still
-    /// allocating.
-    pub fn paths(&self) -> Vec<&Path> {
-        self.user.iter().chain(self.node.iter()).map(|p| p.as_path()).collect()
+    /// The order they are taken: legacy, user, node. Taking this user's locks first also covers
+    /// turning the node lock on, or upgrading the binary, while this user's earlier load (which held
+    /// only those) is still allocating.
+    pub fn files(&self) -> Vec<LockFile> {
+        let f = |p: &PathBuf, kind| LockFile { path: p.clone(), kind };
+        self.legacy.iter().map(|p| f(p, LockKind::Legacy))
+            .chain(self.user.iter().map(|p| f(p, LockKind::User)))
+            .chain(self.node.iter().map(|p| f(p, LockKind::Node)))
+            .collect()
     }
 }
 
-/// Lock locations, decided from ownership only, never from environment variables.
+/// Where the locks are, decided from ownership only, never from environment variables.
 /// - The node lock when `node_dir` is a real directory owned by `trusted_owner` (root in
 ///   production) and closed to writes by others, holding a regular `admission.lock` owned by
-///   `trusted_owner` that grants no access to every account (only its group can open it). A
-///   `node_dir` that exists but fails these checks is an error, not a silent fallback.
+///   `trusted_owner`, in group `node_group` (`sparkforge`), granting no access to other accounts.
+///   A `node_dir` that exists but fails these checks is an error, not a silent fallback.
 /// - The user lock in `<home>/.local/state/sparkforge` (created 0700). `home` is consulted only
 ///   here, so a numeric uid without a password entry can still use a provisioned node lock.
-pub fn admission_locks_in(node_dir: &Path, trusted_owner: u32, uid: u32, home: impl FnOnce() -> Option<PathBuf>) -> Result<AdmissionLocks> {
+/// - Legacy locks: `USER_LOCK_NAME` in each of `legacy_dirs` when the directory and the file are
+///   this user's, the directory isn't writable by others, and the file is regular.
+pub fn admission_locks_in(
+    node_dir: &Path,
+    trusted_owner: u32,
+    node_group: impl FnOnce() -> Option<u32>,
+    uid: u32,
+    home: impl FnOnce() -> Option<PathBuf>,
+    legacy_dirs: &[PathBuf],
+) -> Result<AdmissionLocks> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+        let private_dir = |d: &Path| std::fs::symlink_metadata(d).is_ok_and(|m| m.file_type().is_dir() && m.uid() == uid && m.mode() & 0o022 == 0);
         let node = match std::fs::symlink_metadata(node_dir) {
             Ok(m) => {
                 ensure!(m.file_type().is_dir() && m.uid() == trusted_owner && m.mode() & 0o022 == 0,
@@ -804,7 +932,10 @@ pub fn admission_locks_in(node_dir: &Path, trusted_owner: u32, uid: u32, home: i
                 ensure!(lm.file_type().is_file() && lm.uid() == trusted_owner,
                     "{} must be a regular file owned by uid {trusted_owner}", lock.display());
                 ensure!(lm.mode() & 0o007 == 0,
-                    "{} grants access to every account (mode {:o}), so any local account could hold it and stall every load; share it through a group (mode 0640)", lock.display(), lm.mode() & 0o777);
+                    "{} grants access to every account (mode {:o}), so any local account could hold it and stall every load; share it through group {NODE_LOCK_GROUP} (mode 0640)", lock.display(), lm.mode() & 0o777);
+                let group = node_group().with_context(|| format!("{} is provisioned but group {NODE_LOCK_GROUP} does not exist", lock.display()))?;
+                ensure!(lm.gid() == group,
+                    "{} belongs to gid {}, not group {NODE_LOCK_GROUP} (gid {group}), so accounts outside that group could hold it; fix the provisioning", lock.display(), lm.gid());
                 Some(lock)
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
@@ -814,34 +945,52 @@ pub fn admission_locks_in(node_dir: &Path, trusted_owner: u32, uid: u32, home: i
             let home = home().with_context(|| format!("no home directory for uid {uid} in the password database, and {} is not provisioned", node_dir.display()))?;
             let d = home.join(".local/state/sparkforge");
             std::fs::DirBuilder::new().recursive(true).mode(0o700).create(&d).with_context(|| format!("creating {}", d.display()))?;
-            let private = std::fs::symlink_metadata(&d).is_ok_and(|m| m.file_type().is_dir() && m.uid() == uid && m.mode() & 0o022 == 0);
-            ensure!(private, "{} must be a directory owned by uid {uid} and not writable by others", d.display());
+            ensure!(private_dir(&d), "{} must be a directory owned by uid {uid} and not writable by others", d.display());
             Ok(d.join(USER_LOCK_NAME))
         })();
         // With the node lock, the user lock only adds same-user cutover cover, so it is optional.
         let user = if node.is_some() { user.ok() } else { Some(user?) };
-        Ok(AdmissionLocks { user, node })
+        let legacy = legacy_dirs.iter().filter(|d| private_dir(d)).map(|d| d.join(USER_LOCK_NAME))
+            .filter(|p| std::fs::symlink_metadata(p).is_ok_and(|m| m.file_type().is_file() && m.uid() == uid))
+            .filter(|p| user.as_ref() != Some(p))
+            .collect();
+        Ok(AdmissionLocks { legacy, user, node })
     }
     #[cfg(not(unix))]
     {
-        let _ = (node_dir, trusted_owner, uid);
+        let _ = (node_dir, trusted_owner, node_group, uid, legacy_dirs);
         let home = home().unwrap_or_else(std::env::temp_dir);
-        Ok(AdmissionLocks { user: Some(home.join(USER_LOCK_NAME)), node: None })
+        Ok(AdmissionLocks { legacy: vec![], user: Some(home.join(USER_LOCK_NAME)), node: None })
     }
 }
 
-/// The production lock locations: `/run/sparkforge` owned by root, this process's effective uid,
-/// and the home directory from the password database (not `$HOME`).
+/// The production lock locations: `/run/sparkforge` owned by root in group `sparkforge`, this
+/// process's effective uid, the home directory from the password database (not `$HOME`), and the
+/// directories older loaders used (`/run/user/<uid>`, `<tmp>/sparkforge-<uid>`).
 pub fn admission_locks() -> Result<AdmissionLocks> {
     #[cfg(unix)]
     {
         let uid = unsafe { libc::geteuid() };
-        admission_locks_in(Path::new(NODE_LOCK_DIR), 0, uid, || home_dir_of(uid))
+        let legacy = [PathBuf::from(format!("/run/user/{uid}")), std::env::temp_dir().join(format!("sparkforge-{uid}"))];
+        admission_locks_in(Path::new(NODE_LOCK_DIR), 0, || gid_of(NODE_LOCK_GROUP), uid, || home_dir_of(uid), &legacy)
     }
     #[cfg(not(unix))]
     {
-        admission_locks_in(Path::new(NODE_LOCK_DIR), 0, 0, || None)
+        admission_locks_in(Path::new(NODE_LOCK_DIR), 0, || None, 0, || None, &[])
     }
+}
+
+#[cfg(unix)]
+fn gid_of(group: &str) -> Option<u32> {
+    let name = std::ffi::CString::new(group).ok()?;
+    let mut buf: Vec<libc::c_char> = vec![0; 16 * 1024];
+    let mut gr: libc::group = unsafe { std::mem::zeroed() };
+    let mut out: *mut libc::group = std::ptr::null_mut();
+    let rc = unsafe { libc::getgrnam_r(name.as_ptr(), &mut gr, buf.as_mut_ptr(), buf.len(), &mut out) };
+    if rc != 0 || out.is_null() {
+        return None;
+    }
+    Some(gr.gr_gid)
 }
 
 #[cfg(unix)]
@@ -866,7 +1015,7 @@ pub fn bytes_to_copy(ck: &Checkpoint, b: &Binding) -> u64 {
 /// Admission for loading `b`, taken on the host before any CUDA call: the `locks` and the memory
 /// guard for the copied bytes plus the load's overhead. Hold the result until the upload has made
 /// and filled every allocation; the upload confirms it against what it actually copies.
-pub fn admit_load_with(ck: &Checkpoint, b: &Binding, verifying: bool, locks: &[&Path], mem: impl Fn() -> Option<u64>) -> Result<Admission> {
+pub fn admit_load_with(ck: &Checkpoint, b: &Binding, verifying: bool, locks: &[LockFile], mem: impl Fn() -> Option<u64>) -> Result<Admission> {
     admit(locks, bytes_to_copy(ck, b), load_overhead_bytes(b, verifying), mem, ADMISSION_WAIT)
 }
 
@@ -877,7 +1026,7 @@ pub fn admit_load(ck: &Checkpoint, b: &Binding, verifying: bool) -> Result<Admis
     if locks.scope() == LockScope::User {
         eprintln!("note: {NODE_LOCK_DIR}/{NODE_LOCK_NAME} is not provisioned; loads are serialized only among this user's processes");
     }
-    admit_load_with(ck, b, verifying, &locks.paths(), mem_available)
+    admit_load_with(ck, b, verifying, &locks.files(), mem_available)
 }
 
 /// `MemAvailable` from /proc/meminfo in bytes (Linux only).
