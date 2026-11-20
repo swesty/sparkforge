@@ -157,6 +157,16 @@ the memory budget SHALL include that room.
 - **WHEN** a decode or speculative replay was queued before its predecessor committed the last position of the context
 - **THEN** it publishes zero tokens, reports the context as full, and leaves the committed length, KV, recurrent state and token history unchanged
 
+### Requirement: Output never exceeds the requested length
+
+The engine SHALL publish exactly the requested number of tokens, or fewer when a stop token or the
+context limit comes first, even when a speculative step accepts several tokens at once or a step
+was queued before its predecessor finished.
+
+#### Scenario: Multi-token acceptance at the end of the budget
+- **WHEN** 255 of 256 requested tokens are published and the next speculative step accepts all four drafts
+- **THEN** exactly one more token is published, and a step already queued behind it publishes zero and changes no state
+
 ### Requirement: Token-history lookups follow the committed prefix
 
 Any lookup keyed by preceding tokens, such as the PLE n-gram embedding, SHALL derive its history
