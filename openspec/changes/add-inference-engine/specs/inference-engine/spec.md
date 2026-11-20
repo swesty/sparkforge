@@ -153,6 +153,10 @@ the memory budget SHALL include that room.
 - **WHEN** MTP k=4 verifies with one to four positions left before the context limit
 - **THEN** every write stays inside its allocation, nothing past the limit is committed, and the tokens match sequential decode
 
+#### Scenario: Replay queued at the limit
+- **WHEN** a decode or speculative replay was queued before its predecessor committed the last position of the context
+- **THEN** it publishes zero tokens, reports the context as full, and leaves the committed length, KV, recurrent state and token history unchanged
+
 ### Requirement: Token-history lookups follow the committed prefix
 
 Any lookup keyed by preceding tokens, such as the PLE n-gram embedding, SHALL derive its history
