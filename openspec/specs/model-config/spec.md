@@ -36,11 +36,12 @@ to `intermediate_size`; if neither exists parsing MUST fail. `n_shared_experts` 
 - **WHEN** `configs/qwen3-30b-a3b.json` is parsed
 - **THEN** the spec is MoE with 128 experts, top-8, expert width 768
 
-### Requirement: Weight format is detected from quantization_config
+### Requirement: Weight format comes from quantization_config, and unknown schemes are rejected
 
 With no `quantization_config` the weight format SHALL be BF16. `quant_method` `nvfp4`, or
 `modelopt` with `quant_algo` `NVFP4`, SHALL map to NVFP4. `gptq` or `awq` with 4 bits and a
-positive `group_size` (default 128) SHALL map to W4A16 with that group.
+positive `group_size` (default 128) SHALL map to W4A16 with that group. Rejection of everything
+else is specified in "Unknown or unsupported quantization is rejected".
 
 #### Scenario: AWQ
 - **WHEN** `quantization_config` is `{"quant_method": "awq", "bits": 4, "group_size": 128}`

@@ -1,6 +1,7 @@
 schema: spec-driven
 # Skills live in this repo (.agents/skills, linked from .claude/skills) so every Code Factory worktree
 # and every host has them without a per-machine install. Recorded so `openspec update` never asks.
+# Refresh with tools/openspec-refresh.sh (pins OpenSpec 2.1.1), not a bare `openspec update`.
 skillsScope: project
 
 context: |
@@ -41,7 +42,7 @@ context: |
   (~/.claude/CLAUDE.md). OpenSpec owns the DURABLE spec (openspec/specs = source of truth). The
   PAI Algorithm owns EXECUTION and ISC verification. Loop: /openspec-propose -> OBSERVE
   (tasks.md seeds ISC); /openspec-apply-change -> BUILD/EXECUTE; PAI VERIFY -> ISC pass;
-  /openspec-archive-change + git -> LEARN.
+  `openspec archive <change>` (CLI) + git -> LEARN.
   PAI PRD.md REFERENCES openspec artifacts; it never duplicates spec content.
 
 rules:

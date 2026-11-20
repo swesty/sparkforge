@@ -72,7 +72,7 @@ HF transformers does (`1 / theta^(2i/head_dim)`), with Llama 3 scaling applied w
 - **WHEN** `inv_freq` is computed with llama3 scaling factor 8 and original context 8192
 - **THEN** frequencies with wavelength under 2048 tokens are unchanged, those over 8192 are divided by 8, and those between are interpolated
 
-### Requirement: RoPE sine and cosine stay accurate at large angles
+### Requirement: RoPE matches the reference at every position
 
 The angle SHALL be formed in f32 and its sine and cosine computed in double precision, because under
 `--use_fast_math` `sincosf` becomes `__sincosf`, whose error grows with the angle.
