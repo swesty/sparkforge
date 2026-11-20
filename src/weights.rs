@@ -25,6 +25,7 @@ pub struct TensorInfo {
 pub struct Shard {
     pub path: PathBuf,
     pub map: Mmap,
+    file: File,
 }
 
 pub struct Checkpoint {
@@ -82,13 +83,29 @@ impl Checkpoint {
                 }
                 ck.tensors.insert(t.name.clone(), t);
             }
-            ck.shards.push(Shard { path, map });
+            ck.shards.push(Shard { path, map, file });
         }
         Ok(ck)
     }
 
     pub fn bytes(&self, t: &TensorInfo) -> &[u8] {
         &self.shards[t.shard].map[t.start..t.end]
+    }
+
+    /// Reads a tensor's bytes into `buf` with positioned reads. Bulk loads use this rather than
+    /// touching the mapping: faulting the mmap in page by page ran at ~0.35 GB/s on spark-5, while
+    /// large reads get the kernel's readahead.
+    pub fn read_into(&self, t: &TensorInfo, buf: &mut Vec<u8>) -> Result<()> {
+        buf.resize(t.end - t.start, 0);
+        let shard = &self.shards[t.shard];
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::FileExt;
+            shard.file.read_exact_at(buf, t.start as u64).with_context(|| format!("reading {} from {}", t.name, shard.path.display()))?;
+        }
+        #[cfg(not(unix))]
+        buf.copy_from_slice(&shard.map[t.start..t.end]);
+        Ok(())
     }
 }
 

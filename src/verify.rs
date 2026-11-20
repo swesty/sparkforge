@@ -353,7 +353,6 @@ pub fn token_estimate_us(p: &Plan, rows: &[Row]) -> Option<f64> {
 
 /// One `verify-weights` result row.
 pub struct WeightRow {
-    pub mode: crate::device_weights::Mode,
     pub linear: String,
     pub case: String,
     pub err: Option<f64>,
@@ -363,21 +362,21 @@ pub struct WeightRow {
 
 pub struct WeightReport {
     pub rows: Vec<WeightRow>,
-    pub loads: Vec<(crate::device_weights::Mode, f64, u64, u64, usize)>,
+    pub load_secs: f64,
+    pub bytes_copied: u64,
 }
 
 fn bf16_bytes_to_f64(b: &[u8]) -> Vec<f64> {
     b.chunks_exact(2).map(|c| bf2f(u16::from_le_bytes([c[0], c[1]])) as f64).collect()
 }
 
-/// GEMVs on real checkpoint weights against an f64 reference, in each requested mode.
+/// GEMVs on real checkpoint weights against an f64 reference, timed across all layers.
 pub fn verify_weights(
     p: &Plan,
     g: &Generated,
     e: &Engine,
     ck: &crate::weights::Checkpoint,
     b: &crate::weights::Binding,
-    modes: &[crate::device_weights::Mode],
     seed: u64,
 ) -> Result<WeightReport> {
     use crate::device_weights::upload;
@@ -385,10 +384,9 @@ pub fn verify_weights(
     let s = e.stream.clone();
     let mut rng = Rng(seed | 1);
     let last = p.model.layers.saturating_sub(1);
-    let mut rep = WeightReport { rows: vec![], loads: vec![] };
-    for &mode in modes {
-        let dw = upload(&e.ctx, &s, ck, b, mode)?;
-        rep.loads.push((mode, dw.load_secs, dw.bytes_mapped, dw.bytes_copied, dw.misaligned));
+    let dw = upload(&s, ck, b)?;
+    let mut rep = WeightReport { rows: vec![], load_secs: dw.load_secs, bytes_copied: dw.bytes_copied };
+    {
         for linear in ["qkv_proj", "o_proj", "gate_up_proj", "down_proj", "lm_head"] {
             let entry = format!("gemv_{linear}");
             let (k, f) = kernel(g, e, &entry).with_context(|| format!("{entry} was not generated"))?;
@@ -418,11 +416,10 @@ pub fn verify_weights(
                     }
                 });
                 let case = match bl.layer { Some(i) => format!("layer {i}"), None => "-".into() };
-                rep.rows.push(WeightRow { mode, linear: linear.into(), case, err: Some(max_err(&got, &r)), us: None, gbs: None });
+                rep.rows.push(WeightRow { linear: linear.into(), case, err: Some(max_err(&got, &r)), us: None, gbs: None });
             }
             // Timing: rotate through every layer's copy of this linear (naturally larger than L2).
             let ptrs: Vec<u64> = bound.iter().map(|l| dw.linears[&l.key()].ptr).collect();
-            let mapped = bound.iter().filter(|l| dw.linears[&l.key()].mapped).count();
             let bytes = (n * kk * 2) as f64;
             let iters = (ptrs.len() as u32).max(20);
             let us = time_us(&s, iters, |i| {
@@ -430,9 +427,8 @@ pub fn verify_weights(
                 unsafe { s.launch_builder(f).arg(&w).arg(&dx).arg(&mut dy).launch(cfg(k.grid, k.block, k.dyn_smem))? };
                 Ok(())
             })?;
-            rep.rows.push(WeightRow { mode, linear: linear.into(), case: format!("{} copies, {} mapped", ptrs.len(), mapped), err: None, us: Some(us), gbs: Some(bytes / (us * 1e3)) });
+            rep.rows.push(WeightRow { linear: linear.into(), case: format!("all {} copies", ptrs.len()), err: None, us: Some(us), gbs: Some(bytes / (us * 1e3)) });
         }
-        drop(dw);
     }
     Ok(rep)
 }

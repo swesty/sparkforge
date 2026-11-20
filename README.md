@@ -42,7 +42,8 @@ that would otherwise be runtime heuristics.
 | `plan.rs` | Derives every linear (fused QKV, fused gate/up, experts, lm_head), picks decode GEMV grids, prefill GEMM tiles (smem/regs/wave-quantization scoring), flash-decoding split count, RMSNorm threading, memory budget, and decode roofline. | Working |
 | `codegen.rs` | Emits `model.cu` + `gemm_tiles.cuh` with shapes baked in, plus `manifest.json` (entry, grid, block, dyn smem, args). | Working |
 | `runtime.rs` | NVRTC compile for `sm_121a`, checks cc 12.1, loads every generated entry point via `cudarc`, opts kernels above 48 KB into larger dynamic smem. | Verified on GB10 |
-| `verify.rs` | Runs every generated kernel on random bf16 inputs, diffs against an f64 CPU reference, and optionally times it with weights rotated out of L2. | Verified on GB10 |
+| `verify.rs` | Runs every generated kernel on random bf16 inputs, diffs against an f64 CPU reference, and optionally times it with weights rotated out of L2. `verify-weights` does the same on a real checkpoint. | Verified on GB10 |
+| `weights.rs`, `device_weights.rs` | Opens HF safetensors checkpoints (single file or sharded), validates every tensor against the plan, and copies each linear into GPU memory with q\|k\|v and gate\|up packed, behind a `MemAvailable` guard. Dense BF16 Llama-family only. | Verified on GB10 |
 
 Generated kernels (all compile for `sm_121a` with NVRTC 13 and match the CPU reference; see "Measured on GB10"):
 
@@ -69,6 +70,8 @@ cargo build --release
 # On a Spark:
 cargo run --release --features cuda -- load configs/llama-3.1-8b.json --cuda-include /usr/local/cuda/include
 cargo run --release --features cuda -- verify configs/llama-3.1-8b.json --bench   # correctness + timing per kernel
+./target/release/sparkforge weights /path/to/checkpoint          # validate a safetensors checkpoint (host only)
+cargo run --release --features cuda -- verify-weights /path/to/checkpoint   # GEMVs on the real weights vs f64
 cargo test
 ```
 
@@ -115,8 +118,10 @@ no CUDA graph.
 
 Ordered by what moves tokens/s the most on GB10.
 
-1. **Weight loader + CPU reference.** safetensors via `memmap2`. Since memory is unified, use `cudaHostRegister` or
-   managed memory and skip copies. Write a scalar Rust reference forward pass and diff every generated kernel against it.
+1. **Weight loader + CPU reference.** The loader is done (safetensors, validated, copied into GPU memory: Llama 3.1 8B
+   loads in about 10 s on a Spark). Reading the file mapping in place through ATS was measured and rejected: about
+   0.3 GB/s on first touch and about 35% below device memory warm (`openspec/changes/add-weight-loading/design.md`).
+   Next: a scalar Rust reference forward pass to diff every layer against.
 2. **End-to-end BF16 decode** for one dense model using the existing kernels and a CUDA Graph per decode step
    (the launch count is fixed, so graph capture is simple). Measure against the roofline the planner prints.
 3. **Quantized decode GEMVs.** W4A16 (AWQ/GPTQ layouts) and NVFP4 (e2m1 + e4m3 per-16 scales) with dequant in

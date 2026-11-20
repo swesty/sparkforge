@@ -12,10 +12,10 @@ virtual address (including a file mapping) is a valid GPU address.
 
 **Goals:**
 - Fail before touching the GPU if the checkpoint does not match the plan exactly.
-- Measure mapped versus copied GEMV bandwidth on real weights so the default is chosen on data.
+- Decide zero-copy versus copying on measured GEMV bandwidth from real weights.
 
 **Non-Goals:**
-- Zero-copy for fused linears (needs multi-pointer kernels).
+- Zero-copy for any linear (rejected on measurement, decision 2).
 - Windows or non-Linux memory accounting.
 
 ## Decisions
@@ -24,30 +24,42 @@ virtual address (including a file mapping) is a valid GPU address.
    existing `serde_json`, and map files with `memmap2`. The format is small and stable; a parser
    we own lets us check every byte range against the file length. Alternative: the `safetensors`
    crate. Rejected only to avoid a second JSON stack for a 30-line parser.
-2. **Mapped mode passes the mmap address straight to kernels.** No `cuMemHostRegister`: pinning a
-   15 GB file mapping locks it out of reclaim and, per the fleet runbook, exhausting pinned memory
-   freezes a Spark instead of failing a CUDA call. ATS needs no registration. The device attribute
-   `CU_DEVICE_ATTRIBUTE_PAGEABLE_MEMORY_ACCESS` must be 1, otherwise mapped mode is refused.
-   Alternative: managed memory (`cuMemAllocManaged` + read from file) is still a copy, so it is no
-   better than copied mode for this purpose.
-3. **Alignment fallback.** The GEMV needs 16-byte aligned rows. safetensors only guarantees
-   element alignment, so a tensor whose data is not 16-byte aligned is copied even in mapped mode,
-   and counted separately in the report.
-4. **Fused linears are packed once into a GPU allocation** in both modes, in the kernel's row order.
+2. **Copy into GPU memory; do not read the file mapping in place.** GB10 reports Addressing Mode ATS,
+   so kernels *can* dereference the mmap address directly (no pinning, no copy). This was built
+   (commit "safetensors loader with mapped (ATS) and copied GPU binding" in this change) and
+   measured with `verify-weights` on spark-5 (GB10, 4 KB pages, CUDA 13.0, driver 580.178.04):
+
+   | Llama 3.1 8B linear | Mapped, each layer touched once | Mapped, same tensor re-read | Device memory |
+   |---|---|---|---|
+   | `o_proj` (33.5 MB) | 120,391 µs (~0.3 GB/s) | 208.5 µs (161 GB/s) | 135-143 µs (225-245 GB/s) |
+   | `down_proj` (117 MB) | 376,764 µs (~0.3 GB/s) | 734.6 µs (160 GB/s) | 475-493 µs (238-247 GB/s) |
+
+   First touch costs about 3.3 µs per 4 KB page, and even warm reads lose about 35% of bandwidth,
+   most likely to translation misses on 4 KB pages (inference, not profiled). Copying 14 GB is a
+   one-time 10 s cost, so copying wins. Pinning (`cuMemHostRegister`) was not pursued: it locks the
+   same bytes a copy allocates, and exhausting pinned memory freezes a Spark (fleet runbook).
+3. **Alignment, recorded for any future zero-copy attempt.** safetensors pads the header length to 8
+   bytes, so data starts at `8 + header_len`, which is 0 or 8 mod 16 per *file*; tensor offsets
+   inside the data are 16-byte aligned. Llama 3.2 1B's single file and Llama 3.1 8B's shard 4 are
+   8-byte aligned throughout, shards 1-3 are 16-byte aligned. The 16-byte-vector GEMV could not use
+   misaligned files in place.
+4. **Fused linears are packed once into a GPU allocation**, in the kernel's row order.
 5. **Memory guard on Linux** reads `MemAvailable` from `/proc/meminfo` and refuses when the bytes
-   to copy exceed `MemAvailable - 4 GiB`. Mapped bytes are page cache and are not counted.
+   to copy exceed `MemAvailable - 4 GiB`.
 6. **Binding is name-based and explicit.** For each layer the expected tensor names and shapes are
    generated from the `ModelSpec`; anything missing is an error naming the tensor and the expected
    shape; anything present but unused is listed as unexpected (some checkpoints carry extra
    buffers) without failing.
+7. **Bulk loads use positioned reads, not the mapping.** Copying straight out of the mmap faulted it
+   in a few pages at a time: 13.98 GiB took 40.5-41.8 s (~0.35 GB/s) while `dd` read a shard at
+   1.6 GB/s. `madvise(MADV_SEQUENTIAL)` made it slower (47.9 s). Reading each tensor with `pread`
+   into a reused buffer and copying that brought the load to 10.3-10.8 s (~1.36 GB/s). The mapping
+   is still used for header parsing and for the reference computations in `verify-weights`.
 
 ## Risks / Trade-offs
 
-- [Mapped pages can be evicted under memory pressure and re-faulted by the GPU, which would show
-  up as GEMV slowdowns] -> `verify-weights` times every linear across all layers in both modes;
-  the default mode is set from that measurement, not assumed.
-- [ATS reads may use 4 KB host pages and lose bandwidth to TLB misses] -> same measurement; if
-  mapped bandwidth is materially lower, copied stays the default and mapped stays available for
-  memory-constrained loads.
-- [Fused packing costs a copy of about 70% of a dense model's bytes] -> accepted for now; the
-  multi-pointer GEMV is a follow-up.
+- [Loads are disk-bound when the page cache cannot hold the checkpoint (only ~4.6 GB stayed cached
+  on spark-5 beside the resident vLLM engine)] -> ~1.4 GB/s from NVMe is acceptable for now; a
+  pinned double-buffered reader could overlap reads with copies later.
+- [Fused packing and copying need the model's full size in free memory] -> the 4 GiB guard refuses
+  loads that would push the node into OOM territory; Llama 3.1 8B loaded with 11.3 GiB still free.

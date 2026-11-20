@@ -61,17 +61,15 @@ rows then the up rows, into one GPU allocation each.
 - **WHEN** the `qkv_proj` GEMV runs on packed layer-0 weights with a random input
 - **THEN** its output matches an f64 reference computed from the separate checkpoint tensors within 1/64
 
-### Requirement: Weights are GPU-readable in mapped or copied mode
+### Requirement: Weights are copied into GPU memory
 
-In mapped mode, unfused tensors SHALL be read by kernels at their memory-mapped address with no
-copy and no pinning, and the mode MUST be refused if the device does not report pageable memory
-access. A tensor whose data is not 16-byte aligned SHALL be copied even in mapped mode. In copied
-mode every tensor SHALL be copied into GPU memory. The load report SHALL state bytes mapped and
-bytes copied.
+Every planned linear SHALL be copied into a GPU allocation before kernels use it. Kernels SHALL NOT
+read checkpoint file mappings in place: on GB10 that measured about 0.3 GB/s on first touch and
+about 35% below device memory once warm. The load report SHALL state the bytes copied and the time.
 
-#### Scenario: Mapped mode on GB10
-- **WHEN** Llama 3.2 1B is loaded in mapped mode on a GB10
-- **THEN** unfused, aligned tensors are reported as mapped and fused linears as copied
+#### Scenario: Llama 3.1 8B
+- **WHEN** the Llama 3.1 8B BF16 checkpoint is loaded on a GB10
+- **THEN** 13.98 GiB is copied into GPU memory and the report states the load time
 
 ### Requirement: Loads never exhaust host memory
 
@@ -87,8 +85,8 @@ On Linux, a load SHALL be refused before allocating if the bytes it would copy e
 `sparkforge verify-weights <checkpoint>` SHALL run the generated GEMV for every linear of the first
 and last layer and for `lm_head` on loaded weights, compare each against an f64 reference computed
 from the checkpoint bytes (tolerance 1/64), time each linear across all layers, and report load
-time and GB/s for each requested mode. It MUST exit non-zero if any check fails.
+time and GB/s. It MUST exit non-zero if any check fails.
 
 #### Scenario: Llama 3.1 8B
 - **WHEN** `verify-weights` runs on the Llama 3.1 8B BF16 checkpoint on a GB10
-- **THEN** every check passes and the report shows load time and GB/s for mapped and copied modes
+- **THEN** every check passes and the report shows load time and GB/s for every linear
