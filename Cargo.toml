@@ -1,0 +1,20 @@
+[package]
+name = "sparkforge"
+version = "0.1.0"
+edition = "2021"
+description = "Model-specialized LLM inference engine for NVIDIA DGX Spark (GB10 / SM121)"
+license = "Apache-2.0"
+
+[features]
+default = []
+# Enables NVRTC compilation + kernel loading on a real GB10. Builds without a CUDA install
+# because cudarc loads libcuda/libnvrtc dynamically at runtime.
+cuda = ["dep:cudarc"]
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+cudarc = { version = "0.17", optional = true, default-features = false, features = ["std", "driver", "nvrtc", "dynamic-loading", "cuda-13000"] }

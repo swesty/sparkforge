@@ -1,0 +1,10 @@
+policy_version = 1
+slug = "swesty/sparkforge"
+linear_team = "SHA"
+profile = "research"
+review_mode = "automatic"
+enforcement = "advisory"
+verify_sha256 = "05d1b8e432268acb4fd287691993f584babfe87dfb6b2c4a245ead6c3f054dd4"
+github_api_sha256 = "b4b9f6d55db4eb7617de36808c8cfbdaf15a2ba34c7f7b951aa6cfc7b72cf804" # gitleaks:allow
+ready_sha256 = "8511dd23814e33c6fac474f6aebb4c39fdd35f9db05500b5df331e9afa8f16ef"
+refuse_local_merge_sha256 = "b6313af9df494fb6f6a55fa8f3efdb20a532cdda23f39077017900b5aee8b929"
