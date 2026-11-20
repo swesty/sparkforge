@@ -12,7 +12,7 @@ Plain-text tokenization lives in this change (task 1.4), because `generate` need
 ## 1. Runtime proving ground on Llama 3.1 8B (SHA-755)
 
 - [ ] 1.1 Step program built from plan + manifest for a dense model, with arena allocation behind the memory budget. Verify: `cargo test` builds the program for both example configs, and its kernel list matches the manifest.
-- [ ] 1.2 One CUDA Graph per decode step, with a device step header updated by a memcpy node. Verify: on a GB10, 256 decode steps of Llama 3.1 8B issue one graph launch each, and the text matches non-graph execution.
+- [ ] 1.2 One CUDA Graph per decode step, with a device step header that the sampling kernel advances on the device (a host memcpy node only for prefill and a new request). Verify: on a GB10, 256 decode steps of Llama 3.1 8B issue one graph launch each, and the text matches non-graph execution.
 - [ ] 1.3 Greedy and temperature sampling (Philox) in the `lm_head` epilogue, with ties broken toward the lowest token id. Verify: greedy output matches an argmax over full logits for 256 steps, including a constructed exact tie; `verify --bench` on the fused kernel on a GB10.
 - [ ] 1.4 Plain-text prompt encoding and output decoding from the checkpoint's `tokenizer.json` (HF `tokenizers` crate), with no chat template. Verify: `cargo test` round-trips text and matches the Hugging Face tokenizer's ids for 20 fixed strings (ids checked in as fixtures).
 - [ ] 1.5 `sparkforge generate --prompt "<text>"` prints decoded text, decode tok/s, time to first token and the ceiling. Verify: Llama 3.1 8B on a GB10 with a plain-text prompt, with the tok/s recorded in the PR against the planner ceiling (12.2 tok/s at 32K, 15.1 at 4K).
@@ -33,7 +33,7 @@ Plain-text tokenization lives in this change (task 1.4), because `generate` need
 
 ## 4. MTP speculative decoding (M6: SHA-753, SHA-775)
 
-- [ ] 4.1 Draft (M=1, k times) and verify (M=k+1) step graphs, with rejection sampling. Verify: `cargo test` checks the acceptance logic against a reference implementation on fixed probabilities.
+- [ ] 4.1 One speculative-step graph (k drafts at M=1, verify at M=k+1, accept), with rejection sampling, and the accept kernel advancing the step header on the device. Verify: `cargo test` checks the acceptance logic against a reference implementation on fixed probabilities; on a GB10, 256 steps replay with no host write to the step header.
 - [ ] 4.2 Shape-invariant target computation: every kernel used by verify computes each position with the same reduction partition and order as the M=1 decode kernel (design decision 8). Verify: over 512 positions, verify-step logits are bitwise identical to decode-step logits, including a constructed near-tie position, on a GB10.
 - [ ] 4.3 Snapshot recurrent and convolution state per verify position, and roll back to the last accepted one. Verify: after partial acceptance, state matches a non-speculative run over the same tokens within kernel tolerance, on a GB10.
 - [ ] 4.4 Committed KV length in the step header, and per-query causal bounds in verify (query i reads below C+i+1, in attention and the indexer). Verify on a GB10:
@@ -41,10 +41,14 @@ Plain-text tokenization lives in this change (task 1.4), because `generate` need
   - later keys in the block are never selected;
   - after forced 2-of-4 acceptance, the next step's selected positions and logits equal non-speculative decoding.
 - [ ] 4.5 Circular buffers (the raw-key ring, and the compressed indexer cache if circular) sized to the live window plus k+1, with the head advanced only on commit. Verify: a full ring, a 5-position verify block across the wrap, and 2 accepted positions give next-step keys, selected positions and logits equal to sequential decode, on a GB10.
-- [ ] 4.6 Context-limit headroom: every buffer verify writes (linear KV, MTP-layer KV, indexer caches, token history) holds k+1 provisional slots beyond the limit, counted in the memory budget. Verify: k=4 with 1, 2, 3 and 4 positions left before the limit keeps every write in bounds (checked by a bounds-checking debug build), commits nothing past the limit, and matches sequential decode, on a GB10.
+- [ ] 4.6 Context-limit headroom: every buffer verify writes (linear KV, MTP-layer KV, indexer caches, token history) holds k+1 provisional slots beyond the limit, counted in the memory budget. Verify: k=4 with 1, 2, 3 and 4 positions left before the limit keeps every write in bounds (checked by a bounds-checking debug build), commits nothing past the limit, and matches sequential decode, and, for plain and speculative decode, a successor queued while its predecessor is held before its final commit (released only after the successor is queued) reports context full, publishes zero tokens and leaves committed state unchanged, on a GB10.
 - [ ] 4.7 PLE token history follows the committed prefix and the causal part of the block. Verify: forced 2-of-4 acceptance where the accepted and rejected histories map to different n-gram rows gives the accepted row and logits equal to sequential decode, on a GB10.
-- [ ] 4.8 Greedy output identical with MTP off and with MTP k=4. Verify: the 4 A/B prompts at 256 tokens produce identical token ids.
-- [ ] 4.9 Measure MTP decode. Verify: tok/s and per-draft acceptance on the A/B prompts against the fleet's ~50 tok/s on the same GB10, plus the distinct experts per verify step.
+- [ ] 4.8 Greedy output identical with MTP off and with MTP k=4. Verify: the 4 A/B prompts at 256 tokens produce identical token ids, and the k=4 run first confirms the PLE table is resident and reports at least one draft-and-verify step per prompt; a run with speculation disabled (for example by the disk-PLE fallback) fails the check instead of passing it.
+- [ ] 4.9 Speculation requires the resident PLE table. Verify: with the memory guard denying residency, an MTP k=4 request completes with non-speculative decode and reports why, on a GB10.
+- [ ] 4.10 Per-replay result slots for streaming. Verify: a deliberately delayed host reader receives complete, ordered tokens across consecutive steps that accept different numbers of drafts.
+- [ ] 4.11 Draft and verify PLE gathers depend on the draft nodes that produce their token ids. Verify: consecutive replays with different draft ids give verify logits bitwise identical to a serialized gather.
+- [ ] 4.12 Remaining generation budget on the device. Verify: with 256 requested tokens, a step at 255 that accepts all four drafts publishes exactly one token; a step queued behind it publishes zero and changes no state; a stop token inside an accepted block ends output at that token, on a GB10.
+- [ ] 4.13 Measure MTP decode. Verify: tok/s and per-draft acceptance on the A/B prompts against the fleet's ~50 tok/s on the same GB10, plus the distinct experts per verify step.
 
 ## 5. Prefill chunk graph (M7)
 
