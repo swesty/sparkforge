@@ -16,6 +16,12 @@
 - [x] 1b.2 Price the MTP shared expert's gate, up and down separately. Verify: `cargo test` checks that quantizing any one changes resident bytes by exactly one matrix's delta, and the entry is consumed.
 - [x] 1b.3 Match PLE and MTP modules at exact paths. Verify: `cargo test` checks that auxiliary `aux.ple.key_proj` and `aux.self_attn.v_proj` entries are reported unused and change no budget, while the real PLE key projection is honored.
 
+## 1c. codex-review round 2
+
+- [x] 1c.1 Accept the model-level PLE table path. Verify: `cargo test` checks that an MXFP8 table entry at `model.language_model.ple_embedding.ngram_embedding` is consumed and changes resident and decode bytes by the exact amounts.
+- [x] 1c.2 Accept layer-qualified PLE entries only at layer p or p−1. Verify: `cargo test` checks that `layers.999` is unused with budgets unchanged, while layers 1 and 2 are honored.
+- [x] 1c.3 Skip MTP shared-expert lookups when the width is zero. Verify: `cargo test` checks that a stale `up_proj` entry is reported unused.
+
 ## 2. Unchanged behavior
 
 - [x] 2.1 The dense example plans stay byte-identical. Verify: the golden-file test passes, and `plan --json` diffs empty.

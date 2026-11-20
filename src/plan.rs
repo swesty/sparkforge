@@ -209,13 +209,18 @@ impl<'a> Formats<'a> {
         }).unwrap_or(self.m.weights)
     }
 
-    /// Format of a PLE module `rel` at its language-model paths: `ple.<rel>` or
-    /// `layers.<n>.ple.<rel>` under a text prefix, never an auxiliary path that merely ends the same way.
-    pub fn ple(&self, rel: &str) -> WeightFormat {
+    /// Format of a PLE module `rel` at its language-model paths, under a text prefix: `ple.<rel>`,
+    /// `<rel>` itself when `bare` (the distinctive table name), or `layers.<n>.ple.<rel>` where `n`
+    /// is a configured PLE layer `p` or `p - 1`. The checkpoint files the PLE applied before layer 2
+    /// under `layers.1.ple`, so both are accepted; any other layer is a stale entry, left unused.
+    pub fn ple(&self, rel: &str, bare: bool) -> WeightFormat {
         let want = format!("ple.{rel}");
+        let layers: Vec<String> = self.m.hybrid.as_ref().map_or(vec![], |h| {
+            h.ple.layer_ids.iter().flat_map(|&p| [Some(p), p.checked_sub(1)]).flatten()
+                .map(|n| format!("layers.{n}.{want}")).collect()
+        });
         self.find(|k| TEXT_PREFIXES.iter().filter_map(|p| k.strip_prefix(p)).any(|r| {
-            r == want || r.strip_prefix("layers.").and_then(|x| x.split_once('.'))
-                .is_some_and(|(n, rest)| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()) && rest == want)
+            r == want || (bare && r == rel) || layers.iter().any(|l| r == l)
         })).unwrap_or(self.m.weights)
     }
 
@@ -316,8 +321,8 @@ fn hybrid_linears_noted(m: &ModelSpec, h: &Hybrid, f: &Formats, notes: &mut Vec<
         }
     }
     // PLE projections run once per token (at the PLE layer). key_proj widens to the HC residual.
-    v.push(lin("ple_key_proj", res, h.ple.embed_dim, f.ple("key_proj"), 1));
-    v.push(lin("ple_value_proj", m.hidden, h.ple.embed_dim, f.ple("value_proj"), 1));
+    v.push(lin("ple_key_proj", res, h.ple.embed_dim, f.ple("key_proj", false), 1));
+    v.push(lin("ple_value_proj", m.hidden, h.ple.embed_dim, f.ple("value_proj", false), 1));
     v
 }
 
@@ -327,7 +332,7 @@ fn hybrid_other_ops(m: &ModelSpec, h: &Hybrid, f: &Formats) -> Vec<OpClass> {
     let res = (h.hc.streams * m.hidden) as f64;
     let ngdn = h.count(LayerKind::LinearAttention);
     let nqsa = h.count(LayerKind::FullAttention);
-    let table = f.ple("ple_embedding.ngram_embedding");
+    let table = f.ple("ple_embedding.ngram_embedding", true);
     let op = |name: &str, kind, group, shape: String, format, per_token: u32, bytes_each: f64| OpClass {
         name: name.into(), kind, group, shape, format, per_token, bytes_per_token: bytes_each * per_token as f64,
     };
@@ -402,9 +407,17 @@ fn mtp_weight_bytes(m: &ModelSpec, h: &Hybrid, f: &Formats) -> f64 {
     let attn = (m.q_dim() * 2) as f64 * hd * b("self_attn.q_proj") + m.kv_dim() as f64 * hd * (b("self_attn.k_proj") + b("self_attn.v_proj"))
         + h.qsa.index_qk_dim() as f64 * hd * b("self_attn.indexer.index_qk_proj") + hd * m.q_dim() as f64 * b("self_attn.o_proj");
     let experts = e.map_or(0.0, |e| e.num_experts as f64 * 3.0 * e.expert_intermediate as f64 * hd * b("mlp.experts"));
-    let shared = e.map_or(0.0, |e| e.shared_intermediate as f64 * hd
-        * (b("mlp.shared_expert.gate_proj") + b("mlp.shared_expert.up_proj") + b("mlp.shared_expert.down_proj"))
-        + e.num_experts as f64 * hd * b("mlp.gate"));
+    // Shared-expert formats are looked up only when the shared expert exists, so a stale entry for
+    // an absent projection stays reported as unused. The router is counted either way.
+    let shared = e.map_or(0.0, |e| {
+        let projections = if e.shared_intermediate > 0 {
+            e.shared_intermediate as f64 * hd
+                * (b("mlp.shared_expert.gate_proj") + b("mlp.shared_expert.up_proj") + b("mlp.shared_expert.down_proj"))
+        } else {
+            0.0
+        };
+        projections + e.num_experts as f64 * hd * b("mlp.gate")
+    });
     let fc = 2.0 * hd * hd * 2.0;
     let mixer = |inject: bool| ((h.hc.lowrank + if inject { h.hc.streams } else { 0 }) as f64 * res + res * h.hc.lowrank as f64) * 2.0 + res * 4.0;
     h.mtp_layers as f64 * (attn + experts + shared + fc + 2.0 * mixer(true)) + mixer(false)
@@ -557,7 +570,7 @@ pub fn build(m: &ModelSpec, t: &Target, o: &PlanOpts) -> Plan {
         Some(h) => {
             ops.extend(hybrid_other_ops(m, h, &formats));
             let linear_total: f64 = ls.iter().chain(std::iter::once(&lm)).map(|l| l.bytes_one() * l.copies as f64 * l.per_token as f64).sum();
-            let table = formats.ple("ple_embedding.ngram_embedding");
+            let table = formats.ple("ple_embedding.ngram_embedding", true);
             let ple_table = h.ple.table_rows() as f64 * h.ple.head_dim() as f64 * table.bytes_per_elem();
             let small: f64 = hybrid_param_bytes(m, h).iter().map(|(_, b)| b).sum();
             // A tied lm_head is the embedding matrix itself; count it once.

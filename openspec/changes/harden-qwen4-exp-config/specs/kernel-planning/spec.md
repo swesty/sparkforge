@@ -6,8 +6,8 @@
 
 Per-layer format lookups SHALL match only language-model module paths, so an entry of another tower
 (vision, MTP) with the same layer suffix never sets a text layer's format. `lm_head`, PLE modules
-(`ple.<m>` or `layers.<n>.ple.<m>`) and MTP modules (`mtp.layers.<n>.<m>`) SHALL match only at
-those exact paths, and each projection SHALL be looked up by its own path.
+(`ple.<m>`, or `layers.<n>.ple.<m>` with n a configured PLE layer p or p−1) and MTP modules
+(`mtp.layers.<n>.<m>`) SHALL match only at those paths, and each projection by its own path.
 
 #### Scenario: Vision experts in the map
 - **WHEN** the map also lists `model.visual.layers.0.mlp.experts` as MXFP8
@@ -19,6 +19,10 @@ those exact paths, and each projection SHALL be looked up by its own path.
 
 #### Scenario: Auxiliary PLE or MTP path
 - **WHEN** the map lists `model.language_model.layers.0.aux.ple.key_proj` or `mtp.layers.0.aux.self_attn.v_proj`
+- **THEN** neither budget changes and the entry is reported as unused
+
+#### Scenario: PLE entry at the wrong layer
+- **WHEN** the map lists `model.language_model.layers.999.ple.key_proj` as MXFP8
 - **THEN** neither budget changes and the entry is reported as unused
 
 #### Scenario: MTP value projection

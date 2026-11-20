@@ -476,3 +476,52 @@ fn auxiliary_paths_never_stand_in_for_ple_or_mtp_modules() {
     let p = plan_of(&spec_of(&v).unwrap());
     assert_eq!(p.ops.iter().find(|o| o.name == "ple_key_proj").unwrap().format, Some(WeightFormat::Mxfp8));
 }
+
+// ---- SHA-783 round 2 follow-ups ----
+
+#[test]
+fn the_ple_table_is_recognized_at_its_model_level_path() {
+    let mut v = raw();
+    ql(&mut v).remove("model.language_model.layers.1.ple.ple_embedding.ngram_embedding").unwrap();
+    let bf16 = plan_of(&spec_of(&v).unwrap());
+    ql(&mut v).insert("model.language_model.ple_embedding.ngram_embedding".into(), json!({"quant_algo": "MXFP8", "group_size": 32}));
+    let p = plan_of(&spec_of(&v).unwrap());
+    assert!(!p.notes.iter().any(|n| n.contains("not used by the plan")), "the model-level table entry is consumed: {:#?}", p.notes);
+    // 320,000,000 rows x 160 elements, BF16 (2 B) -> MXFP8 (1.03125 B), resident; 16 rows per token decoded.
+    let gib = (1u64 << 30) as f64;
+    let resident = (bf16.budget.weight_gib - p.budget.weight_gib) * gib;
+    assert!((resident - 320_000_000.0 * 160.0 * (2.0 - 1.03125)).abs() < 1e3, "{resident}");
+    let decode = (bf16.budget.decode_bytes_per_token_gb - p.budget.decode_bytes_per_token_gb) * 1e9;
+    assert!((decode - 16.0 * 160.0 * (2.0 - 1.03125)).abs() < 1e-3, "{decode}");
+}
+
+#[test]
+fn ple_entries_only_count_at_the_configured_ple_layer() {
+    let base = plan_of(&spec_of(&raw()).unwrap());
+    let mut v = raw();
+    ql(&mut v).insert("model.language_model.layers.999.ple.key_proj".into(), json!({"quant_algo": "MXFP8", "group_size": 32}));
+    let p = plan_of(&spec_of(&v).unwrap());
+    assert_eq!((p.budget.weight_gib, p.budget.decode_bytes_per_token_gb), (base.budget.weight_gib, base.budget.decode_bytes_per_token_gb));
+    assert!(p.notes.iter().any(|n| n.contains("not used by the plan") && n.contains("layers.999.ple.key_proj")));
+    // The configured placement (ple_layer_ids [2]) and the layer the checkpoint files it under (1) both count.
+    for l in [1, 2] {
+        let mut v = raw();
+        ql(&mut v).insert(format!("model.language_model.layers.{l}.ple.key_proj"), json!({"quant_algo": "MXFP8", "group_size": 32}));
+        let p = plan_of(&spec_of(&v).unwrap());
+        assert_eq!(p.ops.iter().find(|o| o.name == "ple_key_proj").unwrap().format, Some(WeightFormat::Mxfp8), "layer {l}");
+    }
+}
+
+#[test]
+fn an_absent_mtp_shared_expert_leaves_its_entries_unused() {
+    let mut v = raw();
+    v["text_config"]["shared_expert_intermediate_size"] = json!(0);
+    for l in 0..48 {
+        for proj in ["gate_proj", "up_proj", "down_proj"] {
+            ql(&mut v).remove(&format!("model.language_model.layers.{l}.mlp.shared_expert.{proj}"));
+        }
+    }
+    ql(&mut v).insert("mtp.layers.0.mlp.shared_expert.up_proj".into(), json!({"quant_algo": "MXFP8", "group_size": 32}));
+    let p = plan_of(&spec_of(&v).unwrap());
+    assert!(p.notes.iter().any(|n| n.contains("not used by the plan") && n.contains("mtp.layers.0.mlp.shared_expert.up_proj")), "{:#?}", p.notes);
+}

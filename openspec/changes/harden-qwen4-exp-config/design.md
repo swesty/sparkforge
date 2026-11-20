@@ -19,6 +19,11 @@ See proposal.md (Why). Each decision below answers one codex-review finding on s
    - PLE lookups (`Formats::ple`) match only `ple.<m>` or `layers.<n>.ple.<m>` under a text prefix. MTP lookups match only `mtp.layers.<n>.<m>`. The suffix-based `Formats::model` is removed.
    - The MTP shared expert's gate, up and down, and its router, are priced at their own formats.
 
+9. **Round 2 of codex-review on this change.**
+   - The PLE table also matches at its model-level path (`ple_embedding.ngram_embedding` under a text prefix).
+   - Layer-qualified PLE entries match only at a configured PLE layer `p`, or `p − 1`, the layer the checkpoint files the PLE applied before layer 2 under (`layers.1.ple`). A stale index such as `layers.999` stays unused.
+   - The MTP shared-expert projections are looked up only when the shared expert exists, so stale entries for an absent one stay reported. The router is counted either way.
+
 ## Risks / Trade-offs
 
 - **[Lazy decoding means a bad map entry surfaces later]** → It still surfaces at parse time whenever no override is given, naming the entry.
