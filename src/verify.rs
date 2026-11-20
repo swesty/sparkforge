@@ -350,3 +350,89 @@ pub fn token_estimate_us(p: &Plan, rows: &[Row]) -> Option<f64> {
     }
     Some(p.model.layers as f64 * layer + g("rmsnorm")? + g("gemv_lm_head")?)
 }
+
+/// One `verify-weights` result row.
+pub struct WeightRow {
+    pub mode: crate::device_weights::Mode,
+    pub linear: String,
+    pub case: String,
+    pub err: Option<f64>,
+    pub us: Option<f64>,
+    pub gbs: Option<f64>,
+}
+
+pub struct WeightReport {
+    pub rows: Vec<WeightRow>,
+    pub loads: Vec<(crate::device_weights::Mode, f64, u64, u64, usize)>,
+}
+
+fn bf16_bytes_to_f64(b: &[u8]) -> Vec<f64> {
+    b.chunks_exact(2).map(|c| bf2f(u16::from_le_bytes([c[0], c[1]])) as f64).collect()
+}
+
+/// GEMVs on real checkpoint weights against an f64 reference, in each requested mode.
+pub fn verify_weights(
+    p: &Plan,
+    g: &Generated,
+    e: &Engine,
+    ck: &crate::weights::Checkpoint,
+    b: &crate::weights::Binding,
+    modes: &[crate::device_weights::Mode],
+    seed: u64,
+) -> Result<WeightReport> {
+    use crate::device_weights::upload;
+    unsafe { e.ctx.disable_event_tracking() };
+    let s = e.stream.clone();
+    let mut rng = Rng(seed | 1);
+    let last = p.model.layers.saturating_sub(1);
+    let mut rep = WeightReport { rows: vec![], loads: vec![] };
+    for &mode in modes {
+        let dw = upload(&e.ctx, &s, ck, b, mode)?;
+        rep.loads.push((mode, dw.load_secs, dw.bytes_mapped, dw.bytes_copied, dw.misaligned));
+        for linear in ["qkv_proj", "o_proj", "gate_up_proj", "down_proj", "lm_head"] {
+            let entry = format!("gemv_{linear}");
+            let (k, f) = kernel(g, e, &entry).with_context(|| format!("{entry} was not generated"))?;
+            let bound: Vec<&crate::weights::BoundLinear> = b.linears.iter().filter(|l| l.linear == linear).collect();
+            let (n, kk) = (bound[0].n, bound[0].k);
+            let x = rng.bf16(kk);
+            let xf: Vec<f64> = x.iter().map(|&v| bf2f(v) as f64).collect();
+            let dx = s.memcpy_stod(&x)?;
+            let mut dy = s.alloc_zeros::<u16>(n)?;
+            // Correctness on the first and last layer (or lm_head).
+            for bl in bound.iter().filter(|l| l.layer.is_none_or(|i| i == 0 || i == last)) {
+                let w = dw.linears[&bl.key()].ptr;
+                unsafe { s.launch_builder(f).arg(&w).arg(&dx).arg(&mut dy).launch(cfg(k.grid, k.block, k.dyn_smem))? };
+                let got = to_f32(&s.memcpy_dtov(&dy)?);
+                let rows: Vec<f64> = bl.parts.iter().flat_map(|name| bf16_bytes_to_f64(ck.bytes(&ck.tensors[name]))).collect();
+                let mut r = vec![0f64; n];
+                let chunk = n.div_ceil(16);
+                std::thread::scope(|sc| {
+                    for (ci, out) in r.chunks_mut(chunk).enumerate() {
+                        let (rows, xf) = (&rows, &xf);
+                        sc.spawn(move || {
+                            for (j, o) in out.iter_mut().enumerate() {
+                                let row = (ci * chunk + j) * kk;
+                                *o = (0..kk).map(|c| rows[row + c] * xf[c]).sum();
+                            }
+                        });
+                    }
+                });
+                let case = match bl.layer { Some(i) => format!("layer {i}"), None => "-".into() };
+                rep.rows.push(WeightRow { mode, linear: linear.into(), case, err: Some(max_err(&got, &r)), us: None, gbs: None });
+            }
+            // Timing: rotate through every layer's copy of this linear (naturally larger than L2).
+            let ptrs: Vec<u64> = bound.iter().map(|l| dw.linears[&l.key()].ptr).collect();
+            let mapped = bound.iter().filter(|l| dw.linears[&l.key()].mapped).count();
+            let bytes = (n * kk * 2) as f64;
+            let iters = (ptrs.len() as u32).max(20);
+            let us = time_us(&s, iters, |i| {
+                let w = ptrs[i as usize % ptrs.len()];
+                unsafe { s.launch_builder(f).arg(&w).arg(&dx).arg(&mut dy).launch(cfg(k.grid, k.block, k.dyn_smem))? };
+                Ok(())
+            })?;
+            rep.rows.push(WeightRow { mode, linear: linear.into(), case: format!("{} copies, {} mapped", ptrs.len(), mapped), err: None, us: Some(us), gbs: Some(bytes / (us * 1e3)) });
+        }
+        drop(dw);
+    }
+    Ok(rep)
+}
