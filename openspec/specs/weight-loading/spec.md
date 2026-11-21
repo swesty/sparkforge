@@ -250,6 +250,18 @@ sparkforge assumes one account runs it per node.
 - **WHEN** another process holds the lock for 30 minutes
 - **THEN** the waiting load fails naming the lock instead of hanging
 
+#### Scenario: Holder released after the wait
+- **WHEN** the lock was found held and is released only after the wait limit has passed
+- **THEN** the waiting load times out instead of being admitted late
+
+#### Scenario: Lock replaced while waiting
+- **WHEN** a load waits on the lock file and the file is replaced before it gets the lock
+- **THEN** it locks the new file within the same deadline, so it is never admitted alongside a load holding the new file
+
+#### Scenario: Upgrade from a loader before SHA-765
+- **WHEN** sparkforge is upgraded from a loader that took its lock in `/run/user/<uid>`, `$XDG_RUNTIME_DIR` or the temp directory
+- **THEN** running loads are drained first; the new loader doesn't take that lock, so an old load still allocating isn't coordinated with
+
 #### Scenario: Memory used after admission
 - **WHEN** `MemAvailable` drops below the guard between admission and upload
 - **THEN** the upload refuses before allocating

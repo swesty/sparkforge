@@ -1013,3 +1013,58 @@ fn blobs_verify_on_the_calling_thread_when_no_worker_can_be_made() {
     let err = format!("{:#}", Checkpoint::open_dir_with(&resolve_checkpoint_dir(&snap).unwrap(), 0).err().expect("mismatch"));
     assert!(err.contains("hash to"), "{err}");
 }
+
+// ---- SHA-789: codex-review cycle 1 follow-ups ----
+
+#[cfg(unix)]
+#[test]
+fn a_holder_that_outlasts_the_wait_never_leads_to_an_admission() {
+    // The holder releases after the 10 ms wait but before the 20 ms retry: the retry would get the
+    // lock, yet the deadline has passed, so admission times out.
+    use sparkforge::weights::admit;
+    let lock = dir("late-release").join("sparkforge-gpu-admission.lock");
+    std::fs::write(&lock, b"").unwrap();
+    let holder = std::fs::OpenOptions::new().read(true).write(true).open(&lock).unwrap();
+    holder.lock().unwrap();
+    let release = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(14));
+        drop(holder);
+    });
+    let err = format!("{:#}", admit(&lock, 0, 0, || Some(64 << 30), std::time::Duration::from_millis(10)).err().expect("deadline passed"));
+    release.join().unwrap();
+    assert!(err.contains("gave up after"), "{err}");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_load_waiting_on_a_replaced_lock_moves_to_the_new_file() {
+    // Load A holds the lock. Load B opens it and reports waiting (so B certainly opened the old
+    // file). The file is replaced and load C takes the new one. When A finishes, B gets the old
+    // file's lock, sees the path now names a new file, and waits on C instead of being admitted
+    // alongside it.
+    use sparkforge::weights::admit_observed;
+    use std::time::Duration;
+    let lock = dir("relock").join("sparkforge-gpu-admission.lock");
+    std::fs::write(&lock, b"").unwrap();
+    let open = |p: &std::path::Path| std::fs::OpenOptions::new().read(true).write(true).open(p).unwrap();
+    let a = open(&lock);
+    a.lock().unwrap();
+    let (tx, rx) = std::sync::mpsc::channel::<()>();
+    let tx = std::sync::Mutex::new(tx);
+    let path = lock.clone();
+    let b = std::thread::spawn(move || {
+        admit_observed(&path, 0, 0, || Some(64 << 30), Duration::from_secs(20), &|| {
+            let _ = tx.lock().unwrap().send(());
+        }).map(|_held| ())
+    });
+    rx.recv_timeout(Duration::from_secs(10)).expect("B reports waiting on the old file");
+    std::fs::remove_file(&lock).unwrap();
+    std::fs::write(&lock, b"").unwrap();
+    let c = open(&lock);
+    c.lock().unwrap();
+    drop(a);
+    rx.recv_timeout(Duration::from_secs(10)).expect("B moved to the new file and waits on C");
+    assert!(!b.is_finished(), "B must wait for C, which holds the file the path names now");
+    drop(c);
+    b.join().unwrap().unwrap();
+}

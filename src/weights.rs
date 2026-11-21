@@ -1018,29 +1018,67 @@ fn open_lock(path: &Path) -> Result<File> {
     Ok(lock)
 }
 
-/// Takes the admission lock at `path` (see `admission_lock`), waiting at most `wait` for another
+/// Takes the admission lock at `lock` (see `admission_lock`), waiting at most `wait` for another
 /// load to finish allocating, then runs the memory guard against `mem()` for
 /// `copy_bytes + overhead`. The lock is an advisory `flock`, so it coordinates sparkforge
 /// processes; other programs are seen only through `MemAvailable`.
+///
+/// - Once the lock has been found held, an acquisition after the deadline is a timeout too, so a
+///   holder that outlasts `wait` never leads to an admission.
+/// - After the lock is taken, the path must still name the locked file. If the file was replaced
+///   while this load waited (for example the account cleaned up its state directory), the load
+///   locks the new file instead, within the same deadline, so two loads never hold different files
+///   at once (codex-review of #16).
 pub fn admit(lock: &Path, copy_bytes: u64, overhead: u64, mem: impl Fn() -> Option<u64>, wait: std::time::Duration) -> Result<Admission> {
-    let file = open_lock(lock)?;
+    admit_observed(lock, copy_bytes, overhead, mem, wait, &|| {})
+}
+
+/// `admit`, calling `on_wait` the first time each opened lock file is found held (a test seam: it
+/// proves which file a waiting load opened).
+#[doc(hidden)]
+pub fn admit_observed(lock: &Path, copy_bytes: u64, overhead: u64, mem: impl Fn() -> Option<u64>, wait: std::time::Duration, on_wait: &dyn Fn()) -> Result<Admission> {
     let deadline = std::time::Instant::now() + wait;
-    let mut told = false;
-    loop {
-        match file.try_lock() {
-            Ok(()) => break,
-            Err(std::fs::TryLockError::WouldBlock) => {
-                if !told {
-                    eprintln!("waiting for another sparkforge load to finish allocating ({})", lock.display());
-                    told = true;
+    let timeout = || anyhow::anyhow!("gave up after {} s waiting for the admission lock {}; another process has held it that long", wait.as_secs(), lock.display());
+    let mut contended = false;
+    let file = loop {
+        let file = open_lock(lock)?;
+        let mut told = false;
+        loop {
+            match file.try_lock() {
+                Ok(()) => break,
+                Err(std::fs::TryLockError::WouldBlock) => {
+                    if !told {
+                        if !contended {
+                            eprintln!("waiting for another sparkforge load to finish allocating ({})", lock.display());
+                        }
+                        on_wait();
+                        told = true;
+                        contended = true;
+                    }
+                    if std::time::Instant::now() >= deadline {
+                        return Err(timeout());
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(20));
                 }
-                ensure!(std::time::Instant::now() < deadline,
-                    "gave up after {} s waiting for the admission lock {}; another process has held it that long", wait.as_secs(), lock.display());
-                std::thread::sleep(std::time::Duration::from_millis(20));
+                Err(std::fs::TryLockError::Error(e)) => return Err(e).with_context(|| format!("locking {}", lock.display())),
             }
-            Err(std::fs::TryLockError::Error(e)) => return Err(e).with_context(|| format!("locking {}", lock.display())),
         }
-    }
+        if contended && std::time::Instant::now() >= deadline {
+            return Err(timeout());
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let held = file.metadata().with_context(|| format!("inspecting {}", lock.display()))?;
+            let now = std::fs::symlink_metadata(lock).ok().map(|m| (m.dev(), m.ino()));
+            if now != Some((held.dev(), held.ino())) {
+                eprintln!("{} was replaced while this load waited; locking the new file", lock.display());
+                contended = true;
+                continue;
+            }
+        }
+        break file;
+    };
     let avail = mem().context("cannot read MemAvailable from /proc/meminfo; refusing to allocate without the memory guard")?;
     check_headroom(copy_bytes + overhead, avail)?;
     Ok(Admission { _lock: file, copy_bytes, overhead })
