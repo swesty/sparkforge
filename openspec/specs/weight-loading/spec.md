@@ -48,8 +48,12 @@ shard's data section, checked without overflow, and byte counts MUST match dtype
 - **THEN** the shards still come from the blob store the snapshot was opened with
 
 #### Scenario: Snapshot moved during resolution
-- **WHEN** a snapshot revision is moved or replaced, or its blob store is replaced, after it is opened and before both are checked as a pair
-- **THEN** resolution fails asking for a retry, instead of pairing one generation's config with another's blobs
+- **WHEN** a snapshot revision is moved or replaced, or its blob store is replaced or rearranged, at any point during the load
+- **THEN** every blob the revision links to is verified against its name (SHA256, or the Git object SHA1), so another generation's bytes are refused rather than paired with the config
+
+#### Scenario: Blob that doesn't match its name
+- **WHEN** a snapshot links to `../../blobs/<name>` and that blob's bytes don't hash to `<name>`
+- **THEN** opening fails naming the blob and the hash it found, for shards and for metadata files
 
 #### Scenario: Unused blob store
 - **WHEN** a snapshot of plain files sits beside a `blobs` path that is a symlink or not a directory
@@ -223,6 +227,10 @@ across all users'. Lock locations come from ownership, never environment.
 #### Scenario: Lock being replaced
 - **WHEN** `/run/sparkforge` exists but `admission.lock` is missing, as during its repair
 - **THEN** loads refuse instead of falling back to the user lock
+
+#### Scenario: Lock closed for repair
+- **WHEN** an administrator closes the node lock to its group (mode 0600) before replacing it
+- **THEN** a load that can't open it refuses, saying a repair is under way, instead of suggesting the account join the group
 
 #### Scenario: Waiting on a replaced lock
 - **WHEN** a load is waiting on the node lock and the file is replaced before it gets the lock

@@ -436,8 +436,8 @@ fn index_shard_names_cannot_leave_the_checkpoint_directory() {
         std::fs::create_dir(&blobs).unwrap();
         let snap = root.join("snapshots").join("abc123");
         std::fs::create_dir_all(&snap).unwrap();
-        write_shard(&blobs.join(HF_BLOB), &bf16(tensors(false)), 0);
-        std::os::unix::fs::symlink(format!("../../blobs/{HF_BLOB}"), snap.join("model.safetensors")).unwrap();
+        write_shard(&blobs.join(hf_blob()), &bf16(tensors(false)), 0);
+        std::os::unix::fs::symlink(format!("../../blobs/{}", hf_blob()), snap.join("model.safetensors")).unwrap();
         let ck = Checkpoint::open(&snap).expect("symlinked HF cache snapshot opens");
         bind(&ck, &spec(false)).unwrap();
     }
@@ -485,8 +485,17 @@ fn a_quantized_checkpoint_behind_a_bf16_config_is_refused_before_gpu_work() {
     assert!(err.contains("model.layers.0.self_attn.o_proj.weight: expected dtype BF16, found F8_E4M3"), "{err}");
 }
 
-/// A Hugging Face cache blob name (a SHA-256 in hex).
-const HF_BLOB: &str = "3f2a9c0d1e4b5a6978c0d1e2f3a4b5c6d7e8f9a0b1c2d3e4f5a6b7c8d9e0f1a2";
+/// The Hugging Face cache blob name of the standard untied fixture shard: the SHA256 of its bytes,
+/// as the cache names LFS files.
+fn hf_blob() -> &'static str {
+    static NAME: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    NAME.get_or_init(|| {
+        use sha2::Digest;
+        let d = dir("hf-blob-name");
+        write_shard(&d.join("w"), &bf16(tensors(false)), 0);
+        sha2::Sha256::digest(std::fs::read(d.join("w")).unwrap()).iter().map(|b| format!("{b:02x}")).collect()
+    })
+}
 
 // ---- SHA-765: loader hardening ----
 
@@ -913,13 +922,13 @@ fn only_a_hugging_face_snapshot_may_link_into_its_blobs() {
     let root = std::fs::canonicalize(dir("hf-blobs")).unwrap();
     let blobs = root.join("blobs");
     std::fs::create_dir(&blobs).unwrap();
-    write_shard(&blobs.join(HF_BLOB), &bf16(tensors(false)), 0);
+    write_shard(&blobs.join(hf_blob()), &bf16(tensors(false)), 0);
     write_shard(&blobs.join("latest"), &bf16(tensors(false)), 0);
     // `<repo>/snapshots/<rev>/model.safetensors -> ../../blobs/<sha256>` opens: blobs are
     // content-addressed, so the name cannot come to mean another generation.
     let snap = root.join("snapshots/rev1");
     std::fs::create_dir_all(&snap).unwrap();
-    std::os::unix::fs::symlink(format!("../../blobs/{HF_BLOB}"), snap.join("model.safetensors")).unwrap();
+    std::os::unix::fs::symlink(format!("../../blobs/{}", hf_blob()), snap.join("model.safetensors")).unwrap();
     bind(&Checkpoint::open(&snap).unwrap(), &spec(false)).unwrap();
     // A blob name that is not a hash could be rewritten in place: refused.
     let snap2 = root.join("snapshots/rev2");
@@ -930,7 +939,7 @@ fn only_a_hugging_face_snapshot_may_link_into_its_blobs() {
     // The same link from a directory that is not a cache snapshot: refused.
     let other = root.join("not-snapshots/rev1");
     std::fs::create_dir_all(&other).unwrap();
-    std::os::unix::fs::symlink(format!("../../blobs/{HF_BLOB}"), other.join("model.safetensors")).unwrap();
+    std::os::unix::fs::symlink(format!("../../blobs/{}", hf_blob()), other.join("model.safetensors")).unwrap();
     let err = format!("{:#}", Checkpoint::open(&other).err().expect("not a snapshot"));
     assert!(err.contains("outside the checkpoint directory"), "{err}");
 }
@@ -1022,23 +1031,23 @@ fn a_replaced_hugging_face_blob_store_cannot_mix_generations() {
     let (blobs, snap) = (root.join("blobs"), root.join("snapshots/rev1"));
     std::fs::create_dir(&blobs).unwrap();
     std::fs::create_dir_all(&snap).unwrap();
-    write_shard(&blobs.join(HF_BLOB), &bf16(tensors(false)), 0);
+    write_shard(&blobs.join(hf_blob()), &bf16(tensors(false)), 0);
     std::fs::write(snap.join("config.json"), "{}").unwrap();
-    std::os::unix::fs::symlink(format!("../../blobs/{HF_BLOB}"), snap.join("model.safetensors")).unwrap();
+    std::os::unix::fs::symlink(format!("../../blobs/{}", hf_blob()), snap.join("model.safetensors")).unwrap();
     let opened = resolve_checkpoint_dir(&snap).unwrap();
     read_config(&opened).unwrap();
     std::fs::rename(&blobs, root.join("blobs-a")).unwrap();
     std::fs::create_dir(&blobs).unwrap();
-    write_shard(&blobs.join(HF_BLOB), &bf16(tensors(false)), 0);
-    let mut bytes = std::fs::read(blobs.join(HF_BLOB)).unwrap();
+    write_shard(&blobs.join(hf_blob()), &bf16(tensors(false)), 0);
+    let mut bytes = std::fs::read(blobs.join(hf_blob())).unwrap();
     let n = bytes.len();
     bytes[n - 1] ^= 0xff;
-    std::fs::write(blobs.join(HF_BLOB), bytes).unwrap();
+    std::fs::write(blobs.join(hf_blob()), bytes).unwrap();
     let ck = Checkpoint::open_dir(&opened).unwrap();
     let t = ck.tensors.values().max_by_key(|t| t.end).unwrap();
     let mut got = vec![0u8; 1];
     ck.read_range(t, t.len() - 1, &mut got).unwrap();
-    let want = std::fs::read(root.join("blobs-a").join(HF_BLOB)).unwrap();
+    let want = std::fs::read(root.join("blobs-a").join(hf_blob())).unwrap();
     assert_eq!(got[0], want[want.len() - 1], "the shard comes from the blob store the snapshot was opened with");
 }
 
@@ -1136,52 +1145,13 @@ fn a_node_lock_being_replaced_makes_loads_refuse_not_fall_back() {
 
 #[cfg(unix)]
 #[test]
-fn a_snapshot_moved_to_another_repository_during_resolution_is_refused() {
-    // Between opening repo-a/snapshots/rev and opening the blob store, the revision is moved to
-    // repo-b, whose blobs hold different bytes under the same hash name. Resolution notices the
-    // revision is no longer where it was opened and fails, rather than pairing it with any store.
-    use sparkforge::weights::{read_config, resolve_checkpoint_dir_between, ResolveStep};
-    let root = std::fs::canonicalize(dir("hf-move")).unwrap();
-    for (repo, flip) in [("repo-a", false), ("repo-b", true)] {
-        let blobs = root.join(repo).join("blobs");
-        std::fs::create_dir_all(&blobs).unwrap();
-        std::fs::create_dir_all(root.join(repo).join("snapshots")).unwrap();
-        write_shard(&blobs.join(HF_BLOB), &bf16(tensors(false)), 0);
-        if flip {
-            let mut bytes = std::fs::read(blobs.join(HF_BLOB)).unwrap();
-            let n = bytes.len();
-            bytes[n - 1] ^= 0xff;
-            std::fs::write(blobs.join(HF_BLOB), bytes).unwrap();
-        }
-    }
-    let snap = root.join("repo-a/snapshots/rev");
-    std::fs::create_dir(&snap).unwrap();
-    std::fs::write(snap.join("config.json"), "{}").unwrap();
-    std::os::unix::fs::symlink(format!("../../blobs/{HF_BLOB}"), snap.join("model.safetensors")).unwrap();
-    let err = format!("{:#}", resolve_checkpoint_dir_between(&snap, |step| if step == ResolveStep::RevisionOpened { std::fs::rename(&snap, root.join("repo-b/snapshots/rev")).unwrap() })
-        .err().expect("a moved revision must fail"));
-    assert!(err.contains("changed while"), "{err}");
-    // Without the move, the same snapshot opens and reads repo-a's blob.
-    std::fs::rename(root.join("repo-b/snapshots/rev"), &snap).unwrap();
-    let opened = resolve_checkpoint_dir_between(&snap, |_| {}).unwrap();
-    read_config(&opened).unwrap();
-    let ck = Checkpoint::open_dir(&opened).unwrap();
-    let t = ck.tensors.values().max_by_key(|t| t.end).unwrap();
-    let mut got = vec![0u8; 1];
-    ck.read_range(t, t.len() - 1, &mut got).unwrap();
-    let want = std::fs::read(root.join("repo-a/blobs").join(HF_BLOB)).unwrap();
-    assert_eq!(got[0], want[want.len() - 1], "repo-a's blob");
-}
-
-#[cfg(unix)]
-#[test]
 fn an_unusable_blob_store_only_matters_to_checkpoints_that_link_into_it() {
     // <repo>/blobs is a symlink to another volume. A snapshot of plain files still opens; one that
     // links into the blob store fails, naming the store.
     let root = std::fs::canonicalize(dir("hf-blob-link")).unwrap();
     let volume = root.join("volume");
     std::fs::create_dir(&volume).unwrap();
-    write_shard(&volume.join(HF_BLOB), &bf16(tensors(false)), 0);
+    write_shard(&volume.join(hf_blob()), &bf16(tensors(false)), 0);
     std::os::unix::fs::symlink(&volume, root.join("blobs")).unwrap();
     let plain = root.join("snapshots/plain");
     std::fs::create_dir_all(&plain).unwrap();
@@ -1189,71 +1159,12 @@ fn an_unusable_blob_store_only_matters_to_checkpoints_that_link_into_it() {
     bind(&Checkpoint::open(&plain).unwrap(), &spec(false)).unwrap();
     let linked = root.join("snapshots/linked");
     std::fs::create_dir_all(&linked).unwrap();
-    std::os::unix::fs::symlink(format!("../../blobs/{HF_BLOB}"), linked.join("model.safetensors")).unwrap();
+    std::os::unix::fs::symlink(format!("../../blobs/{}", hf_blob()), linked.join("model.safetensors")).unwrap();
     let err = format!("{:#}", Checkpoint::open(&linked).err().expect("blob store is a symlink"));
     assert!(err.contains("links into the blob store") && err.contains("blobs"), "{err}");
 }
 
 // ---- SHA-788: codex-review cycle 1 follow-ups ----
-
-/// A snapshot whose shard links into `blobs`; `flip` makes a second store's bytes differ.
-#[cfg(unix)]
-fn hf_repo(root: &std::path::Path) -> (PathBuf, PathBuf) {
-    let (blobs, snap) = (root.join("blobs"), root.join("snapshots/rev"));
-    std::fs::create_dir(&blobs).unwrap();
-    std::fs::create_dir_all(&snap).unwrap();
-    write_shard(&blobs.join(HF_BLOB), &bf16(tensors(false)), 0);
-    std::os::unix::fs::symlink(format!("../../blobs/{HF_BLOB}"), snap.join("model.safetensors")).unwrap();
-    (blobs, snap)
-}
-
-#[cfg(unix)]
-#[test]
-fn a_blob_store_swapped_after_it_was_opened_fails_resolution() {
-    // The blob store is opened, then `blobs` is moved aside and replaced by a store with other
-    // bytes under the same hash name, before the revision and store are checked as a pair.
-    use sparkforge::weights::{resolve_checkpoint_dir_between, ResolveStep};
-    let root = std::fs::canonicalize(dir("hf-swap-after")).unwrap();
-    let (blobs, snap) = hf_repo(&root);
-    let err = format!("{:#}", resolve_checkpoint_dir_between(&snap, |step| if step == ResolveStep::BlobsOpened {
-        std::fs::rename(&blobs, root.join("blobs-old")).unwrap();
-        std::fs::create_dir(&blobs).unwrap();
-        write_shard(&blobs.join(HF_BLOB), &bf16(tensors(true)), 0);
-    }).err().expect("a swapped blob store must fail"));
-    assert!(err.contains("changed while"), "{err}");
-}
-
-#[cfg(unix)]
-#[test]
-fn a_revision_replaced_during_resolution_fails() {
-    use sparkforge::weights::{resolve_checkpoint_dir_between, ResolveStep};
-    let root = std::fs::canonicalize(dir("hf-rev-replaced")).unwrap();
-    let (_, snap) = hf_repo(&root);
-    let err = format!("{:#}", resolve_checkpoint_dir_between(&snap, |step| if step == ResolveStep::BlobsOpened {
-        std::fs::rename(&snap, root.join("snapshots/rev-old")).unwrap();
-        std::fs::create_dir(&snap).unwrap();
-    }).err().expect("a replaced revision must fail"));
-    assert!(err.contains("changed while"), "{err}");
-}
-
-#[cfg(unix)]
-#[test]
-fn a_blob_store_swapped_before_it_is_opened_is_used_whole() {
-    // A swap that completes before the blob store is opened is simply the repository's state when
-    // the pair is checked: the new store is opened, and every read comes from it.
-    use sparkforge::weights::{resolve_checkpoint_dir_between, ResolveStep};
-    let root = std::fs::canonicalize(dir("hf-swap-before")).unwrap();
-    let (blobs, snap) = hf_repo(&root);
-    let d = resolve_checkpoint_dir_between(&snap, |step| if step == ResolveStep::RevisionOpened {
-        std::fs::rename(&blobs, root.join("blobs-old")).unwrap();
-        std::fs::create_dir(&blobs).unwrap();
-        write_shard(&blobs.join(HF_BLOB), &bf16(tensors(true)), 0);
-    }).unwrap();
-    std::fs::rename(&blobs, root.join("blobs-new")).unwrap();
-    std::fs::rename(root.join("blobs-old"), &blobs).unwrap();
-    let ck = Checkpoint::open_dir(&d).unwrap();
-    assert!(!ck.tensors.contains_key("lm_head.weight"), "reads come from the store that was opened, not the one restored later");
-}
 
 #[cfg(unix)]
 #[test]
@@ -1264,14 +1175,77 @@ fn two_entries_for_one_lock_file_are_locked_once() {
     admit(&[e.clone(), e], 0, 0, || Some(64 << 30), std::time::Duration::from_millis(500)).unwrap();
 }
 
+
+// ---- SHA-788: codex-review cycle 2 follow-ups ----
+
+#[cfg(unix)]
+#[test]
+fn a_blob_whose_bytes_do_not_match_its_name_is_refused() {
+    // Whatever rearranged the cache (a blob store swapped between two checks and swapped back, a
+    // revision moved to another repository, a corrupt download), the result is a blob name whose
+    // bytes are another generation's. Each blob is verified against its name, so it is refused.
+    let root = std::fs::canonicalize(dir("hf-mismatch")).unwrap();
+    let (blobs, snap) = (root.join("blobs"), root.join("snapshots/rev"));
+    std::fs::create_dir(&blobs).unwrap();
+    std::fs::create_dir_all(&snap).unwrap();
+    write_shard(&blobs.join(hf_blob()), &bf16(tensors(true)), 0); // other bytes under A's name
+    std::os::unix::fs::symlink(format!("../../blobs/{}", hf_blob()), snap.join("model.safetensors")).unwrap();
+    let err = format!("{:#}", Checkpoint::open(&snap).err().expect("mismatched blob"));
+    assert!(err.contains("hash to") && err.contains("not used"), "{err}");
+    // With the right bytes it opens.
+    write_shard(&blobs.join(hf_blob()), &bf16(tensors(false)), 0);
+    bind(&Checkpoint::open(&snap).unwrap(), &spec(false)).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn a_git_object_blob_is_verified_over_the_bytes_read() {
+    // Small files in a Hugging Face cache (config.json) are named by their Git object SHA1.
+    use sha1::Digest;
+    use sparkforge::weights::{read_config, resolve_checkpoint_dir};
+    let root = std::fs::canonicalize(dir("hf-git-blob")).unwrap();
+    let (blobs, snap) = (root.join("blobs"), root.join("snapshots/rev"));
+    std::fs::create_dir(&blobs).unwrap();
+    std::fs::create_dir_all(&snap).unwrap();
+    let config = b"{\"gen\": \"A\"}";
+    let mut h = sha1::Sha1::new();
+    h.update(format!("blob {}\0", config.len()).as_bytes());
+    h.update(config);
+    let name: String = h.finalize().iter().map(|b| format!("{b:02x}")).collect();
+    std::fs::write(blobs.join(&name), config).unwrap();
+    std::os::unix::fs::symlink(format!("../../blobs/{name}"), snap.join("config.json")).unwrap();
+    assert!(read_config(&resolve_checkpoint_dir(&snap).unwrap()).unwrap().contains("\"A\""));
+    std::fs::write(blobs.join(&name), b"{\"gen\": \"B\"}").unwrap();
+    let err = format!("{:#}", read_config(&resolve_checkpoint_dir(&snap).unwrap()).unwrap_err());
+    assert!(err.contains("hash to"), "{err}");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_closed_node_lock_says_a_repair_is_under_way() {
+    // The repair closes the lock to its group (mode 0600) so no new load starts; a load that can't
+    // open it is told that, not told to join the group. (Mode 0000 stands in here, since the test
+    // account owns the file.)
+    if my_uid() == 0 {
+        return; // root opens anything
+    }
+    use sparkforge::weights::{admission_locks_in, admit};
+    let node = dir("node-closed").join("run-sparkforge");
+    provision_node(&node, 0o000);
+    let locks = admission_locks_in(&node, my_uid(), || Some(my_gid()), 1000, || None).unwrap();
+    let err = format!("{:#}", admit(&locks.files(), 0, 0, || Some(64 << 30), std::time::Duration::from_secs(1)).err().expect("closed lock"));
+    assert!(err.contains("is closed") && err.contains("retry later"), "{err}");
+    chmod(&node.join("admission.lock"), 0o640);
+}
+
 #[cfg(unix)]
 #[test]
 fn a_load_waiting_on_a_replaced_lock_moves_to_the_new_file() {
-    // Load A holds the node lock. Load B opens it and waits. The repair replaces the file while
-    // A's lock is held, and a new load C takes the new file. When A finishes, B gets the old
-    // file's lock, sees it was replaced, and waits on the new file (held by C) instead of being
-    // admitted alongside C.
-    use sparkforge::weights::{admission_locks_in, admit};
+    // Load A holds the node lock. Load B opens it and reports that it is waiting (so B certainly
+    // opened the old file). The file is replaced and a new load C takes the new file. When A
+    // finishes, B gets the old file's lock, sees the path names a new file, and waits on C instead
+    // of being admitted alongside it.
+    use sparkforge::weights::{admission_locks_in, admit_observed};
     use std::time::Duration;
     let node = dir("node-relock").join("run-sparkforge");
     provision_node(&node, 0o640);
@@ -1280,15 +1254,22 @@ fn a_load_waiting_on_a_replaced_lock_moves_to_the_new_file() {
     let a = std::fs::File::open(&lock).unwrap();
     a.lock().unwrap();
     let files = locks.files();
-    let b = std::thread::spawn(move || admit(&files, 0, 0, || Some(64 << 30), Duration::from_secs(10)).map(|_held| ()));
-    std::thread::sleep(Duration::from_millis(300));
+    let (tx, rx) = std::sync::mpsc::channel::<()>();
+    let tx = std::sync::Mutex::new(tx);
+    let b = std::thread::spawn(move || {
+        admit_observed(&files, 0, 0, || Some(64 << 30), Duration::from_secs(20), &|_| {
+            let _ = tx.lock().unwrap().send(());
+        }).map(|_held| ())
+    });
+    rx.recv_timeout(Duration::from_secs(10)).expect("B reports waiting on the old file");
     std::fs::remove_file(&lock).unwrap();
     std::fs::write(&lock, b"").unwrap();
     chmod(&lock, 0o640);
     let c = std::fs::File::open(&lock).unwrap();
     c.lock().unwrap();
     drop(a);
-    std::thread::sleep(Duration::from_millis(500));
+    // B now waits on the new file and reports that a second time.
+    rx.recv_timeout(Duration::from_secs(10)).expect("B moved to the new file and waits on C");
     assert!(!b.is_finished(), "B must wait for C, which holds the file the path names now");
     drop(c);
     b.join().unwrap().unwrap();

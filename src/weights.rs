@@ -93,9 +93,11 @@ pub struct CheckpointDir {
     #[cfg(unix)]
     fd: File,
     /// `<repo>/blobs` of a Hugging Face snapshot, opened from the same pinned `<repo>` descriptor as
-    /// the snapshot itself, so blob links resolve into the blob store of the repository the config
-    /// came from, even if `blobs` is replaced or the snapshot moved mid-load (codex-review of
-    /// SHA-787). `None` for a directory that is not a snapshot. An open error is kept, not raised,
+    /// the snapshot itself. Directory pinning alone can't make the revision and the store a
+    /// consistent pair (entries can be swapped and swapped back between any two checks), so every
+    /// blob is also verified against its name (`verify_blob`): the revision's links, read from the
+    /// opened revision, then fix the bytes, whichever store they are found in (codex-review of
+    /// SHA-788). `None` for a directory that is not a snapshot. An open error is kept, not raised,
     /// and reported only when a blob link needs the store, so a checkpoint of plain files loads
     /// beside a blob store it doesn't use.
     #[cfg(unix)]
@@ -117,8 +119,12 @@ impl CheckpointDir {
     /// That walk is one component at a time with `O_NOFOLLOW`, so a target that passes through
     /// another symlink (for example a `current` alias that a publisher switches) is refused rather
     /// than followed into whatever generation the alias names now (codex-review of SHA-765).
-    fn open(&self, name: &str) -> Result<File> {
+    /// `open`, without verifying a blob: returns the Hugging Face blob name the entry links to, if
+    /// any, so the caller can verify several shards in parallel.
+    fn open_entry(&self, name: &str) -> Result<(File, Option<String>)> {
         let path = self.entry(name);
+        #[allow(unused_mut)]
+        let mut blob_name = None;
         #[cfg(unix)]
         let opened = {
             use std::io::ErrorKind;
@@ -130,7 +136,10 @@ impl CheckpointDir {
                     let hop = match link_target(Path::new(name), &target, self.is_hf_snapshot()) {
                         LinkTarget::Inside(rel) => nofollow::walk(&self.fd, &rel).and_then(|(p, l)| nofollow::open_file(&p, &l)),
                         LinkTarget::HfBlob(blob) => match &self.blobs {
-                            Some(Ok(blobs)) => nofollow::cstr(&blob).and_then(|c| nofollow::open_file(blobs, &c)),
+                            Some(Ok(blobs)) => {
+                                blob_name = blob.to_str().map(str::to_owned);
+                                nofollow::cstr(&blob).and_then(|c| nofollow::open_file(blobs, &c))
+                            }
                             Some(Err(why)) => bail!("{} links into the blob store, but {why}", path.display()),
                             None => Err(std::io::Error::from(ErrorKind::NotFound)),
                         },
@@ -160,7 +169,7 @@ impl CheckpointDir {
         };
         let m = file.metadata().with_context(|| format!("inspecting {}", path.display()))?;
         ensure!(m.file_type().is_file(), "{} is not a regular file", path.display());
-        Ok(file)
+        Ok((file, blob_name))
     }
 
     /// Whether this is `<repo>/snapshots/<revision>` of a Hugging Face cache.
@@ -190,13 +199,74 @@ impl CheckpointDir {
     }
 
     /// Reads a metadata file (config or index) with the shard open rules plus a size cap.
+    /// A Hugging Face blob is verified against its name over exactly the bytes returned.
     pub fn read_metadata(&self, name: &str) -> Result<String> {
         let path = self.entry(name);
-        let file = self.open(name)?;
+        let (file, blob) = self.open_entry(name)?;
         let len = file.metadata()?.len();
         ensure!(len <= MAX_METADATA_BYTES, "{} is {len} bytes, above the {MAX_METADATA_BYTES}-byte metadata limit", path.display());
-        read_capped(file, MAX_METADATA_BYTES, &path.display().to_string())
+        let text = read_capped(file, MAX_METADATA_BYTES, &path.display().to_string())?;
+        if let Some(blob) = blob {
+            let got = blob_digest(&blob, text.len() as u64, &path, |update| {
+                update(text.as_bytes());
+                Ok(())
+            })?;
+            check_blob_digest(&got, &blob, &path)?;
+        }
+        Ok(text)
     }
+}
+
+/// Checks that a Hugging Face blob's bytes match its name: SHA256 of the content for a 64-digit
+/// name (LFS files), or the Git object SHA1 (`blob <len>\0` then the content) for a 40-digit one.
+/// Blob names are what make a snapshot's links mean fixed bytes; this makes that hold even if the
+/// blob store was replaced or rearranged around the load. The file's stamp must not change while
+/// it is hashed, and later reads are checked against that same stamp.
+fn verify_blob(file: &File, name: &str, path: &Path) -> Result<FileStamp> {
+    let stamp = FileStamp::of(file).with_context(|| format!("inspecting {}", path.display()))?;
+    let mut buf = vec![0u8; REF_CHUNK_BYTES];
+    let got = blob_digest(name, stamp.len, path, |update| {
+        let mut at = 0u64;
+        while at < stamp.len {
+            let n = (stamp.len - at).min(buf.len() as u64) as usize;
+            pread(file, &mut buf[..n], at).with_context(|| format!("reading {} to verify it", path.display()))?;
+            update(&buf[..n]);
+            at += n as u64;
+        }
+        Ok(())
+    })?;
+    check_blob_digest(&got, name, path)?;
+    ensure!(FileStamp::of(file)? == stamp, "{} changed while it was being verified", path.display());
+    Ok(stamp)
+}
+
+/// The digest a blob named `name` must have, over `len` bytes that `feed` passes to its callback.
+fn blob_digest(name: &str, len: u64, path: &Path, feed: impl FnOnce(&mut dyn FnMut(&[u8])) -> Result<()>) -> Result<String> {
+    use sha2::Digest;
+    Ok(match name.len() {
+        64 => {
+            let mut h = sha2::Sha256::new();
+            feed(&mut |b| h.update(b))?;
+            hex(&h.finalize())
+        }
+        40 => {
+            let mut h = sha1::Sha1::new();
+            h.update(format!("blob {len}\0").as_bytes());
+            feed(&mut |b| h.update(b))?;
+            hex(&h.finalize())
+        }
+        n => bail!("{} links to a blob name of {n} characters, not a SHA1 or SHA256", path.display()),
+    })
+}
+
+fn check_blob_digest(got: &str, name: &str, path: &Path) -> Result<()> {
+    ensure!(got.eq_ignore_ascii_case(name),
+        "{} links to blob {name}, but that blob's bytes hash to {got}: the blob store holds other bytes under that name (replaced, rearranged or corrupt), so they are not used", path.display());
+    Ok(())
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 /// Where a shard link's target lands, judged lexically from the link's own directory.
@@ -304,20 +374,6 @@ mod nofollow {
         openat(&parent, &last, DIR_FLAGS)
     }
 
-    /// Whether `rel`, looked up from `dir` without following a final symlink, is the same file as
-    /// `f` (device and inode). A missing entry is `false`.
-    pub fn names(dir: &File, rel: &Path, f: &File) -> io::Result<bool> {
-        use std::os::unix::fs::MetadataExt;
-        let c = cstr(rel.as_os_str())?;
-        let mut st: libc::stat = unsafe { std::mem::zeroed() };
-        if unsafe { libc::fstatat(dir.as_raw_fd(), c.as_ptr(), &mut st, libc::AT_SYMLINK_NOFOLLOW) } != 0 {
-            let e = io::Error::last_os_error();
-            return if e.kind() == io::ErrorKind::NotFound { Ok(false) } else { Err(e) };
-        }
-        let m = f.metadata()?;
-        Ok(st.st_dev as u64 == m.dev() && st.st_ino as u64 == m.ino())
-    }
-
     /// Opens a file non-blocking; a symlink there fails with `ELOOP`.
     pub fn open_file(dir: &File, name: &std::ffi::CStr) -> io::Result<File> {
         openat(dir, name, libc::O_RDONLY | libc::O_NONBLOCK)
@@ -359,23 +415,6 @@ pub fn read_capped(r: impl std::io::Read, cap: u64, what: &str) -> Result<String
 /// Resolves a checkpoint directory once and opens it, so the config, the index and every shard
 /// come from one generation even if the directory or a symlink on its path is replaced mid-load.
 pub fn resolve_checkpoint_dir(dir: &Path) -> Result<CheckpointDir> {
-    resolve_checkpoint_dir_between(dir, |_| {})
-}
-
-/// A point inside snapshot resolution where `resolve_checkpoint_dir_between` calls its hook.
-#[doc(hidden)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ResolveStep {
-    /// The revision is open; the blob store is not yet.
-    RevisionOpened,
-    /// Both are open; the consistency check has not run yet.
-    BlobsOpened,
-}
-
-/// `resolve_checkpoint_dir`, calling `hook` at each `ResolveStep` of a Hugging Face snapshot (a
-/// test seam for moves during resolution).
-#[doc(hidden)]
-pub fn resolve_checkpoint_dir_between(dir: &Path, mut hook: impl FnMut(ResolveStep)) -> Result<CheckpointDir> {
     let path = std::fs::canonicalize(dir).with_context(|| format!("resolving checkpoint directory {}", dir.display()))?;
     ensure!(path.is_dir(), "{} is not a directory", path.display());
     #[cfg(unix)]
@@ -386,29 +425,15 @@ pub fn resolve_checkpoint_dir_between(dir: &Path, mut hook: impl FnMut(ResolveSt
         let snapshot = path.parent().filter(|s| s.file_name().is_some_and(|n| n == "snapshots"));
         let (fd, blobs) = match (snapshot.and_then(Path::parent), path.file_name()) {
             // A Hugging Face snapshot: pin `<repo>` and open `snapshots/<rev>` and `blobs` downward
-            // from it, so a revision moved to another repository between the two opens can't pair
-            // its config with that repository's blobs (codex-review of SHA-787).
+            // from it. Which bytes a blob link may yield is settled by `verify_blob`, not by this.
             (Some(repo), Some(rev)) => {
                 let repo_fd = open(repo).with_context(|| format!("opening the cache repository {}", repo.display()))?;
                 let fd = nofollow::open_dir(&repo_fd, &Path::new("snapshots").join(rev))
                     .map_err(|e| nofollow::explain(e, &path, "is not a real directory under its repository"))?;
-                hook(ResolveStep::RevisionOpened);
                 let blobs = nofollow::open_dir(&repo_fd, Path::new("blobs")).map_err(|e| match e.kind() {
                     std::io::ErrorKind::NotFound => format!("{} is missing", repo.join("blobs").display()),
                     _ => format!("{} cannot be opened as a real directory ({e})", repo.join("blobs").display()),
                 });
-                hook(ResolveStep::BlobsOpened);
-                // Both entries must still name what was opened: then, at this moment, the
-                // repository held exactly this revision and this blob store, a consistent pair. A
-                // revision moved, or a blob store swapped, between the two opens fails here
-                // instead of pairing one generation's config with another's blobs (codex-review of
-                // SHA-788).
-                let rev_path = Path::new("snapshots").join(rev);
-                let mut unchanged = nofollow::names(&repo_fd, &rev_path, &fd)?;
-                if let Ok(b) = &blobs {
-                    unchanged &= nofollow::names(&repo_fd, Path::new("blobs"), b)?;
-                }
-                ensure!(unchanged, "the cache repository {} changed while {} was being opened (a revision or the blob store was moved or replaced); retry the load", repo.display(), path.display());
                 (fd, Some(blobs))
             }
             _ => (open(&path).with_context(|| format!("opening checkpoint directory {}", path.display()))?, None),
@@ -416,10 +441,7 @@ pub fn resolve_checkpoint_dir_between(dir: &Path, mut hook: impl FnMut(ResolveSt
         Ok(CheckpointDir { path, fd, blobs })
     }
     #[cfg(not(unix))]
-    {
-        let _ = &mut hook;
-        Ok(CheckpointDir { path })
-    }
+    Ok(CheckpointDir { path })
 }
 
 /// `config.json` of an opened checkpoint directory, read with the metadata open rules.
@@ -588,10 +610,30 @@ impl Checkpoint {
             None => vec!["model.safetensors".into()],
         };
         let mut ck = Checkpoint { dir: dir.path.clone(), shards: vec![], tensors: HashMap::new() };
+        let mut opened = Vec::with_capacity(shard_files.len());
         for f in &shard_files {
-            let path = dir.entry(f);
-            let file = dir.open(f).context("opening a shard")?;
+            let (file, blob) = dir.open_entry(f).context("opening a shard")?;
+            opened.push((f, dir.entry(f), file, blob));
+        }
+        // Hugging Face blobs are verified against their names in parallel: hashing runs at about
+        // 2.2 GB/s per thread on GB10 (SHA2 instructions), so one thread per shard keeps it to
+        // roughly the time of the largest shard.
+        let threads = std::thread::available_parallelism().map_or(4, |n| n.get());
+        let mut verified: Vec<Option<FileStamp>> = Vec::with_capacity(opened.len());
+        for group in opened.chunks(threads) {
+            let stamps = std::thread::scope(|sc| {
+                let jobs: Vec<_> = group.iter().map(|(_, path, file, blob)| blob.as_ref().map(|b| sc.spawn(move || verify_blob(file, b, path)))).collect();
+                jobs.into_iter().map(|j| match j {
+                    Some(j) => j.join().map_err(|_| anyhow::anyhow!("a blob verification thread panicked"))?.map(Some),
+                    None => Ok(None),
+                }).collect::<Result<Vec<_>>>()
+            })?;
+            verified.extend(stamps);
+        }
+        for ((f, path, file, _), verified) in opened.into_iter().zip(verified) {
             let stamp = FileStamp::of(&file)?;
+            // A verified blob must still be the version that was hashed.
+            ensure!(verified.as_ref().is_none_or(|v| *v == stamp), "{} changed after it was verified against its blob name", path.display());
             let len = stamp.len;
             let shard = ck.shards.len();
             for t in read_header(&path, &file, len, shard)? {
@@ -948,10 +990,24 @@ fn open_lock(path: &Path, writable: bool, create: bool) -> Result<File> {
     opts.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
     let lock = match opts.open(path) {
         Ok(f) => f,
-        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => bail!(
-            "this account cannot open the admission lock {}; the node lock is shared through its group, so ask an administrator to add this user to that group",
-            path.display()
-        ),
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+            // An administrator closes the node lock to its group (mode 0600) to fence new loads
+            // during a repair; say so rather than suggest joining the group.
+            #[cfg(unix)]
+            if !writable {
+                use std::os::unix::fs::PermissionsExt;
+                if let Ok(m) = std::fs::metadata(path) {
+                    let mode = m.permissions().mode() & 0o777;
+                    ensure!(mode & 0o040 != 0,
+                        "the admission lock {} is closed (mode {mode:o}), as an administrator does while repairing it; no load starts until it is reopened, so retry later",
+                        path.display());
+                }
+            }
+            bail!(
+                "this account cannot open the admission lock {}; the node lock is shared through its group, so ask an administrator to add this user to that group",
+                path.display()
+            )
+        }
         Err(e) => return Err(e).with_context(|| format!("opening the admission lock {}", path.display())),
     };
     let m = lock.metadata().with_context(|| format!("inspecting {}", path.display()))?;
@@ -959,8 +1015,9 @@ fn open_lock(path: &Path, writable: bool, create: bool) -> Result<File> {
     Ok(lock)
 }
 
-/// Takes the `flock` on an opened lock, waiting at most `wait` for the current holder.
-fn take_lock(lock: File, path: &Path, wait: std::time::Duration) -> Result<File> {
+/// Takes the `flock` on an opened lock, waiting at most `wait` for the current holder. `on_wait`
+/// runs once, the first time the lock is found held.
+fn take_lock(lock: File, path: &Path, wait: std::time::Duration, on_wait: &dyn Fn(&Path)) -> Result<File> {
     let deadline = std::time::Instant::now() + wait;
     let mut told = false;
     loop {
@@ -969,6 +1026,7 @@ fn take_lock(lock: File, path: &Path, wait: std::time::Duration) -> Result<File>
             Err(std::fs::TryLockError::WouldBlock) => {
                 if !told {
                     eprintln!("waiting for another sparkforge load to finish allocating ({})", path.display());
+                    on_wait(path);
                     told = true;
                 }
                 ensure!(std::time::Instant::now() < deadline,
@@ -995,6 +1053,13 @@ fn take_lock(lock: File, path: &Path, wait: std::time::Duration) -> Result<File>
 /// - Each file is locked once, even if two entries name it: a second descriptor's `flock` would
 ///   wait on this process's own first one.
 pub fn admit(locks: &[LockFile], copy_bytes: u64, overhead: u64, mem: impl Fn() -> Option<u64>, wait: std::time::Duration) -> Result<Admission> {
+    admit_observed(locks, copy_bytes, overhead, mem, wait, &|_| {})
+}
+
+/// `admit`, calling `on_wait` with a lock's path the first time each opened lock file is found
+/// held (a test seam: it proves which file a waiting load opened).
+#[doc(hidden)]
+pub fn admit_observed(locks: &[LockFile], copy_bytes: u64, overhead: u64, mem: impl Fn() -> Option<u64>, wait: std::time::Duration, on_wait: &dyn Fn(&Path)) -> Result<Admission> {
     ensure!(!locks.is_empty(), "no admission lock to take");
     let mut held = Vec::new();
     #[cfg(unix)]
@@ -1019,7 +1084,7 @@ pub fn admit(locks: &[LockFile], copy_bytes: u64, overhead: u64, mem: impl Fn() 
                 }
                 (m.dev(), m.ino())
             };
-            let lock = take_lock(lock, &l.path, deadline.saturating_duration_since(std::time::Instant::now()))?;
+            let lock = take_lock(lock, &l.path, deadline.saturating_duration_since(std::time::Instant::now()), on_wait)?;
             #[cfg(unix)]
             {
                 use std::os::unix::fs::MetadataExt;
@@ -1186,7 +1251,7 @@ fn check_node_lock(m: &std::fs::Metadata, acl: Option<Vec<u8>>, lock: &Path, own
     // The mode bits don't show what a POSIX ACL grants a named user or group.
     if let Some(acl) = acl {
         if let Some(who) = acl_named_grant(&acl).with_context(|| format!("reading the ACL of {}", lock.display()))? {
-            bail!("{} has a POSIX ACL entry granting {who} access, so an account outside group {NODE_LOCK_GROUP} could hold it. Replace the file rather than editing its ACL, since a descriptor opened while the ACL allowed it keeps working: stop new loads, drain running ones, then `rm -f` the file (leave the directory, so loads refuse meanwhile) and recreate it (`systemd-tmpfiles --create`)", lock.display());
+            bail!("{} has a POSIX ACL entry granting {who} access, so an account outside group {NODE_LOCK_GROUP} could hold it. Replace the file rather than editing its ACL, since a descriptor opened while the ACL allowed it keeps working: close it (`chmod 0600`) so no new load starts, wait until no sparkforge process runs, then `rm -f` the file and recreate it (`systemd-tmpfiles --create`). This needs no lock on the old file, which the outside descriptor may hold", lock.display());
         }
     }
     Ok(())
