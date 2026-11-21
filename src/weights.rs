@@ -92,11 +92,14 @@ pub struct CheckpointDir {
     pub path: PathBuf,
     #[cfg(unix)]
     fd: File,
-    /// `<repo>/blobs` of a Hugging Face snapshot, opened when the snapshot is resolved, so blob
-    /// links resolve into the blob store that existed when the config was read, even if `blobs`
-    /// is replaced mid-load (codex-review cycle 1 on SHA-787).
+    /// `<repo>/blobs` of a Hugging Face snapshot, opened from the same pinned `<repo>` descriptor as
+    /// the snapshot itself, so blob links resolve into the blob store of the repository the config
+    /// came from, even if `blobs` is replaced or the snapshot moved mid-load (codex-review of
+    /// SHA-787). `None` for a directory that is not a snapshot. An open error is kept, not raised,
+    /// and reported only when a blob link needs the store, so a checkpoint of plain files loads
+    /// beside a blob store it doesn't use.
     #[cfg(unix)]
-    blobs: Option<File>,
+    blobs: Option<std::result::Result<File, String>>,
 }
 
 impl CheckpointDir {
@@ -127,7 +130,8 @@ impl CheckpointDir {
                     let hop = match link_target(Path::new(name), &target, self.is_hf_snapshot()) {
                         LinkTarget::Inside(rel) => nofollow::walk(&self.fd, &rel).and_then(|(p, l)| nofollow::open_file(&p, &l)),
                         LinkTarget::HfBlob(blob) => match &self.blobs {
-                            Some(blobs) => nofollow::cstr(&blob).and_then(|c| nofollow::open_file(blobs, &c)),
+                            Some(Ok(blobs)) => nofollow::cstr(&blob).and_then(|c| nofollow::open_file(blobs, &c)),
+                            Some(Err(why)) => bail!("{} links into the blob store, but {why}", path.display()),
                             None => Err(std::io::Error::from(ErrorKind::NotFound)),
                         },
                         LinkTarget::Outside => bail!(
@@ -160,6 +164,7 @@ impl CheckpointDir {
     }
 
     /// Whether this is `<repo>/snapshots/<revision>` of a Hugging Face cache.
+    #[cfg(unix)]
     fn is_hf_snapshot(&self) -> bool {
         self.path.parent().and_then(Path::file_name).is_some_and(|n| n == "snapshots")
     }
@@ -195,6 +200,7 @@ impl CheckpointDir {
 }
 
 /// Where a shard link's target lands, judged lexically from the link's own directory.
+#[cfg(unix)]
 #[derive(Debug, PartialEq, Eq)]
 enum LinkTarget {
     /// Never leaves the checkpoint directory; the path relative to it, with no `..` left. Walking
@@ -211,6 +217,7 @@ enum LinkTarget {
     Outside,
 }
 
+#[cfg(unix)]
 fn link_target(entry: &Path, target: &Path, hf_snapshot: bool) -> LinkTarget {
     let mut depth: Vec<&std::ffi::OsStr> = entry.parent().into_iter().flat_map(Path::components).filter_map(|c| match c {
         Component::Normal(n) => Some(n),
@@ -338,28 +345,45 @@ pub fn read_capped(r: impl std::io::Read, cap: u64, what: &str) -> Result<String
 /// Resolves a checkpoint directory once and opens it, so the config, the index and every shard
 /// come from one generation even if the directory or a symlink on its path is replaced mid-load.
 pub fn resolve_checkpoint_dir(dir: &Path) -> Result<CheckpointDir> {
+    resolve_checkpoint_dir_between(dir, || {})
+}
+
+/// `resolve_checkpoint_dir`, running `between` after a Hugging Face snapshot is opened and before
+/// its blob store is (a test seam for moves during resolution).
+#[doc(hidden)]
+pub fn resolve_checkpoint_dir_between(dir: &Path, between: impl FnOnce()) -> Result<CheckpointDir> {
     let path = std::fs::canonicalize(dir).with_context(|| format!("resolving checkpoint directory {}", dir.display()))?;
     ensure!(path.is_dir(), "{} is not a directory", path.display());
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
         // O_NOFOLLOW: if the canonical entry became a symlink since `canonicalize`, fail.
-        let fd = std::fs::OpenOptions::new().read(true).custom_flags(nofollow::DIR_FLAGS | libc::O_NOFOLLOW)
-            .open(&path).with_context(|| format!("opening checkpoint directory {}", path.display()))?;
-        let mut dir = CheckpointDir { path, fd, blobs: None };
-        if dir.is_hf_snapshot() {
-            // `..` twice from the opened snapshot, then `blobs`, none of them a symlink. A cache
-            // without a blob store just has no blob links to follow.
-            dir.blobs = match nofollow::open_dir(&dir.fd, Path::new("../../blobs")) {
-                Ok(b) => Some(b),
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-                Err(e) => return Err(nofollow::explain(e, &dir.path.join("../../blobs"), "is not a real directory")),
-            };
-        }
-        Ok(dir)
+        let open = |p: &Path| std::fs::OpenOptions::new().read(true).custom_flags(nofollow::DIR_FLAGS | libc::O_NOFOLLOW).open(p);
+        let snapshot = path.parent().filter(|s| s.file_name().is_some_and(|n| n == "snapshots"));
+        let (fd, blobs) = match (snapshot.and_then(Path::parent), path.file_name()) {
+            // A Hugging Face snapshot: pin `<repo>` and open `snapshots/<rev>` and `blobs` downward
+            // from it, so a revision moved to another repository between the two opens can't pair
+            // its config with that repository's blobs (codex-review of SHA-787).
+            (Some(repo), Some(rev)) => {
+                let repo_fd = open(repo).with_context(|| format!("opening the cache repository {}", repo.display()))?;
+                let fd = nofollow::open_dir(&repo_fd, &Path::new("snapshots").join(rev))
+                    .map_err(|e| nofollow::explain(e, &path, "is not a real directory under its repository"))?;
+                between();
+                let blobs = nofollow::open_dir(&repo_fd, Path::new("blobs")).map_err(|e| match e.kind() {
+                    std::io::ErrorKind::NotFound => format!("{} is missing", repo.join("blobs").display()),
+                    _ => format!("{} cannot be opened as a real directory ({e})", repo.join("blobs").display()),
+                });
+                (fd, Some(blobs))
+            }
+            _ => (open(&path).with_context(|| format!("opening checkpoint directory {}", path.display()))?, None),
+        };
+        Ok(CheckpointDir { path, fd, blobs })
     }
     #[cfg(not(unix))]
-    Ok(CheckpointDir { path })
+    {
+        between();
+        Ok(CheckpointDir { path })
+    }
 }
 
 /// `config.json` of an opened checkpoint directory, read with the metadata open rules.
@@ -480,6 +504,13 @@ fn pread(file: &File, buf: &mut [u8], at: u64) -> std::io::Result<()> {
             done += n;
         }
         Ok(())
+    }
+    // Other targets (for example wasm32) have no positioned reads; this keeps the non-Unix code
+    // paths compiling, which `cargo check --target wasm32-unknown-unknown` verifies.
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (file, buf, at);
+        Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "positioned reads are not supported on this target"))
     }
 }
 
@@ -917,25 +948,23 @@ fn take_lock(lock: File, path: &Path, wait: std::time::Duration) -> Result<File>
 /// against `mem()` for `copy_bytes + overhead`. The locks are advisory `flock`s, so they coordinate
 /// sparkforge processes; other programs are seen only through `MemAvailable`.
 ///
-/// Two entries naming one file (for example `$XDG_RUNTIME_DIR` spelled `/run/user/1000/../1000`)
-/// are locked once: `flock`s on two descriptors of one file conflict, so the second would wait for
-/// this process's own first one (codex-review cycle 1 on SHA-787).
+/// The node lock is checked again on the descriptor about to be locked (owner, group, mode and
+/// ACL), so a file swapped in after `admission_locks` inspected the path is held to the same rules
+/// (codex-review of SHA-787).
 pub fn admit(locks: &[LockFile], copy_bytes: u64, overhead: u64, mem: impl Fn() -> Option<u64>, wait: std::time::Duration) -> Result<Admission> {
     ensure!(!locks.is_empty(), "no admission lock to take");
     let mut held = Vec::new();
-    let mut seen = HashSet::new();
     for l in locks {
-        let lock = open_lock(&l.path, l.kind != LockKind::Node, l.kind == LockKind::User)?;
+        let lock = open_lock(&l.path, l.kind == LockKind::User, l.kind == LockKind::User)?;
         #[cfg(unix)]
-        {
-            use std::os::unix::fs::MetadataExt;
+        if let LockKind::Node { owner, group } = l.kind {
             let m = lock.metadata().with_context(|| format!("inspecting {}", l.path.display()))?;
-            if !seen.insert((m.dev(), m.ino())) {
-                continue;
-            }
+            #[cfg(target_os = "linux")]
+            let acl = fd_acl(&lock, &l.path)?;
+            #[cfg(not(target_os = "linux"))]
+            let acl = None;
+            check_node_lock(&m, acl, &l.path, owner, group)?;
         }
-        #[cfg(not(unix))]
-        let _ = &mut seen;
         held.push(take_lock(lock, &l.path, wait)?);
     }
     let avail = mem().context("cannot read MemAvailable from /proc/meminfo; refusing to allocate without the memory guard")?;
@@ -966,14 +995,10 @@ pub enum LockScope {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LockKind {
-    /// A lock an older loader (before SHA-765) left in this user's runtime or temp directory; taken
-    /// while it exists so a load by the old binary still blocks a new one during an upgrade. Never
-    /// created.
-    Legacy,
     /// This user's lock under the password-database home directory.
     User,
-    /// The node-wide lock.
-    Node,
+    /// The node-wide lock, with the owner and group its descriptor must still have when locked.
+    Node { owner: u32, group: u32 },
 }
 
 /// One lock an admission takes.
@@ -983,17 +1008,28 @@ pub struct LockFile {
     pub kind: LockKind,
 }
 
+/// The node-wide lock as discovered: its path and the owner and group it must have.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NodeLock {
+    pub path: PathBuf,
+    pub owner: u32,
+    pub group: u32,
+}
+
 /// The locks one admission takes.
+///
+/// Locks a loader from before SHA-765 used (`/run/user/<uid>`, `$XDG_RUNTIME_DIR`, `<tmp>`) are
+/// not consulted: no environment can reveal every place such a load may hold one (another temp
+/// directory, another PID namespace), so upgrading from it requires draining running loads first,
+/// as the provisioning runbook says (codex-review of SHA-787).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AdmissionLocks {
-    /// Locks of older loaders that exist now, owned by this user in private directories.
-    pub legacy: Vec<PathBuf>,
     /// This user's lock under the password-database home directory. It doesn't depend on a login
     /// session, so a background job and a login shell always meet here. Optional only when the
     /// node lock is available.
     pub user: Option<PathBuf>,
     /// The node-wide lock, when provisioned.
-    pub node: Option<PathBuf>,
+    pub node: Option<NodeLock>,
 }
 
 impl AdmissionLocks {
@@ -1001,14 +1037,12 @@ impl AdmissionLocks {
         if self.node.is_some() { LockScope::Node } else { LockScope::User }
     }
 
-    /// The order they are taken: legacy, user, node. Taking this user's locks first also covers
-    /// turning the node lock on, or upgrading the binary, while this user's earlier load (which held
-    /// only those) is still allocating.
+    /// The order they are taken, the same in every process: user, then node. Taking this user's
+    /// lock first also covers turning the node lock on while this user's earlier load (which held
+    /// only the user lock) is still allocating.
     pub fn files(&self) -> Vec<LockFile> {
-        let f = |p: &PathBuf, kind| LockFile { path: p.clone(), kind };
-        self.legacy.iter().map(|p| f(p, LockKind::Legacy))
-            .chain(self.user.iter().map(|p| f(p, LockKind::User)))
-            .chain(self.node.iter().map(|p| f(p, LockKind::Node)))
+        self.user.iter().map(|p| LockFile { path: p.clone(), kind: LockKind::User })
+            .chain(self.node.iter().map(|n| LockFile { path: n.path.clone(), kind: LockKind::Node { owner: n.owner, group: n.group } }))
             .collect()
     }
 }
@@ -1021,15 +1055,14 @@ impl AdmissionLocks {
 ///   A `node_dir` that exists but fails these checks is an error, not a silent fallback.
 /// - The user lock in `<home>/.local/state/sparkforge` (created 0700). `home` is consulted only
 ///   here, so a numeric uid without a password entry can still use a provisioned node lock.
-/// - Legacy locks: `USER_LOCK_NAME` in each of `legacy_dirs` when the directory and the file are
-///   this user's, the directory isn't writable by others, and the file is regular.
+/// - With `node_dir` present but `admission.lock` missing (for example while it is being
+///   replaced), admission fails instead of falling back to the user lock.
 pub fn admission_locks_in(
     node_dir: &Path,
     trusted_owner: u32,
     node_group: impl FnOnce() -> Option<u32>,
     uid: u32,
     home: impl FnOnce() -> Option<PathBuf>,
-    legacy_dirs: &[PathBuf],
 ) -> Result<AdmissionLocks> {
     #[cfg(unix)]
     {
@@ -1040,22 +1073,15 @@ pub fn admission_locks_in(
                 ensure!(m.file_type().is_dir() && m.uid() == trusted_owner && m.mode() & 0o022 == 0,
                     "{} exists but is not a directory owned by uid {trusted_owner} and closed to writes by others; fix the provisioning or remove it", node_dir.display());
                 let lock = node_dir.join(NODE_LOCK_NAME);
-                let lm = std::fs::symlink_metadata(&lock).with_context(|| format!("{} is provisioned without {NODE_LOCK_NAME}", node_dir.display()))?;
-                ensure!(lm.file_type().is_file() && lm.uid() == trusted_owner,
-                    "{} must be a regular file owned by uid {trusted_owner}", lock.display());
-                ensure!(lm.mode() & 0o007 == 0,
-                    "{} grants access to every account (mode {:o}), so any local account could hold it and stall every load; share it through group {NODE_LOCK_GROUP} (mode 0640)", lock.display(), lm.mode() & 0o777);
+                let lm = std::fs::symlink_metadata(&lock).with_context(|| format!(
+                    "{} is provisioned without {NODE_LOCK_NAME}; loads refuse until it is recreated (`systemd-tmpfiles --create`)", node_dir.display()))?;
                 let group = node_group().with_context(|| format!("{} is provisioned but group {NODE_LOCK_GROUP} does not exist", lock.display()))?;
-                ensure!(lm.gid() == group,
-                    "{} belongs to gid {}, not group {NODE_LOCK_GROUP} (gid {group}), so accounts outside that group could hold it; fix the provisioning", lock.display(), lm.gid());
-                // The mode bits don't show what a POSIX ACL grants a named user or group.
                 #[cfg(target_os = "linux")]
-                if let Some(acl) = access_acl(&lock)? {
-                    if let Some(who) = acl_named_grant(&acl).with_context(|| format!("reading the ACL of {}", lock.display()))? {
-                        bail!("{} has a POSIX ACL entry granting {who} access, so an account outside group {NODE_LOCK_GROUP} could hold it. Replace the file rather than editing its ACL, since a descriptor opened while the ACL allowed it keeps working: drain loads, remove it, and recreate it (`systemd-tmpfiles --create`)", lock.display());
-                    }
-                }
-                Some(lock)
+                let acl = path_acl(&lock)?;
+                #[cfg(not(target_os = "linux"))]
+                let acl = None;
+                check_node_lock(&lm, acl, &lock, trusted_owner, group)?;
+                Some(NodeLock { path: lock, owner: trusted_owner, group })
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
             Err(e) => return Err(e).with_context(|| format!("inspecting {}", node_dir.display())),
@@ -1069,82 +1095,48 @@ pub fn admission_locks_in(
         })();
         // With the node lock, the user lock only adds same-user cutover cover, so it is optional.
         let user = if node.is_some() { user.ok() } else { Some(user?) };
-        let legacy = legacy_dirs.iter().filter(|d| private_dir(d)).map(|d| d.join(USER_LOCK_NAME))
-            .filter(|p| std::fs::symlink_metadata(p).is_ok_and(|m| m.file_type().is_file() && m.uid() == uid))
-            .filter(|p| user.as_ref() != Some(p))
-            .collect();
-        Ok(AdmissionLocks { legacy, user, node })
+        Ok(AdmissionLocks { user, node })
     }
     #[cfg(not(unix))]
     {
-        let _ = (node_dir, trusted_owner, node_group, uid, legacy_dirs);
+        let _ = (node_dir, trusted_owner, node_group, uid);
         let home = home().unwrap_or_else(std::env::temp_dir);
-        Ok(AdmissionLocks { legacy: vec![], user: Some(home.join(USER_LOCK_NAME)), node: None })
+        Ok(AdmissionLocks { user: Some(home.join(USER_LOCK_NAME)), node: None })
     }
 }
 
+/// The node lock rules, applied to path metadata at discovery and to the opened descriptor before
+/// locking: a regular file owned by `owner`, in `group`, with no access for other accounts in its
+/// mode bits or (on Linux) its ACL.
+#[cfg(unix)]
+fn check_node_lock(m: &std::fs::Metadata, acl: Option<Vec<u8>>, lock: &Path, owner: u32, group: u32) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    ensure!(m.file_type().is_file() && m.uid() == owner, "{} must be a regular file owned by uid {owner}", lock.display());
+    ensure!(m.mode() & 0o007 == 0,
+        "{} grants access to every account (mode {:o}), so any local account could hold it and stall every load; share it through group {NODE_LOCK_GROUP} (mode 0640)", lock.display(), m.mode() & 0o777);
+    ensure!(m.gid() == group,
+        "{} belongs to gid {}, not group {NODE_LOCK_GROUP} (gid {group}), so accounts outside that group could hold it; fix the provisioning", lock.display(), m.gid());
+    // The mode bits don't show what a POSIX ACL grants a named user or group.
+    if let Some(acl) = acl {
+        if let Some(who) = acl_named_grant(&acl).with_context(|| format!("reading the ACL of {}", lock.display()))? {
+            bail!("{} has a POSIX ACL entry granting {who} access, so an account outside group {NODE_LOCK_GROUP} could hold it. Replace the file rather than editing its ACL, since a descriptor opened while the ACL allowed it keeps working: stop new loads, drain running ones, then `rm -f` the file (leave the directory, so loads refuse meanwhile) and recreate it (`systemd-tmpfiles --create`)", lock.display());
+        }
+    }
+    Ok(())
+}
+
 /// The production lock locations: `/run/sparkforge` owned by root in group `sparkforge`, this
-/// process's effective uid, the home directory from the password database (not `$HOME`), and the
-/// directories older loaders used (`legacy_lock_dirs`).
+/// process's effective uid, and the home directory from the password database (not `$HOME`).
 pub fn admission_locks() -> Result<AdmissionLocks> {
     #[cfg(unix)]
     {
         let uid = unsafe { libc::geteuid() };
-        #[allow(unused_mut)] // extended on Linux only
-        let mut xdg: Vec<PathBuf> = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from).into_iter().collect();
-        #[cfg(target_os = "linux")]
-        xdg.extend(runtime_dirs_of_processes(Path::new("/proc"), uid));
-        let legacy = legacy_lock_dirs(uid, &xdg, &std::env::temp_dir());
-        admission_locks_in(Path::new(NODE_LOCK_DIR), 0, || gid_of(NODE_LOCK_GROUP), uid, || home_dir_of(uid), &legacy)
+        admission_locks_in(Path::new(NODE_LOCK_DIR), 0, || gid_of(NODE_LOCK_GROUP), uid, || home_dir_of(uid))
     }
     #[cfg(not(unix))]
     {
-        admission_locks_in(Path::new(NODE_LOCK_DIR), 0, || None, 0, || None, &[])
+        admission_locks_in(Path::new(NODE_LOCK_DIR), 0, || None, 0, || None)
     }
-}
-
-/// Where a loader from before SHA-765 may hold its lock: `/run/user/<uid>`, `<tmp>/sparkforge-<uid>`,
-/// and every `XDG_RUNTIME_DIR` value given, since that loader used whatever the variable named
-/// (codex-review round 3 on #13). Environment values are used here only for compatibility: these
-/// locks are taken when they already exist and are this user's, never created, so the user lock
-/// stays the one meeting point. Relative values are ignored, as the XDG spec requires.
-pub fn legacy_lock_dirs(uid: u32, xdg_runtime_dirs: &[PathBuf], tmp: &Path) -> Vec<PathBuf> {
-    let mut dirs = vec![PathBuf::from(format!("/run/user/{uid}")), tmp.join(format!("sparkforge-{uid}"))];
-    for x in xdg_runtime_dirs.iter().filter(|x| x.is_absolute()) {
-        if !dirs.contains(x) {
-            dirs.push(x.clone());
-        }
-    }
-    dirs
-}
-
-/// `XDG_RUNTIME_DIR` of every process `uid` runs, read from `<proc>/<pid>/environ` (the
-/// environment each started with). An old load may have been started with a runtime directory this
-/// process wasn't, and its own environment is the one place that records it (codex-review cycle 1
-/// on SHA-787). Processes that can't be read are skipped.
-#[cfg(target_os = "linux")]
-pub fn runtime_dirs_of_processes(proc: &Path, uid: u32) -> Vec<PathBuf> {
-    use std::os::unix::ffi::OsStrExt;
-    use std::os::unix::fs::MetadataExt;
-    let mut out: Vec<PathBuf> = Vec::new();
-    let Ok(entries) = std::fs::read_dir(proc) else { return out };
-    for e in entries.flatten() {
-        if !e.file_name().to_str().is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit())) {
-            continue;
-        }
-        let dir = e.path();
-        if !std::fs::metadata(&dir).is_ok_and(|m| m.uid() == uid) {
-            continue;
-        }
-        let Ok(env) = std::fs::read(dir.join("environ")) else { continue };
-        for v in env.split(|&b| b == 0).filter_map(|kv| kv.strip_prefix(b"XDG_RUNTIME_DIR=")) {
-            let d = PathBuf::from(std::ffi::OsStr::from_bytes(v));
-            if d.is_absolute() && !out.contains(&d) {
-                out.push(d);
-            }
-        }
-    }
-    out
 }
 
 /// The first entry of a `system.posix_acl_access` value that grants a named user or a named group
@@ -1176,12 +1168,24 @@ pub fn acl_named_grant(acl: &[u8]) -> Result<Option<String>> {
 /// The access ACL of `path` (not following a final symlink); `None` when it has none or the
 /// filesystem doesn't support ACLs.
 #[cfg(target_os = "linux")]
-fn access_acl(path: &Path) -> Result<Option<Vec<u8>>> {
+fn path_acl(path: &Path) -> Result<Option<Vec<u8>>> {
     use std::os::unix::ffi::OsStrExt;
     let c = std::ffi::CString::new(path.as_os_str().as_bytes()).with_context(|| format!("{} contains a NUL byte", path.display()))?;
+    read_acl(path, |name, buf, len| unsafe { libc::lgetxattr(c.as_ptr(), name, buf, len) })
+}
+
+/// The access ACL of an open file, as `path_acl`.
+#[cfg(target_os = "linux")]
+fn fd_acl(file: &File, path: &Path) -> Result<Option<Vec<u8>>> {
+    use std::os::fd::AsRawFd;
+    read_acl(path, |name, buf, len| unsafe { libc::fgetxattr(file.as_raw_fd(), name, buf, len) })
+}
+
+#[cfg(target_os = "linux")]
+fn read_acl(path: &Path, get: impl Fn(*const libc::c_char, *mut libc::c_void, usize) -> isize) -> Result<Option<Vec<u8>>> {
     let name = std::ffi::CStr::from_bytes_with_nul(b"system.posix_acl_access\0").expect("static name");
     let mut buf = vec![0u8; 64 * 1024];
-    let n = unsafe { libc::lgetxattr(c.as_ptr(), name.as_ptr(), buf.as_mut_ptr().cast(), buf.len()) };
+    let n = get(name.as_ptr(), buf.as_mut_ptr().cast(), buf.len());
     if n < 0 {
         let e = std::io::Error::last_os_error();
         return match e.raw_os_error() {
