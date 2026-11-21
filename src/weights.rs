@@ -582,6 +582,13 @@ impl Checkpoint {
 
     /// `open` on an already opened directory: the index and every shard are opened relative to it.
     pub fn open_dir(dir: &CheckpointDir) -> Result<Self> {
+        Self::open_dir_with(dir, std::thread::available_parallelism().map_or(4, |n| n.get()))
+    }
+
+    /// `open_dir` verifying Hugging Face blobs with at most `workers` threads; 0 verifies them all
+    /// on the calling thread, as happens for any blob whose worker the OS refuses to create.
+    #[doc(hidden)]
+    pub fn open_dir_with(dir: &CheckpointDir, workers: usize) -> Result<Self> {
         const INDEX: &str = "model.safetensors.index.json";
         let index_path = dir.entry(INDEX);
         // Presence is the directory entry itself: a dangling index symlink is an error, never a
@@ -618,14 +625,28 @@ impl Checkpoint {
         // Hugging Face blobs are verified against their names in parallel: hashing runs at about
         // 2.2 GB/s per thread on GB10 (SHA2 instructions), so one thread per shard keeps it to
         // roughly the time of the largest shard.
-        let threads = std::thread::available_parallelism().map_or(4, |n| n.get());
         let mut verified: Vec<Option<FileStamp>> = Vec::with_capacity(opened.len());
-        for group in opened.chunks(threads) {
+        for group in opened.chunks(workers.max(1)) {
+            // A worker the OS refuses to create (for example in a container at its task limit) is
+            // not an error: that blob is verified on this thread instead (codex-review of #15).
             let stamps = std::thread::scope(|sc| {
-                let jobs: Vec<_> = group.iter().map(|(_, path, file, blob)| blob.as_ref().map(|b| sc.spawn(move || verify_blob(file, b, path)))).collect();
-                jobs.into_iter().map(|j| match j {
-                    Some(j) => j.join().map_err(|_| anyhow::anyhow!("a blob verification thread panicked"))?.map(Some),
-                    None => Ok(None),
+                enum Job<'s> {
+                    None,
+                    Spawned(std::thread::ScopedJoinHandle<'s, Result<FileStamp>>),
+                    Here,
+                }
+                let jobs: Vec<Job> = group.iter().map(|(_, path, file, blob)| match blob {
+                    None => Job::None,
+                    Some(_) if workers == 0 => Job::Here,
+                    Some(b) => match std::thread::Builder::new().spawn_scoped(sc, move || verify_blob(file, b, path)) {
+                        Ok(h) => Job::Spawned(h),
+                        Err(_) => Job::Here,
+                    },
+                }).collect();
+                jobs.into_iter().zip(group).map(|(j, (_, path, file, blob))| match j {
+                    Job::None => Ok(None),
+                    Job::Spawned(h) => h.join().map_err(|_| anyhow::anyhow!("a blob verification thread panicked"))?.map(Some),
+                    Job::Here => verify_blob(file, blob.as_deref().expect("a blob job has a name"), path).map(Some),
                 }).collect::<Result<Vec<_>>>()
             })?;
             verified.extend(stamps);
@@ -936,7 +957,7 @@ pub fn check_headroom(copy_bytes: u64, mem_available: u64) -> Result<()> {
 /// `MemAvailable` reading already reflects this one. Without it, two loads started together could
 /// both read the same `MemAvailable` and both pass (codex-review cycle 2).
 pub struct Admission {
-    _locks: Vec<File>,
+    _lock: File,
     copy_bytes: u64,
     overhead: u64,
 }
@@ -947,7 +968,7 @@ impl Admission {
         self.copy_bytes
     }
 
-    /// Re-checks, under the held locks and right before allocating, that this admission covers the
+    /// Re-checks, under the held lock and right before allocating, that this admission covers the
     /// workload actually being run (its copied bytes and its overhead, which includes verification
     /// scratch when verifying), and that `MemAvailable` still leaves the headroom: CUDA startup
     /// between admission and upload uses memory too (codex-review of SHA-765).
@@ -966,14 +987,13 @@ impl Admission {
 /// turns into an error instead of an indefinite hang.
 pub const ADMISSION_WAIT: std::time::Duration = std::time::Duration::from_secs(30 * 60);
 
-/// Opens an admission lock without following a final symlink and without blocking, and requires a
-/// regular file: a FIFO there fails promptly. A missing per-user lock is created private to this
-/// user first. This user's own locks open read-write, since an exclusive lock over NFS needs a
-/// writable descriptor; the root-owned node lock opens read-only, which `flock` on tmpfs accepts.
-fn open_lock(path: &Path, writable: bool, create: bool) -> Result<File> {
+/// Opens this user's admission lock without following a final symlink and without blocking, and
+/// requires a regular file: a FIFO there fails promptly. A missing lock is created private to this
+/// user first. It opens read-write, since an exclusive lock over NFS needs a writable descriptor.
+fn open_lock(path: &Path) -> Result<File> {
     #[cfg(unix)]
     use std::os::unix::fs::OpenOptionsExt;
-    if create && matches!(std::fs::symlink_metadata(path), Err(e) if e.kind() == std::io::ErrorKind::NotFound) {
+    if matches!(std::fs::symlink_metadata(path), Err(e) if e.kind() == std::io::ErrorKind::NotFound) {
         let mut create = std::fs::OpenOptions::new();
         create.write(true).create_new(true);
         #[cfg(unix)]
@@ -985,29 +1005,12 @@ fn open_lock(path: &Path, writable: bool, create: bool) -> Result<File> {
         }
     }
     let mut opts = std::fs::OpenOptions::new();
-    opts.read(true).write(writable);
+    opts.read(true).write(true);
     #[cfg(unix)]
     opts.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
     let lock = match opts.open(path) {
         Ok(f) => f,
-        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
-            // An administrator closes the node lock to its group (mode 0600) to fence new loads
-            // during a repair; say so rather than suggest joining the group.
-            #[cfg(unix)]
-            if !writable {
-                use std::os::unix::fs::PermissionsExt;
-                if let Ok(m) = std::fs::metadata(path) {
-                    let mode = m.permissions().mode() & 0o777;
-                    ensure!(mode & 0o040 != 0,
-                        "the admission lock {} is closed (mode {mode:o}), as an administrator does while repairing it; no load starts until it is reopened, so retry later",
-                        path.display());
-                }
-            }
-            bail!(
-                "this account cannot open the admission lock {}; the node lock is shared through its group, so ask an administrator to add this user to that group",
-                path.display()
-            )
-        }
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => bail!("this account cannot open the admission lock {} read-write", path.display()),
         Err(e) => return Err(e).with_context(|| format!("opening the admission lock {}", path.display())),
     };
     let m = lock.metadata().with_context(|| format!("inspecting {}", path.display()))?;
@@ -1015,331 +1018,129 @@ fn open_lock(path: &Path, writable: bool, create: bool) -> Result<File> {
     Ok(lock)
 }
 
-/// Takes the `flock` on an opened lock, waiting at most `wait` for the current holder. `on_wait`
-/// runs once, the first time the lock is found held.
-fn take_lock(lock: File, path: &Path, wait: std::time::Duration, on_wait: &dyn Fn(&Path)) -> Result<File> {
-    let deadline = std::time::Instant::now() + wait;
-    let mut told = false;
-    loop {
-        match lock.try_lock() {
-            Ok(()) => return Ok(lock),
-            Err(std::fs::TryLockError::WouldBlock) => {
-                if !told {
-                    eprintln!("waiting for another sparkforge load to finish allocating ({})", path.display());
-                    on_wait(path);
-                    told = true;
-                }
-                ensure!(std::time::Instant::now() < deadline,
-                    "gave up after {} s waiting for the admission lock {}; another process has held it that long", wait.as_secs(), path.display());
-                std::thread::sleep(std::time::Duration::from_millis(20));
-            }
-            Err(std::fs::TryLockError::Error(e)) => return Err(e).with_context(|| format!("locking {}", path.display())),
-        }
-    }
-}
-
-/// Takes every lock in `locks`, in order (see `AdmissionLocks::files`), then runs the memory guard
-/// against `mem()` for `copy_bytes + overhead`. The locks are advisory `flock`s, so they coordinate
-/// sparkforge processes; other programs are seen only through `MemAvailable`.
+/// Takes the admission lock at `lock` (see `admission_lock`), waiting at most `wait` for another
+/// load to finish allocating, then runs the memory guard against `mem()` for
+/// `copy_bytes + overhead`. The lock is an advisory `flock`, so it coordinates sparkforge
+/// processes; other programs are seen only through `MemAvailable`.
 ///
-/// - The node lock is checked again on the descriptor about to be locked (owner, group, mode and
-///   ACL), so a file swapped in after `admission_locks` inspected the path is held to the same
-///   rules (codex-review of SHA-787).
-/// - After a lock is taken, the path must still name the locked file. If the file was replaced
-///   while this process waited, it locks the new file instead, so every process ends up holding
-///   the file that the path names. A repair that replaces the file while holding the old one
-///   (see the runbook) therefore can't leave two lock generations admitting loads at once
-///   (codex-review of SHA-788).
-/// - Each file is locked once, even if two entries name it: a second descriptor's `flock` would
-///   wait on this process's own first one.
-pub fn admit(locks: &[LockFile], copy_bytes: u64, overhead: u64, mem: impl Fn() -> Option<u64>, wait: std::time::Duration) -> Result<Admission> {
-    admit_observed(locks, copy_bytes, overhead, mem, wait, &|_| {})
+/// - Once the lock has been found held, an acquisition after the deadline is a timeout too, so a
+///   holder that outlasts `wait` never leads to an admission.
+/// - After the lock is taken, the path must still name the locked file. If the file was replaced
+///   before this load got it, the load locks the new file instead, within the same deadline
+///   (codex-review of #16).
+/// - Deleting the lock file, or `~/.local/state/sparkforge`, while a load is admitted is not
+///   supported: no lock survives its own deletion, so a load started afterwards locks a new file
+///   and isn't coordinated with the admitted one. Nothing on the Sparks deletes that directory;
+///   don't remove it while sparkforge runs.
+pub fn admit(lock: &Path, copy_bytes: u64, overhead: u64, mem: impl Fn() -> Option<u64>, wait: std::time::Duration) -> Result<Admission> {
+    admit_with(lock, copy_bytes, overhead, mem, wait, &AdmitHooks::default())
 }
 
-/// `admit`, calling `on_wait` with a lock's path the first time each opened lock file is found
-/// held (a test seam: it proves which file a waiting load opened).
+/// Test seams for `admit_with`: `on_wait` runs the first time each opened lock file is found held
+/// (it proves which file a waiting load opened), and `sleep` replaces the pause between attempts
+/// (so a test can release the lock at an exact point).
 #[doc(hidden)]
-pub fn admit_observed(locks: &[LockFile], copy_bytes: u64, overhead: u64, mem: impl Fn() -> Option<u64>, wait: std::time::Duration, on_wait: &dyn Fn(&Path)) -> Result<Admission> {
-    ensure!(!locks.is_empty(), "no admission lock to take");
-    let mut held = Vec::new();
-    #[cfg(unix)]
-    let mut taken: HashSet<(u64, u64)> = HashSet::new();
-    'locks: for l in locks {
-        let deadline = std::time::Instant::now() + wait;
-        loop {
-            let lock = open_lock(&l.path, l.kind == LockKind::User, l.kind == LockKind::User)?;
-            #[cfg(unix)]
-            let id = {
-                use std::os::unix::fs::MetadataExt;
-                let m = lock.metadata().with_context(|| format!("inspecting {}", l.path.display()))?;
-                if let LockKind::Node { owner, group } = l.kind {
-                    #[cfg(target_os = "linux")]
-                    let acl = fd_acl(&lock, &l.path)?;
-                    #[cfg(not(target_os = "linux"))]
-                    let acl = None;
-                    check_node_lock(&m, acl, &l.path, owner, group)?;
-                }
-                if taken.contains(&(m.dev(), m.ino())) {
-                    continue 'locks;
-                }
-                (m.dev(), m.ino())
-            };
-            let lock = take_lock(lock, &l.path, deadline.saturating_duration_since(std::time::Instant::now()), on_wait)?;
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::MetadataExt;
-                let now = std::fs::symlink_metadata(&l.path).ok().map(|m| (m.dev(), m.ino()));
-                if now != Some(id) {
-                    eprintln!("{} was replaced while this load waited; locking the new file", l.path.display());
-                    continue;
-                }
-                taken.insert(id);
-            }
-            held.push(lock);
-            continue 'locks;
-        }
+pub struct AdmitHooks<'a> {
+    pub on_wait: &'a dyn Fn(),
+    pub sleep: &'a dyn Fn(std::time::Duration),
+}
+
+impl Default for AdmitHooks<'_> {
+    fn default() -> Self {
+        AdmitHooks { on_wait: &|| {}, sleep: &std::thread::sleep }
     }
+}
+
+/// `admit` with test seams.
+#[doc(hidden)]
+pub fn admit_with(lock: &Path, copy_bytes: u64, overhead: u64, mem: impl Fn() -> Option<u64>, wait: std::time::Duration, hooks: &AdmitHooks) -> Result<Admission> {
+    let deadline = std::time::Instant::now() + wait;
+    let timeout = || anyhow::anyhow!("gave up after {} s waiting for the admission lock {}; another process has held it that long", wait.as_secs(), lock.display());
+    let mut contended = false;
+    let file = loop {
+        let file = open_lock(lock)?;
+        let mut told = false;
+        loop {
+            match file.try_lock() {
+                Ok(()) => break,
+                Err(std::fs::TryLockError::WouldBlock) => {
+                    if !told {
+                        if !contended {
+                            eprintln!("waiting for another sparkforge load to finish allocating ({})", lock.display());
+                        }
+                        (hooks.on_wait)();
+                        told = true;
+                        contended = true;
+                    }
+                    if std::time::Instant::now() >= deadline {
+                        return Err(timeout());
+                    }
+                    (hooks.sleep)(std::time::Duration::from_millis(20));
+                }
+                Err(std::fs::TryLockError::Error(e)) => return Err(e).with_context(|| format!("locking {}", lock.display())),
+            }
+        }
+        if contended && std::time::Instant::now() >= deadline {
+            return Err(timeout());
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let held = file.metadata().with_context(|| format!("inspecting {}", lock.display()))?;
+            let now = std::fs::symlink_metadata(lock).ok().map(|m| (m.dev(), m.ino()));
+            if now != Some((held.dev(), held.ino())) {
+                eprintln!("{} was replaced while this load waited; locking the new file", lock.display());
+                contended = true;
+                continue;
+            }
+        }
+        break file;
+    };
     let avail = mem().context("cannot read MemAvailable from /proc/meminfo; refusing to allocate without the memory guard")?;
     check_headroom(copy_bytes + overhead, avail)?;
-    Ok(Admission { _locks: held, copy_bytes, overhead })
+    Ok(Admission { _lock: file, copy_bytes, overhead })
 }
 
-/// Root-provisioned directory holding the node-wide admission lock (a deploy step on each GB10).
-/// The lock is shared through the `sparkforge` group, never with every account, so a local account
-/// outside that group cannot hold it and stall other users' loads. `/run` is tmpfs, so a boot-time
-/// `tmpfiles.d` entry recreates it:
-/// `d /run/sparkforge 0755 root root -` and `f /run/sparkforge/admission.lock 0640 root sparkforge -`.
-pub const NODE_LOCK_DIR: &str = "/run/sparkforge";
-/// The group the node lock is shared through.
-pub const NODE_LOCK_GROUP: &str = "sparkforge";
-const NODE_LOCK_NAME: &str = "admission.lock";
 const USER_LOCK_NAME: &str = "sparkforge-gpu-admission.lock";
 
-/// Which processes an admission coordinates with.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum LockScope {
-    /// Every user's sparkforge processes on this node (the node-wide lock is provisioned).
-    Node,
-    /// Only this user's processes; `MemAvailable` is machine-wide, so loads by different users can
-    /// still pass together.
-    User,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum LockKind {
-    /// This user's lock under the password-database home directory.
-    User,
-    /// The node-wide lock, with the owner and group its descriptor must still have when locked.
-    Node { owner: u32, group: u32 },
-}
-
-/// One lock an admission takes.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LockFile {
-    pub path: PathBuf,
-    pub kind: LockKind,
-}
-
-/// The node-wide lock as discovered: its path and the owner and group it must have.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct NodeLock {
-    pub path: PathBuf,
-    pub owner: u32,
-    pub group: u32,
-}
-
-/// The locks one admission takes.
+/// This user's admission lock: `<home>/.local/state/sparkforge/sparkforge-gpu-admission.lock`, with
+/// the directory created 0700 and required to be this user's and not writable by others. `home`
+/// comes from the password database, never from environment variables, so a login shell and a
+/// background job always meet at the same lock.
 ///
-/// Locks a loader from before SHA-765 used (`/run/user/<uid>`, `$XDG_RUNTIME_DIR`, `<tmp>`) are
-/// not consulted: no environment can reveal every place such a load may hold one (another temp
-/// directory, another PID namespace), so upgrading from it requires draining running loads first,
-/// as the provisioning runbook says (codex-review of SHA-787).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AdmissionLocks {
-    /// This user's lock under the password-database home directory. It doesn't depend on a login
-    /// session, so a background job and a login shell always meet here. Optional only when the
-    /// node lock is available.
-    pub user: Option<PathBuf>,
-    /// The node-wide lock, when provisioned.
-    pub node: Option<NodeLock>,
-}
-
-impl AdmissionLocks {
-    pub fn scope(&self) -> LockScope {
-        if self.node.is_some() { LockScope::Node } else { LockScope::User }
-    }
-
-    /// The order they are taken, the same in every process: user, then node. Taking this user's
-    /// lock first also covers turning the node lock on while this user's earlier load (which held
-    /// only the user lock) is still allocating.
-    pub fn files(&self) -> Vec<LockFile> {
-        self.user.iter().map(|p| LockFile { path: p.clone(), kind: LockKind::User })
-            .chain(self.node.iter().map(|n| LockFile { path: n.path.clone(), kind: LockKind::Node { owner: n.owner, group: n.group } }))
-            .collect()
-    }
-}
-
-/// Where the locks are, decided from ownership only, never from environment variables.
-/// - The node lock when `node_dir` is a real directory owned by `trusted_owner` (root in
-///   production) and closed to writes by others, holding a regular `admission.lock` owned by
-///   `trusted_owner`, in group `node_group` (`sparkforge`), granting no access to other accounts
-///   through its mode bits or (on Linux) a POSIX ACL entry naming another user or group.
-///   A `node_dir` that exists but fails these checks is an error, not a silent fallback.
-/// - The user lock in `<home>/.local/state/sparkforge` (created 0700). `home` is consulted only
-///   here, so a numeric uid without a password entry can still use a provisioned node lock.
-/// - With `node_dir` present but `admission.lock` missing (for example while it is being
-///   replaced), admission fails instead of falling back to the user lock.
-pub fn admission_locks_in(
-    node_dir: &Path,
-    trusted_owner: u32,
-    node_group: impl FnOnce() -> Option<u32>,
-    uid: u32,
-    home: impl FnOnce() -> Option<PathBuf>,
-) -> Result<AdmissionLocks> {
+/// The lock coordinates one account's loads. Every Spark runs sparkforge under the single account
+/// `spark`, so that is every load on the node. A node-wide lock shared between accounts was built
+/// in #13 to #15 and removed in SHA-789, since no Spark has a second account. A second account
+/// loading weights on the same GB10 at the same time would need it back.
+pub fn admission_lock_in(uid: u32, home: impl FnOnce() -> Option<PathBuf>) -> Result<PathBuf> {
+    let home = home().with_context(|| format!("no home directory for uid {uid} in the password database"))?;
+    let d = home.join(".local/state/sparkforge");
     #[cfg(unix)]
     {
         use std::os::unix::fs::{DirBuilderExt, MetadataExt};
-        let private_dir = |d: &Path| std::fs::symlink_metadata(d).is_ok_and(|m| m.file_type().is_dir() && m.uid() == uid && m.mode() & 0o022 == 0);
-        let node = match std::fs::symlink_metadata(node_dir) {
-            Ok(m) => {
-                ensure!(m.file_type().is_dir() && m.uid() == trusted_owner && m.mode() & 0o022 == 0,
-                    "{} exists but is not a directory owned by uid {trusted_owner} and closed to writes by others; fix the provisioning or remove it", node_dir.display());
-                let lock = node_dir.join(NODE_LOCK_NAME);
-                let lm = std::fs::symlink_metadata(&lock).with_context(|| format!(
-                    "{} is provisioned without {NODE_LOCK_NAME}; loads refuse until it is recreated (`systemd-tmpfiles --create`)", node_dir.display()))?;
-                let group = node_group().with_context(|| format!("{} is provisioned but group {NODE_LOCK_GROUP} does not exist", lock.display()))?;
-                #[cfg(target_os = "linux")]
-                let acl = path_acl(&lock)?;
-                #[cfg(not(target_os = "linux"))]
-                let acl = None;
-                check_node_lock(&lm, acl, &lock, trusted_owner, group)?;
-                Some(NodeLock { path: lock, owner: trusted_owner, group })
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-            Err(e) => return Err(e).with_context(|| format!("inspecting {}", node_dir.display())),
-        };
-        let user = (|| -> Result<PathBuf> {
-            let home = home().with_context(|| format!("no home directory for uid {uid} in the password database, and {} is not provisioned", node_dir.display()))?;
-            let d = home.join(".local/state/sparkforge");
-            std::fs::DirBuilder::new().recursive(true).mode(0o700).create(&d).with_context(|| format!("creating {}", d.display()))?;
-            ensure!(private_dir(&d), "{} must be a directory owned by uid {uid} and not writable by others", d.display());
-            Ok(d.join(USER_LOCK_NAME))
-        })();
-        // With the node lock, the user lock only adds same-user cutover cover, so it is optional.
-        let user = if node.is_some() { user.ok() } else { Some(user?) };
-        Ok(AdmissionLocks { user, node })
+        std::fs::DirBuilder::new().recursive(true).mode(0o700).create(&d).with_context(|| format!("creating {}", d.display()))?;
+        let private = std::fs::symlink_metadata(&d).is_ok_and(|m| m.file_type().is_dir() && m.uid() == uid && m.mode() & 0o022 == 0);
+        ensure!(private, "{} must be a directory owned by uid {uid} and not writable by others", d.display());
     }
     #[cfg(not(unix))]
     {
-        let _ = (node_dir, trusted_owner, node_group, uid);
-        let home = home().unwrap_or_else(std::env::temp_dir);
-        Ok(AdmissionLocks { user: Some(home.join(USER_LOCK_NAME)), node: None })
+        let _ = uid;
+        std::fs::create_dir_all(&d).with_context(|| format!("creating {}", d.display()))?;
     }
+    Ok(d.join(USER_LOCK_NAME))
 }
 
-/// The node lock rules, applied to path metadata at discovery and to the opened descriptor before
-/// locking: a regular file owned by `owner`, in `group`, with no access for other accounts in its
-/// mode bits or (on Linux) its ACL.
-#[cfg(unix)]
-fn check_node_lock(m: &std::fs::Metadata, acl: Option<Vec<u8>>, lock: &Path, owner: u32, group: u32) -> Result<()> {
-    use std::os::unix::fs::MetadataExt;
-    ensure!(m.file_type().is_file() && m.uid() == owner, "{} must be a regular file owned by uid {owner}", lock.display());
-    ensure!(m.mode() & 0o007 == 0,
-        "{} grants access to every account (mode {:o}), so any local account could hold it and stall every load; share it through group {NODE_LOCK_GROUP} (mode 0640)", lock.display(), m.mode() & 0o777);
-    ensure!(m.gid() == group,
-        "{} belongs to gid {}, not group {NODE_LOCK_GROUP} (gid {group}), so accounts outside that group could hold it; fix the provisioning", lock.display(), m.gid());
-    // The mode bits don't show what a POSIX ACL grants a named user or group.
-    if let Some(acl) = acl {
-        if let Some(who) = acl_named_grant(&acl).with_context(|| format!("reading the ACL of {}", lock.display()))? {
-            bail!("{} has a POSIX ACL entry granting {who} access, so an account outside group {NODE_LOCK_GROUP} could hold it. Replace the file rather than editing its ACL, since a descriptor opened while the ACL allowed it keeps working: close it (`chmod 0600`) so no new load starts, wait until no sparkforge process runs, then `rm -f` the file and recreate it (`systemd-tmpfiles --create`). This needs no lock on the old file, which the outside descriptor may hold", lock.display());
-        }
-    }
-    Ok(())
-}
-
-/// The production lock locations: `/run/sparkforge` owned by root in group `sparkforge`, this
-/// process's effective uid, and the home directory from the password database (not `$HOME`).
-pub fn admission_locks() -> Result<AdmissionLocks> {
+/// `admission_lock_in` for this process's effective uid and its password-database home.
+pub fn admission_lock() -> Result<PathBuf> {
     #[cfg(unix)]
     {
         let uid = unsafe { libc::geteuid() };
-        admission_locks_in(Path::new(NODE_LOCK_DIR), 0, || gid_of(NODE_LOCK_GROUP), uid, || home_dir_of(uid))
+        admission_lock_in(uid, || home_dir_of(uid))
     }
     #[cfg(not(unix))]
     {
-        admission_locks_in(Path::new(NODE_LOCK_DIR), 0, || None, 0, || None)
+        admission_lock_in(0, || std::env::var_os("USERPROFILE").map(PathBuf::from))
     }
-}
-
-/// The first entry of a `system.posix_acl_access` value that grants a named user or a named group
-/// any permission, as `user <id>` or `group <id>`; `None` when the ACL only mirrors the mode bits.
-/// A value that does not parse is an error, never "no ACL".
-pub fn acl_named_grant(acl: &[u8]) -> Result<Option<String>> {
-    const VERSION: u32 = 2;
-    const ACL_USER: u16 = 0x02;
-    const ACL_GROUP: u16 = 0x08;
-    ensure!(acl.len() >= 4 && (acl.len() - 4).is_multiple_of(8), "a POSIX ACL of {} bytes is malformed", acl.len());
-    let version = u32::from_le_bytes([acl[0], acl[1], acl[2], acl[3]]);
-    ensure!(version == VERSION, "unsupported POSIX ACL version {version}");
-    for e in acl[4..].as_chunks::<8>().0 {
-        let tag = u16::from_le_bytes([e[0], e[1]]);
-        let perm = u16::from_le_bytes([e[2], e[3]]);
-        let id = u32::from_le_bytes([e[4], e[5], e[6], e[7]]);
-        let kind = match tag {
-            ACL_USER => "user",
-            ACL_GROUP => "group",
-            _ => continue,
-        };
-        if perm & 0o7 != 0 {
-            return Ok(Some(format!("{kind} {id}")));
-        }
-    }
-    Ok(None)
-}
-
-/// The access ACL of `path` (not following a final symlink); `None` when it has none or the
-/// filesystem doesn't support ACLs.
-#[cfg(target_os = "linux")]
-fn path_acl(path: &Path) -> Result<Option<Vec<u8>>> {
-    use std::os::unix::ffi::OsStrExt;
-    let c = std::ffi::CString::new(path.as_os_str().as_bytes()).with_context(|| format!("{} contains a NUL byte", path.display()))?;
-    read_acl(path, |name, buf, len| unsafe { libc::lgetxattr(c.as_ptr(), name, buf, len) })
-}
-
-/// The access ACL of an open file, as `path_acl`.
-#[cfg(target_os = "linux")]
-fn fd_acl(file: &File, path: &Path) -> Result<Option<Vec<u8>>> {
-    use std::os::fd::AsRawFd;
-    read_acl(path, |name, buf, len| unsafe { libc::fgetxattr(file.as_raw_fd(), name, buf, len) })
-}
-
-#[cfg(target_os = "linux")]
-fn read_acl(path: &Path, get: impl Fn(*const libc::c_char, *mut libc::c_void, usize) -> isize) -> Result<Option<Vec<u8>>> {
-    let name = std::ffi::CStr::from_bytes_with_nul(b"system.posix_acl_access\0").expect("static name");
-    let mut buf = vec![0u8; 64 * 1024];
-    let n = get(name.as_ptr(), buf.as_mut_ptr().cast(), buf.len());
-    if n < 0 {
-        let e = std::io::Error::last_os_error();
-        return match e.raw_os_error() {
-            Some(libc::ENODATA) | Some(libc::EOPNOTSUPP) => Ok(None),
-            _ => Err(e).with_context(|| format!("reading the ACL of {}", path.display())),
-        };
-    }
-    buf.truncate(n as usize);
-    Ok(Some(buf))
-}
-
-#[cfg(unix)]
-fn gid_of(group: &str) -> Option<u32> {
-    let name = std::ffi::CString::new(group).ok()?;
-    let mut buf: Vec<libc::c_char> = vec![0; 16 * 1024];
-    let mut gr: libc::group = unsafe { std::mem::zeroed() };
-    let mut out: *mut libc::group = std::ptr::null_mut();
-    let rc = unsafe { libc::getgrnam_r(name.as_ptr(), &mut gr, buf.as_mut_ptr(), buf.len(), &mut out) };
-    if rc != 0 || out.is_null() {
-        return None;
-    }
-    Some(gr.gr_gid)
 }
 
 #[cfg(unix)]
@@ -1361,21 +1162,16 @@ pub fn bytes_to_copy(ck: &Checkpoint, b: &Binding) -> u64 {
     b.linears.iter().flat_map(|l| l.parts.iter()).map(|p| ck.tensors[p].len()).sum()
 }
 
-/// Admission for loading `b`, taken on the host before any CUDA call: the `locks` and the memory
-/// guard for the copied bytes plus the load's overhead. Hold the result until the upload has made
+/// Admission for loading `b`, taken on the host before any CUDA call: the lock at `lock` and the
+/// memory guard for the copied bytes plus the load's overhead. Hold the result until the upload has made
 /// and filled every allocation; the upload confirms it against what it actually copies.
-pub fn admit_load_with(ck: &Checkpoint, b: &Binding, verifying: bool, locks: &[LockFile], mem: impl Fn() -> Option<u64>) -> Result<Admission> {
-    admit(locks, bytes_to_copy(ck, b), load_overhead_bytes(b, verifying), mem, ADMISSION_WAIT)
+pub fn admit_load_with(ck: &Checkpoint, b: &Binding, verifying: bool, lock: &Path, mem: impl Fn() -> Option<u64>) -> Result<Admission> {
+    admit(lock, bytes_to_copy(ck, b), load_overhead_bytes(b, verifying), mem, ADMISSION_WAIT)
 }
 
-/// `admit_load_with` at the production lock locations with `/proc/meminfo`. Warns when only the
-/// per-user lock is available.
+/// `admit_load_with` at this user's admission lock with `/proc/meminfo`.
 pub fn admit_load(ck: &Checkpoint, b: &Binding, verifying: bool) -> Result<Admission> {
-    let locks = admission_locks()?;
-    if locks.scope() == LockScope::User {
-        eprintln!("note: {NODE_LOCK_DIR}/{NODE_LOCK_NAME} is not provisioned; loads are serialized only among this user's processes");
-    }
-    admit_load_with(ck, b, verifying, &locks.files(), mem_available)
+    admit_load_with(ck, b, verifying, &admission_lock()?, mem_available)
 }
 
 /// `MemAvailable` from /proc/meminfo in bytes (Linux only).

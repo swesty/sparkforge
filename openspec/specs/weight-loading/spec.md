@@ -188,78 +188,6 @@ about 35% below device memory once warm. The load report SHALL state the bytes c
 - **WHEN** the Llama 3.1 8B BF16 checkpoint is loaded on a GB10
 - **THEN** 13.98 GiB is copied into GPU memory and the report states the load time
 
-### Requirement: Loads never exhaust host memory
-
-A load SHALL be refused before any CUDA call if its copied bytes, staging buffer and, when
-verifying, reference scratch exceed `MemAvailable` minus 4 GiB, and rechecked before allocating.
-Admission SHALL be held until that memory is allocated, or freed after verification, and
-serialized across this user's processes and, through a group-only node lock when provisioned,
-across all users'. Lock locations come from ownership, never environment.
-
-#### Scenario: Too large to copy
-- **WHEN** the bytes to copy plus overhead exceed `MemAvailable` minus 4 GiB
-- **THEN** loading fails before any CUDA call, stating both numbers
-
-#### Scenario: Concurrent loads
-- **WHEN** two sparkforge loads of 14 GiB start together with 20 GiB available
-- **THEN** the second waits until the first has allocated, then is refused
-
-#### Scenario: Loads by two users
-- **WHEN** the node-wide lock is provisioned and two different users start loads
-- **THEN** both use the same lock, so the second waits for the first
-
-#### Scenario: Lock open to every account
-- **WHEN** the node-wide lock file grants access to every account
-- **THEN** admission refuses it, naming the mode, instead of letting any account hold it
-
-#### Scenario: Lock in the wrong group
-- **WHEN** the node-wide lock is mode 0640 but belongs to a group other than `sparkforge`
-- **THEN** admission refuses it, naming both groups
-
-#### Scenario: Lock opened to another account by an ACL
-- **WHEN** the node-wide lock is mode 0640 in group `sparkforge` but an ACL entry grants a named user read access
-- **THEN** admission refuses it, naming that user and saying to replace the file, since removing the ACL leaves descriptors already opened usable
-
-#### Scenario: Lock swapped before locking
-- **WHEN** the node lock passes discovery and is then replaced by a file any account can open, or one with a named ACL entry
-- **THEN** admission refuses it, because the checks run again on the descriptor it locks
-
-#### Scenario: Lock being replaced
-- **WHEN** `/run/sparkforge` exists but `admission.lock` is missing, as during its repair
-- **THEN** loads refuse instead of falling back to the user lock
-
-#### Scenario: Lock closed for repair
-- **WHEN** an administrator closes the node lock to its group (mode 0600) before replacing it
-- **THEN** a load that can't open it refuses, saying a repair is under way, instead of suggesting the account join the group
-
-#### Scenario: Waiting on a replaced lock
-- **WHEN** a load is waiting on the node lock and the file is replaced before it gets the lock
-- **THEN** once it gets the old file's lock it sees the path names a new file and waits on that one, so it is never admitted alongside a load holding the new file
-
-#### Scenario: Upgrade from a custom runtime directory
-- **WHEN** a lock file the loader before SHA-765 used exists in `/run/user/<uid>`, a custom `$XDG_RUNTIME_DIR` or the temp directory
-- **THEN** admission neither takes nor creates it; upgrading from that loader drains running loads first
-
-#### Scenario: One lock under two spellings
-- **WHEN** two lock entries given to admission name the same file
-- **THEN** it is locked once, instead of the second waiting on this process's own first lock
-
-#### Scenario: Second load during verification
-- **WHEN** a second `verify-weights` starts while the first is copying or verifying, with room for only one
-- **THEN** it waits until the first has freed its memory, then is admitted
-
-#### Scenario: Login during a load
-- **WHEN** a user's load is admitted and a login then creates that user's runtime directory
-- **THEN** the user's next load waits on the same lock
-
-#### Scenario: Memory used after admission
-- **WHEN** `MemAvailable` drops below the guard between admission and upload
-- **THEN** the upload refuses before allocating
-
-#### Scenario: Wide vocabulary
-- **WHEN** `verify-weights` checks Llama 3.1 8B's `lm_head` (1.05 GB of weights)
-- **THEN** the process's peak host memory stays bounded (measured 225 MB) instead of scaling with the tensor
-
 ### Requirement: Loaded weights are verified on the GPU
 
 `sparkforge verify-weights <checkpoint>` SHALL run the generated GEMV for every linear of the first
@@ -289,3 +217,59 @@ lift this refusal.
 #### Scenario: Quantized tensors behind a BF16 config
 - **WHEN** a config without `quantization_config` is bound to a checkpoint whose `o_proj` is F8_E4M3 with a scale tensor
 - **THEN** binding fails before GPU work, naming the tensor and its dtype
+
+### Requirement: Loads never exhaust host memory on a single-account node
+
+A load SHALL be refused before any CUDA call if its copied bytes, staging buffer and, when
+verifying, reference scratch exceed `MemAvailable` minus 4 GiB, and rechecked before allocating.
+Admission SHALL be held until that memory is allocated, or freed after verification, and
+serialized through one lock per account, under the home directory from the password database.
+sparkforge assumes one account runs it per node.
+
+#### Scenario: Too large to copy
+- **WHEN** the bytes to copy plus overhead exceed `MemAvailable` minus 4 GiB
+- **THEN** loading fails before any CUDA call, stating both numbers
+
+#### Scenario: Concurrent loads
+- **WHEN** two sparkforge loads of 14 GiB start together with 20 GiB available
+- **THEN** the second waits until the first has allocated, then is refused
+
+#### Scenario: Second load during verification
+- **WHEN** a second `verify-weights` starts while the first is copying or verifying, with room for only one
+- **THEN** it waits until the first has freed its memory, then is admitted
+
+#### Scenario: Login during a load
+- **WHEN** a load is admitted and a login then creates the account's runtime directory
+- **THEN** the next load waits on the same lock, which depends only on the home directory
+
+#### Scenario: Lock location from ownership
+- **WHEN** the account has no password-database home, or its lock directory is writable by others
+- **THEN** admission refuses instead of using an environment variable or a shared temp path
+
+#### Scenario: Stuck holder
+- **WHEN** another process holds the lock for 30 minutes
+- **THEN** the waiting load fails naming the lock instead of hanging
+
+#### Scenario: Holder released after the wait
+- **WHEN** the lock was found held and is released only after the wait limit has passed
+- **THEN** the waiting load times out instead of being admitted late
+
+#### Scenario: Lock replaced while waiting
+- **WHEN** a load waits on the lock file and the file is replaced before it gets the lock
+- **THEN** it locks the new file within the same deadline, so it is never admitted alongside a load holding the new file
+
+#### Scenario: Upgrade from a loader before SHA-765
+- **WHEN** sparkforge is upgraded from any earlier version, including one that locked in `/run/user/<uid>`, `$XDG_RUNTIME_DIR`, the temp directory or `/run/sparkforge`
+- **THEN** running loads are drained first, since an earlier version may hold a lock this one doesn't take
+
+#### Scenario: State directory deleted during a load
+- **WHEN** the account deletes the lock file or `~/.local/state/sparkforge` while a load is admitted
+- **THEN** that is unsupported: a load started afterwards locks a new file and isn't coordinated with the admitted one, so the directory must not be removed while sparkforge runs
+
+#### Scenario: Memory used after admission
+- **WHEN** `MemAvailable` drops below the guard between admission and upload
+- **THEN** the upload refuses before allocating
+
+#### Scenario: Wide vocabulary
+- **WHEN** `verify-weights` checks Llama 3.1 8B's `lm_head` (1.05 GB of weights)
+- **THEN** the process's peak host memory stays bounded (measured 225 MB) instead of scaling with the tensor
