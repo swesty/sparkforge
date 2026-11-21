@@ -101,10 +101,10 @@ fn build(c: &Common) -> Result<plan::Plan> {
         Fmt::W4a16 => Some(WeightFormat::W4A16 { group: 128 }),
         Fmt::Nvfp4 => Some(WeightFormat::Nvfp4),
     };
-    let mut spec = ModelSpec::from_json(&std::fs::read_to_string(&c.config)?, fmt)?;
+    let text = std::fs::read_to_string(&c.config)?;
+    let mut spec = ModelSpec::from_json(&text, fmt)?;
     if let Some(dir) = &c.checkpoint {
-        let names = sparkforge::weights::tensor_names(&sparkforge::weights::resolve_checkpoint_dir(dir)?)?;
-        spec.resolve_modules(names.iter().map(String::as_str))?;
+        sparkforge::weights::resolve_with_checkpoint(&mut spec, &text, &sparkforge::weights::resolve_checkpoint_dir(dir)?)?;
     }
     Ok(plan::build(&spec, &GB10, &plan::PlanOpts { prefill_tokens: c.prefill_tokens, ctx: c.ctx }))
 }

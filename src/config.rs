@@ -1,7 +1,7 @@
 //! Hugging Face `config.json` -> normalized ModelSpec.
 use anyhow::{bail, ensure, Context, Result};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Debug, Deserialize)]
 struct RawLayerQuant {
@@ -592,6 +592,13 @@ impl ModelSpec {
         // Read from the raw strings, independently of format detection, so an override never
         // hides that the checkpoint itself is mixed precision.
         // Either level declaring mixed precision is enough: an override never hides it.
+        if r.tie_word_embeddings {
+            // A tied head is the embedding matrix: entries for both must agree.
+            let at = |name: &str| formats.modules.iter().find(|(k, _)| strip_text_prefix(k) == name).map(|(k, f)| (k.clone(), *f));
+            if let (Some((hk, h)), Some((ek, e))) = (at("lm_head"), at("embed_tokens")) {
+                ensure!(h == e, "quantized_layers lists {hk} as {h:?} and {ek} as {e:?}, but the head is tied to the embedding: one matrix has one format");
+            }
+        }
         let is_mixed = |q: &serde_json::Value| {
             q.get("quant_method").and_then(|v| v.as_str()) == Some("modelopt")
                 && q.get("quant_algo").and_then(|v| v.as_str()) == Some("MIXED_PRECISION")
@@ -625,9 +632,37 @@ impl ModelSpec {
     /// Resolves `formats` onto the modules of a checkpoint, given its tensor names: each entry
     /// applies to the modules at or under its path, entries that cover one module must agree, and
     /// entries that cover none are reported as unused instead of matching by pattern.
+    ///
+    /// For a hybrid model it also checks what the planner relies on: the checkpoint's MTP layer
+    /// indices are exactly the configured ones, every group the planner prices as one format (a
+    /// layer's routed experts, the PLE table, the MTP experts) has one format, and a tied head
+    /// isn't given a format other than the embedding's (codex-review of #17).
     pub fn resolve_modules<'a>(&mut self, names: impl IntoIterator<Item = &'a str>) -> Result<()> {
         let table = crate::modules::ModuleTable::from_tensor_names(names);
-        self.resolved = Some(crate::modules::resolve(&self.formats, table)?);
+        let r = crate::modules::resolve(&self.formats, table)?;
+        if let Some(h) = &self.hybrid {
+            let live: BTreeSet<u32> = r.table.children("mtp.layers").into_iter()
+                .map(|n| n.parse::<u32>().with_context(|| format!("the checkpoint has an MTP module under mtp.layers.{n}, which is not a layer index")))
+                .collect::<Result<_>>()?;
+            let want: BTreeSet<u32> = (0..h.mtp_layers).collect();
+            ensure!(live == want, "the checkpoint holds MTP layer(s) {live:?}, but the config has {} MTP layer(s) ({want:?}); the draft layers can't be priced unambiguously", h.mtp_layers);
+            let mut groups: Vec<String> = (0..h.schedule.len()).map(|i| format!("layers.{i}.mlp.experts")).collect();
+            groups.extend((0..h.mtp_layers).map(|i| format!("mtp.layers.{i}.mlp.experts")));
+            groups.extend(h.ple.layer_ids.iter().flat_map(|&p| [Some(p), p.checked_sub(1)]).flatten()
+                .map(|n| format!("layers.{n}.ple.ple_embedding.ngram_embedding")));
+            for g in &groups {
+                let fs = r.formats_at(g, self.weights);
+                ensure!(fs.len() <= 1, "the planner prices {g} as one format, but the checkpoint's modules there have {}; mixed formats inside one group are not supported",
+                    fs.iter().map(|(f, n)| format!("{f:?} ({n} modules)")).collect::<Vec<_>>().join(" and "));
+            }
+        }
+        if self.tie_embeddings {
+            let (head, embed) = (r.format_at("lm_head", self.weights), r.format_at("embed_tokens", WeightFormat::Bf16));
+            if let (Some(h), Some(e)) = (head, embed) {
+                ensure!(h == e, "the head is tied to the embedding, but the checkpoint gives lm_head {h:?} and embed_tokens {e:?}; one matrix has one format");
+            }
+        }
+        self.resolved = Some(r);
         Ok(())
     }
 

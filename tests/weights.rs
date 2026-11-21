@@ -1102,3 +1102,38 @@ fn a_blob_that_links_into_a_shared_store_is_followed_and_verified() {
     let err = format!("{:#}", Checkpoint::open(&snap).err().expect("mismatch"));
     assert!(err.contains("hash to"), "{err}");
 }
+
+// ---- SHA-785: codex-review cycle 1 follow-ups ----
+
+#[test]
+fn planning_from_an_index_applies_the_loaders_shard_name_rule() {
+    use sparkforge::weights::{resolve_checkpoint_dir, tensor_names};
+    let d = dir("names-escape");
+    for bad in [serde_json::json!("../outside.safetensors"), serde_json::json!("/abs/model.safetensors")] {
+        let mut map = serde_json::Map::new();
+        map.insert("model.embed_tokens.weight".into(), bad.clone());
+        write_index(&d, map);
+        let err = format!("{:#}", tensor_names(&resolve_checkpoint_dir(&d).unwrap()).unwrap_err());
+        assert!(err.contains("not a plain relative path"), "{bad}: {err}");
+    }
+    let mut map = serde_json::Map::new();
+    map.insert("model.embed_tokens.weight".into(), serde_json::json!(7));
+    write_index(&d, map);
+    assert!(tensor_names(&resolve_checkpoint_dir(&d).unwrap()).is_err(), "a non-string shard reference");
+}
+
+#[test]
+fn a_plan_config_must_be_the_checkpoints_own() {
+    // `plan <config> --checkpoint <dir>` reads the checkpoint's config.json through the opened
+    // directory; a config from another generation is refused instead of being mixed with this
+    // checkpoint's modules.
+    use sparkforge::weights::{resolve_checkpoint_dir, resolve_with_checkpoint};
+    let d = single("cfg-match", bf16(tensors(false)));
+    let ours = CFG.replace("TIE", "false");
+    std::fs::write(d.join("config.json"), &ours).unwrap();
+    let mut s = spec(false);
+    resolve_with_checkpoint(&mut s, &ours, &resolve_checkpoint_dir(&d).unwrap()).unwrap();
+    let other = CFG.replace("TIE", "false").replace("\"vocab_size\": 64", "\"vocab_size\": 65");
+    let err = format!("{:#}", resolve_with_checkpoint(&mut spec(false), &other, &resolve_checkpoint_dir(&d).unwrap()).unwrap_err());
+    assert!(err.contains("differs from"), "{err}");
+}

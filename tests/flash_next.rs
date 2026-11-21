@@ -682,3 +682,78 @@ fn a_tied_head_has_the_embedding_format_and_one_resident_copy() {
         assert!(!unused_entries(&p).contains(&"model.language_model.embed_tokens".to_string()), "{label}");
     }
 }
+
+// ---- SHA-785: codex-review cycle 1 follow-ups ----
+
+fn resolved_with(v: &Value, extra: &[&str]) -> anyhow::Result<ModelSpec> {
+    let mut s = spec_of(v)?;
+    let mut names = checkpoint_names(&s);
+    names.extend(extra.iter().map(|e| e.to_string()));
+    s.resolve_modules(names.iter().map(String::as_str))?;
+    Ok(s)
+}
+
+#[test]
+fn a_tied_head_entry_that_disagrees_with_the_embedding_is_rejected() {
+    let mut v = raw();
+    v["tie_word_embeddings"] = json!(true);
+    if let Some(t) = v.get_mut("text_config") { t["tie_word_embeddings"] = json!(true); }
+    ql(&mut v).insert("model.language_model.embed_tokens".into(), json!({"quant_algo": "MXFP8", "group_size": 32}));
+    ql(&mut v).insert("lm_head".into(), json!({"quant_algo": "NVFP4", "group_size": 16}));
+    let err = format!("{:#}", spec_of(&v).unwrap_err());
+    assert!(err.contains("tied") && err.contains("lm_head") && err.contains("embed_tokens"), "config: {err}");
+    // From a checkpoint that also holds an lm_head tensor, the same conflict is caught on resolve.
+    ql(&mut v).remove("lm_head");
+    let mut s = spec_of(&v).unwrap();
+    let mut names = checkpoint_names(&s);
+    names.push("lm_head.weight".into());
+    s.formats.modules.insert("lm_head".into(), WeightFormat::Nvfp4);
+    let err = format!("{:#}", s.resolve_modules(names.iter().map(String::as_str)).unwrap_err());
+    assert!(err.contains("tied") && err.contains("one format"), "checkpoint: {err}");
+}
+
+#[test]
+fn a_ple_table_split_across_formats_is_rejected() {
+    // The planner prices the table as one format. One shard declared MXFP8 and another left at
+    // the default is a table it can't price, so resolution refuses it instead of collapsing it.
+    let mut v = raw();
+    ql(&mut v).remove("model.language_model.layers.1.ple.ple_embedding.ngram_embedding").unwrap();
+    ql(&mut v).insert("model.language_model.layers.1.ple.ple_embedding.ngram_embedding.shard_0".into(), json!({"quant_algo": "MXFP8", "group_size": 32}));
+    let err = format!("{:#}", resolved_with(&v, &["model.language_model.layers.1.ple.ple_embedding.ngram_embedding.shard_1.weight"]).unwrap_err());
+    assert!(err.contains("ngram_embedding") && err.contains("mixed formats"), "{err}");
+}
+
+#[test]
+fn checkpoint_mtp_layers_must_be_the_configured_ones() {
+    // An extra live index (mtp.layers.48 tensors beside the one configured layer) is diagnosed
+    // instead of letting its default format reprice layer 0.
+    let mut v = raw();
+    ql(&mut v).insert("mtp.layers.0.self_attn.v_proj".into(), json!({"quant_algo": "MXFP8", "group_size": 32}));
+    let err = format!("{:#}", resolved_with(&v, &["mtp.layers.48.self_attn.v_proj.weight"]).unwrap_err());
+    assert!(err.contains("MTP layer") && err.contains("48"), "{err}");
+    assert!(resolved_with(&v, &[]).is_ok());
+}
+
+#[test]
+fn an_entry_whose_modules_the_plan_never_prices_is_reported() {
+    // The vision tower's experts exist in the checkpoint, so the entry covers modules, but no
+    // text op uses them: it is still reported as unused, and text layer 0's experts keep NVFP4.
+    let mut v = raw();
+    ql(&mut v).insert("model.visual.layers.0.mlp.experts".into(), json!({"quant_algo": "MXFP8", "group_size": 32}));
+    let base = plan_of(&resolved(&raw()).unwrap());
+    let p = plan_of(&resolved_with(&v, &["model.visual.layers.0.mlp.experts.0.up_proj.weight"]).unwrap());
+    assert!(unused_entries(&p).contains(&"model.visual.layers.0.mlp.experts".to_string()), "{:#?}", p.notes);
+    assert_eq!(p.budget.weight_gib, base.budget.weight_gib);
+}
+
+#[test]
+fn the_embedding_stays_bf16_whatever_the_general_weight_format() {
+    // `--format nvfp4` sets the linears' format; the embedding table stays BF16 unless an entry
+    // quantizes it, in its resident bytes and its decode gather.
+    let s = ModelSpec::from_json(&raw().to_string(), Some(WeightFormat::Nvfp4)).unwrap();
+    assert_eq!(s.weights, WeightFormat::Nvfp4);
+    let p = plan_of(&s);
+    let gather = p.ops.iter().find(|o| o.name == "embed_gather").unwrap();
+    assert_eq!(gather.format, Some(WeightFormat::Bf16));
+    assert!((gather.bytes_per_token - 2560.0 * 2.0).abs() < 1e-9, "{}", gather.bytes_per_token);
+}

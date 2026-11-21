@@ -168,6 +168,12 @@ pub struct Formats<'a> {
 impl<'a> Formats<'a> {
     pub fn new(m: &'a ModelSpec) -> Self { Formats { m, used: RefCell::new(BTreeSet::new()) } }
 
+    /// The format of the checkpoint modules at `path`, marking the entries that cover them as used.
+    fn at(&self, r: &crate::modules::ResolvedFormats, path: &str, default: WeightFormat) -> Option<WeightFormat> {
+        self.used.borrow_mut().extend(r.entries_at(path).into_iter().map(str::to_owned));
+        r.format_at(path, default)
+    }
+
     /// Every matching entry counts as used (a map can list one module under two paths). Matches
     /// that disagree resolve to the largest format.
     fn find(&self, pred: impl Fn(&str) -> bool) -> Option<WeightFormat> {
@@ -184,7 +190,7 @@ impl<'a> Formats<'a> {
     pub fn layer(&self, layer: u32, rel: &str) -> WeightFormat {
         let tail = format!("layers.{layer}.{rel}");
         if let Some(r) = &self.m.resolved {
-            return r.format_at(&tail, self.m.weights).unwrap_or(self.m.weights);
+            return self.at(r, &tail, self.m.weights).unwrap_or(self.m.weights);
         }
         self.find(|k| TEXT_PREFIXES.iter().any(|p| k.strip_prefix(p) == Some(tail.as_str()))).unwrap_or(self.m.weights)
     }
@@ -208,13 +214,14 @@ impl<'a> Formats<'a> {
     /// holds; without one, only indices below the configured MTP layer count, so a stale entry such
     /// as `mtp.layers.999.<rel>` never prices the real draft layer.
     pub fn mtp(&self, rel: &str) -> WeightFormat {
+        let layers = self.m.hybrid.as_ref().map_or(0, |h| h.mtp_layers);
         if let Some(r) = &self.m.resolved {
-            return r.table.children("mtp.layers").into_iter()
-                .filter_map(|n| r.format_at(&format!("mtp.layers.{n}.{rel}"), self.m.weights))
+            // `resolve_modules` checked that the checkpoint's MTP indices are exactly 0..layers.
+            return (0..layers)
+                .filter_map(|n| self.at(r, &format!("mtp.layers.{n}.{rel}"), self.m.weights))
                 .reduce(|a, b| if b.bytes_per_elem() > a.bytes_per_elem() { b } else { a })
                 .unwrap_or(self.m.weights);
         }
-        let layers = self.m.hybrid.as_ref().map_or(0, |h| h.mtp_layers);
         // Exactly `mtp.layers.<n>.<rel>`, so `mtp.layers.0.aux.<rel>` is not the module.
         self.find(|k| {
             k.strip_prefix("mtp.layers.")
@@ -238,7 +245,7 @@ impl<'a> Formats<'a> {
             let mut paths = layers.clone();
             paths.push(want.clone());
             if bare { paths.push(rel.to_owned()); }
-            return paths.iter().filter_map(|p| r.format_at(p, self.m.weights))
+            return paths.iter().filter_map(|p| self.at(r, p, self.m.weights))
                 .reduce(|a, b| if b.bytes_per_elem() > a.bytes_per_elem() { b } else { a })
                 .unwrap_or(self.m.weights);
         }
@@ -248,34 +255,32 @@ impl<'a> Formats<'a> {
     }
 
     /// Format of the output head, at its model-level paths (`lm_head`, `model.lm_head`, ...),
-    /// never by suffix inside a layer. A tied head is the embedding matrix, so it has the
-    /// embedding's format (codex-review of swesty/sparkforge#10).
+    /// never by suffix inside a layer. A tied head is the embedding matrix, so it always has the
+    /// embedding's format; a conflicting `lm_head` entry is rejected when the spec is parsed or
+    /// resolved (codex-review of swesty/sparkforge#10 and #17).
     pub fn head(&self) -> WeightFormat {
+        if self.m.tie_embeddings {
+            return self.embed();
+        }
         if let Some(r) = &self.m.resolved {
-            if let Some(f) = r.format_at("lm_head", self.m.weights) {
-                return f;
-            }
-            return if self.m.tie_embeddings { self.embed() } else { self.m.weights };
+            return self.at(r, "lm_head", self.m.weights).unwrap_or(self.m.weights);
         }
-        match self.find(|k| TEXT_PREFIXES.iter().any(|p| k.strip_prefix(p) == Some("lm_head"))) {
-            Some(f) => f,
-            None if self.m.tie_embeddings => self.embed(),
-            None => self.m.weights,
-        }
+        self.find(|k| TEXT_PREFIXES.iter().any(|p| k.strip_prefix(p) == Some("lm_head"))).unwrap_or(self.m.weights)
     }
 
-    /// Format of the input embedding (`embed_tokens` under a text prefix).
+    /// Format of the input embedding (`embed_tokens` under a text prefix). BF16 unless an entry
+    /// covers it: the general weight format (`ModelSpec::weights`, for example from `--format`)
+    /// describes the linears, not the embedding table.
     pub fn embed(&self) -> WeightFormat {
         if let Some(r) = &self.m.resolved {
-            return r.format_at("embed_tokens", self.m.weights).unwrap_or(self.m.weights);
+            return self.at(r, "embed_tokens", WeightFormat::Bf16).unwrap_or(WeightFormat::Bf16);
         }
-        self.find(|k| TEXT_PREFIXES.iter().any(|p| k.strip_prefix(p) == Some("embed_tokens"))).unwrap_or(self.m.weights)
+        self.find(|k| TEXT_PREFIXES.iter().any(|p| k.strip_prefix(p) == Some("embed_tokens"))).unwrap_or(WeightFormat::Bf16)
     }
 
+    /// Map entries no lookup used: with a checkpoint, those that cover no module plus those whose
+    /// modules the plan never prices (for example a vision tower's).
     pub fn unused(&self) -> Vec<String> {
-        if let Some(r) = &self.m.resolved {
-            return r.unused.clone();
-        }
         let used = self.used.borrow();
         self.m.formats.modules.keys().filter(|k| !used.contains(*k)).cloned().collect()
     }

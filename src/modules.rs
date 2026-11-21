@@ -87,6 +87,11 @@ impl ResolvedFormats {
         out
     }
 
+    /// The map entries that cover the modules at `path` or under it.
+    pub fn entries_at(&self, path: &str) -> BTreeSet<&str> {
+        self.table.covered(path).filter_map(|m| self.by_module.get(m)).map(|(_, e)| e.as_str()).collect()
+    }
+
     /// One format for the modules at `path`: the largest when they differ (the budget then never
     /// undercounts), `None` when no module exists there.
     pub fn format_at(&self, path: &str, default: WeightFormat) -> Option<WeightFormat> {
