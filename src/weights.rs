@@ -1026,17 +1026,34 @@ fn open_lock(path: &Path) -> Result<File> {
 /// - Once the lock has been found held, an acquisition after the deadline is a timeout too, so a
 ///   holder that outlasts `wait` never leads to an admission.
 /// - After the lock is taken, the path must still name the locked file. If the file was replaced
-///   while this load waited (for example the account cleaned up its state directory), the load
-///   locks the new file instead, within the same deadline, so two loads never hold different files
-///   at once (codex-review of #16).
+///   before this load got it, the load locks the new file instead, within the same deadline
+///   (codex-review of #16).
+/// - Deleting the lock file, or `~/.local/state/sparkforge`, while a load is admitted is not
+///   supported: no lock survives its own deletion, so a load started afterwards locks a new file
+///   and isn't coordinated with the admitted one. Nothing on the Sparks deletes that directory;
+///   don't remove it while sparkforge runs.
 pub fn admit(lock: &Path, copy_bytes: u64, overhead: u64, mem: impl Fn() -> Option<u64>, wait: std::time::Duration) -> Result<Admission> {
-    admit_observed(lock, copy_bytes, overhead, mem, wait, &|| {})
+    admit_with(lock, copy_bytes, overhead, mem, wait, &AdmitHooks::default())
 }
 
-/// `admit`, calling `on_wait` the first time each opened lock file is found held (a test seam: it
-/// proves which file a waiting load opened).
+/// Test seams for `admit_with`: `on_wait` runs the first time each opened lock file is found held
+/// (it proves which file a waiting load opened), and `sleep` replaces the pause between attempts
+/// (so a test can release the lock at an exact point).
 #[doc(hidden)]
-pub fn admit_observed(lock: &Path, copy_bytes: u64, overhead: u64, mem: impl Fn() -> Option<u64>, wait: std::time::Duration, on_wait: &dyn Fn()) -> Result<Admission> {
+pub struct AdmitHooks<'a> {
+    pub on_wait: &'a dyn Fn(),
+    pub sleep: &'a dyn Fn(std::time::Duration),
+}
+
+impl Default for AdmitHooks<'_> {
+    fn default() -> Self {
+        AdmitHooks { on_wait: &|| {}, sleep: &std::thread::sleep }
+    }
+}
+
+/// `admit` with test seams.
+#[doc(hidden)]
+pub fn admit_with(lock: &Path, copy_bytes: u64, overhead: u64, mem: impl Fn() -> Option<u64>, wait: std::time::Duration, hooks: &AdmitHooks) -> Result<Admission> {
     let deadline = std::time::Instant::now() + wait;
     let timeout = || anyhow::anyhow!("gave up after {} s waiting for the admission lock {}; another process has held it that long", wait.as_secs(), lock.display());
     let mut contended = false;
@@ -1051,14 +1068,14 @@ pub fn admit_observed(lock: &Path, copy_bytes: u64, overhead: u64, mem: impl Fn(
                         if !contended {
                             eprintln!("waiting for another sparkforge load to finish allocating ({})", lock.display());
                         }
-                        on_wait();
+                        (hooks.on_wait)();
                         told = true;
                         contended = true;
                     }
                     if std::time::Instant::now() >= deadline {
                         return Err(timeout());
                     }
-                    std::thread::sleep(std::time::Duration::from_millis(20));
+                    (hooks.sleep)(std::time::Duration::from_millis(20));
                 }
                 Err(std::fs::TryLockError::Error(e)) => return Err(e).with_context(|| format!("locking {}", lock.display())),
             }

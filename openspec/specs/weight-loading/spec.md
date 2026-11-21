@@ -259,8 +259,12 @@ sparkforge assumes one account runs it per node.
 - **THEN** it locks the new file within the same deadline, so it is never admitted alongside a load holding the new file
 
 #### Scenario: Upgrade from a loader before SHA-765
-- **WHEN** sparkforge is upgraded from a loader that took its lock in `/run/user/<uid>`, `$XDG_RUNTIME_DIR` or the temp directory
-- **THEN** running loads are drained first; the new loader doesn't take that lock, so an old load still allocating isn't coordinated with
+- **WHEN** sparkforge is upgraded from any earlier version, including one that locked in `/run/user/<uid>`, `$XDG_RUNTIME_DIR`, the temp directory or `/run/sparkforge`
+- **THEN** running loads are drained first, since an earlier version may hold a lock this one doesn't take
+
+#### Scenario: State directory deleted during a load
+- **WHEN** the account deletes the lock file or `~/.local/state/sparkforge` while a load is admitted
+- **THEN** that is unsupported: a load started afterwards locks a new file and isn't coordinated with the admitted one, so the directory must not be removed while sparkforge runs
 
 #### Scenario: Memory used after admission
 - **WHEN** `MemAvailable` drops below the guard between admission and upload

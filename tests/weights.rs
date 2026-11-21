@@ -1019,20 +1019,28 @@ fn blobs_verify_on_the_calling_thread_when_no_worker_can_be_made() {
 #[cfg(unix)]
 #[test]
 fn a_holder_that_outlasts_the_wait_never_leads_to_an_admission() {
-    // The holder releases after the 10 ms wait but before the 20 ms retry: the retry would get the
-    // lock, yet the deadline has passed, so admission times out.
-    use sparkforge::weights::admit;
+    // The first attempt finds the lock held. During the pause before the next attempt, the
+    // deadline passes and only then is the lock released, so the next attempt would get it.
+    // Admission still times out. The pause is the test's own, so the order is exact.
+    use sparkforge::weights::{admit_with, AdmitHooks};
+    use std::time::{Duration, Instant};
     let lock = dir("late-release").join("sparkforge-gpu-admission.lock");
     std::fs::write(&lock, b"").unwrap();
     let holder = std::fs::OpenOptions::new().read(true).write(true).open(&lock).unwrap();
     holder.lock().unwrap();
-    let release = std::thread::spawn(move || {
-        std::thread::sleep(std::time::Duration::from_millis(14));
-        drop(holder);
-    });
-    let err = format!("{:#}", admit(&lock, 0, 0, || Some(64 << 30), std::time::Duration::from_millis(10)).err().expect("deadline passed"));
-    release.join().unwrap();
+    let holder = std::sync::Mutex::new(Some(holder));
+    let wait = Duration::from_millis(10);
+    let start = Instant::now();
+    let pause = |_: Duration| {
+        while start.elapsed() <= wait {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        holder.lock().unwrap().take(); // released after the deadline, before the next attempt
+    };
+    let err = format!("{:#}", admit_with(&lock, 0, 0, || Some(64 << 30), wait, &AdmitHooks { on_wait: &|| {}, sleep: &pause })
+        .err().expect("the deadline passed while the lock was held"));
     assert!(err.contains("gave up after"), "{err}");
+    assert!(holder.lock().unwrap().is_none(), "the lock was released before the last attempt");
 }
 
 #[cfg(unix)]
@@ -1042,7 +1050,7 @@ fn a_load_waiting_on_a_replaced_lock_moves_to_the_new_file() {
     // file). The file is replaced and load C takes the new one. When A finishes, B gets the old
     // file's lock, sees the path now names a new file, and waits on C instead of being admitted
     // alongside it.
-    use sparkforge::weights::admit_observed;
+    use sparkforge::weights::{admit_with, AdmitHooks};
     use std::time::Duration;
     let lock = dir("relock").join("sparkforge-gpu-admission.lock");
     std::fs::write(&lock, b"").unwrap();
@@ -1053,9 +1061,10 @@ fn a_load_waiting_on_a_replaced_lock_moves_to_the_new_file() {
     let tx = std::sync::Mutex::new(tx);
     let path = lock.clone();
     let b = std::thread::spawn(move || {
-        admit_observed(&path, 0, 0, || Some(64 << 30), Duration::from_secs(20), &|| {
+        let on_wait = || {
             let _ = tx.lock().unwrap().send(());
-        }).map(|_held| ())
+        };
+        admit_with(&path, 0, 0, || Some(64 << 30), Duration::from_secs(20), &AdmitHooks { on_wait: &on_wait, sleep: &std::thread::sleep }).map(|_held| ())
     });
     rx.recv_timeout(Duration::from_secs(10)).expect("B reports waiting on the old file");
     std::fs::remove_file(&lock).unwrap();
