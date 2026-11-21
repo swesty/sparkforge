@@ -1137,3 +1137,25 @@ fn a_plan_config_must_be_the_checkpoints_own() {
     let err = format!("{:#}", resolve_with_checkpoint(&mut spec(false), &other, &resolve_checkpoint_dir(&d).unwrap()).unwrap_err());
     assert!(err.contains("differs from"), "{err}");
 }
+
+#[cfg(unix)]
+#[test]
+fn a_blob_link_out_of_the_shared_store_is_refused_before_opening() {
+    // Only `../../blobs/<xx>/<name>` is followed, inside the cache's shared store. A blob linking
+    // anywhere else (here an absolute path to a valid shard) is refused without opening it.
+    let hub = std::fs::canonicalize(dir("hf-escape")).unwrap();
+    let outside = std::fs::canonicalize(dir("hf-escape-outside")).unwrap();
+    write_shard(&outside.join("private.safetensors"), &bf16(tensors(false)), 0);
+    let repo = hub.join("models--org--name");
+    let (blobs, snap) = (repo.join("blobs"), repo.join("snapshots/rev"));
+    std::fs::create_dir_all(&blobs).unwrap();
+    std::fs::create_dir_all(&snap).unwrap();
+    std::fs::create_dir_all(hub.join("blobs")).unwrap();
+    std::os::unix::fs::symlink(format!("../../blobs/{}", hf_blob()), snap.join("model.safetensors")).unwrap();
+    for target in [outside.join("private.safetensors").display().to_string(), "../../blobs/ab/../../x".into(), "../../other/ab/x".into(), "../../blobs/abc/x".into()] {
+        let _ = std::fs::remove_file(blobs.join(hf_blob()));
+        std::os::unix::fs::symlink(&target, blobs.join(hf_blob())).unwrap();
+        let err = format!("{:#}", Checkpoint::open(&snap).err().expect("escaping chain"));
+        assert!(err.contains("only into the cache's shared store"), "{target}: {err}");
+    }
+}

@@ -66,19 +66,35 @@ impl ModuleTable {
 #[derive(Debug, Clone, Default)]
 pub struct ResolvedFormats {
     pub table: ModuleTable,
-    /// Format of every module some entry covers, with the entry that set it.
-    by_module: BTreeMap<String, (WeightFormat, String)>,
+    /// Format of every module some entry covers, with every (agreeing) entry that covers it.
+    by_module: BTreeMap<String, (WeightFormat, Vec<String>)>,
     /// Map entries that cover no module of the checkpoint (stale indices, paths of another layout).
     pub unused: Vec<String>,
 }
 
 impl ResolvedFormats {
-    /// The formats of the modules at `path` or under it: `(format, count)` per distinct format,
-    /// with `default` for modules no entry covers. Empty when no module exists there.
+    /// The format of one module, `default` when no entry covers it.
+    pub fn format_of(&self, module: &str, default: WeightFormat) -> WeightFormat {
+        self.by_module.get(module).map_or(default, |(f, _)| *f)
+    }
+
+    /// The modules a lookup of `path` prices: the module at exactly `path` when the checkpoint
+    /// has one (a projection: tensors kept under it, such as an observer's, don't reprice it),
+    /// else every module under it (a group such as a layer's routed experts or a sharded table).
+    pub fn priced<'s>(&'s self, path: &'s str) -> Vec<&'s str> {
+        if self.table.covered(path).next() == Some(path) {
+            vec![path]
+        } else {
+            self.table.covered(path).collect()
+        }
+    }
+
+    /// The formats of the modules a lookup of `path` prices (see `priced`): `(format, count)` per
+    /// distinct format, with `default` for modules no entry covers. Empty when no module exists.
     pub fn formats_at(&self, path: &str, default: WeightFormat) -> Vec<(WeightFormat, usize)> {
         let mut out: Vec<(WeightFormat, usize)> = vec![];
-        for m in self.table.covered(path) {
-            let f = self.by_module.get(m).map_or(default, |(f, _)| *f);
+        for m in self.priced(path) {
+            let f = self.format_of(m, default);
             match out.iter_mut().find(|(g, _)| *g == f) {
                 Some(g) => g.1 += 1,
                 None => out.push((f, 1)),
@@ -87,13 +103,28 @@ impl ResolvedFormats {
         out
     }
 
-    /// The map entries that cover the modules at `path` or under it.
-    pub fn entries_at(&self, path: &str) -> BTreeSet<&str> {
-        self.table.covered(path).filter_map(|m| self.by_module.get(m)).map(|(_, e)| e.as_str()).collect()
+    /// The formats of every module at or under `path`, for checking that a group the planner
+    /// prices as one format really has one (`formats_at` would stop at a module at `path` itself,
+    /// such as a table's scalar global scale beside its shards).
+    pub fn formats_under(&self, path: &str, default: WeightFormat) -> Vec<(WeightFormat, usize)> {
+        let mut out: Vec<(WeightFormat, usize)> = vec![];
+        for m in self.table.covered(path) {
+            let f = self.format_of(m, default);
+            match out.iter_mut().find(|(g, _)| *g == f) {
+                Some(g) => g.1 += 1,
+                None => out.push((f, 1)),
+            }
+        }
+        out
     }
 
-    /// One format for the modules at `path`: the largest when they differ (the budget then never
-    /// undercounts), `None` when no module exists there.
+    /// Every map entry that covers a module a lookup of `path` prices.
+    pub fn entries_at(&self, path: &str) -> BTreeSet<&str> {
+        self.priced(path).into_iter().filter_map(|m| self.by_module.get(m)).flat_map(|(_, es)| es.iter().map(String::as_str)).collect()
+    }
+
+    /// One format for the modules a lookup of `path` prices: the largest when they differ (the
+    /// budget then never undercounts), `None` when no module exists there.
     pub fn format_at(&self, path: &str, default: WeightFormat) -> Option<WeightFormat> {
         self.formats_at(path, default)
             .into_iter()
@@ -104,7 +135,7 @@ impl ResolvedFormats {
 
 /// Applies each entry of `map` to the modules of `table` at or under its canonical path.
 pub fn resolve(map: &FormatMap, table: ModuleTable) -> Result<ResolvedFormats> {
-    let mut by_module: BTreeMap<String, (WeightFormat, String)> = BTreeMap::new();
+    let mut by_module: BTreeMap<String, (WeightFormat, Vec<String>)> = BTreeMap::new();
     let mut unused = vec![];
     for (entry, &f) in &map.modules {
         let covered: Vec<&str> = table.covered(canonical(entry)).collect();
@@ -113,13 +144,14 @@ pub fn resolve(map: &FormatMap, table: ModuleTable) -> Result<ResolvedFormats> {
             continue;
         }
         for m in covered {
-            match by_module.get(m) {
-                Some((g, other)) if *g != f => bail!(
-                    "quantized_layers lists {other} as {g:?} and {entry} as {f:?}; both cover the checkpoint module {m}: conflicting formats for one module"
+            match by_module.get_mut(m) {
+                Some((g, others)) if *g != f => bail!(
+                    "quantized_layers lists {} as {g:?} and {entry} as {f:?}; both cover the checkpoint module {m}: conflicting formats for one module",
+                    others[0]
                 ),
-                Some(_) => {}
+                Some((_, others)) => others.push(entry.clone()),
                 None => {
-                    by_module.insert(m.to_owned(), (f, entry.clone()));
+                    by_module.insert(m.to_owned(), (f, vec![entry.clone()]));
                 }
             }
         }

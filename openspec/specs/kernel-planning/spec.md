@@ -246,3 +246,19 @@ models.
 #### Scenario: Invalid shard reference in the index
 - **WHEN** the index names a shard by a parent or absolute path, or not by a string
 - **THEN** reading its tensor names fails as the loader would, without opening any shard
+
+#### Scenario: Model-level table split across formats
+- **WHEN** the PLE table lives at `ple_embedding.ngram_embedding` with one shard MXFP8 and one at the default
+- **THEN** resolution fails naming the table
+
+#### Scenario: Non-canonical MTP index
+- **WHEN** the checkpoint holds `mtp.layers.00` modules beside `mtp.layers.0`
+- **THEN** resolution fails naming `mtp.layers.00`
+
+#### Scenario: Tensors under a projection
+- **WHEN** layer 3's `q_proj` has no entry and an observer tensor under it is declared MXFP8
+- **THEN** `q_proj` keeps its default price and the observer entry is reported as unused
+
+#### Scenario: Agreeing parent and child entries
+- **WHEN** `layers.1.ple.ple_embedding` and its `ngram_embedding` child are both NVFP4
+- **THEN** neither entry is reported as unused

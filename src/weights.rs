@@ -102,6 +102,10 @@ pub struct CheckpointDir {
     /// beside a blob store it doesn't use.
     #[cfg(unix)]
     blobs: Option<std::result::Result<File, String>>,
+    /// The cache's shared, deduplicated store (`<repo>/../blobs`), when it exists. A blob may link
+    /// one hop into it, as `../../blobs/<xx>/<name>`, and nowhere else.
+    #[cfg(unix)]
+    shared: Option<File>,
 }
 
 impl CheckpointDir {
@@ -138,12 +142,21 @@ impl CheckpointDir {
                         LinkTarget::HfBlob(blob) => match &self.blobs {
                             Some(Ok(blobs)) => {
                                 blob_name = blob.to_str().map(str::to_owned);
-                                // The blob itself may be a link into a shared, deduplicated store
-                                // (spark-5's cache links `<repo>/blobs/<sha256>` on to
-                                // `hub/blobs/<xx>/<other id>`). Its bytes are verified against
-                                // the name, so following links from here can't yield another
-                                // generation's bytes.
-                                nofollow::cstr(&blob).and_then(|c| nofollow::open_file_following(blobs, &c))
+                                let c = nofollow::cstr(&blob)?;
+                                match nofollow::open_file(blobs, &c) {
+                                    // The blob may itself link one hop into the shared store
+                                    // (spark-5's cache links `<repo>/blobs/<sha256>` on to
+                                    // `hub/blobs/<xx>/<id>`), walked there without following any
+                                    // further link. Its bytes are verified against the name.
+                                    Err(e) if e.raw_os_error() == Some(libc::ELOOP) => {
+                                        let t = nofollow::readlink(blobs, &c).with_context(|| format!("reading the blob link behind {}", path.display()))?;
+                                        let (Some(rel), Some(shared)) = (shared_store_target(&t), &self.shared) else {
+                                            bail!("{} links to blob {}, which links on to {}; a blob may link only into the cache's shared store, as ../../blobs/<xx>/<name>", path.display(), blob.to_string_lossy(), t.display());
+                                        };
+                                        nofollow::walk(shared, &rel).and_then(|(d, l)| nofollow::open_file(&d, &l))
+                                    }
+                                    r => r,
+                                }
                             }
                             Some(Err(why)) => bail!("{} links into the blob store, but {why}", path.display()),
                             None => Err(std::io::Error::from(ErrorKind::NotFound)),
@@ -274,6 +287,21 @@ fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// `<xx>/<name>` when a blob's own link is exactly `../../blobs/<xx>/<name>`: a two-hex-digit
+/// shard directory of the shared store, then a plain name.
+#[cfg(unix)]
+fn shared_store_target(t: &Path) -> Option<PathBuf> {
+    let c: Vec<Component> = t.components().collect();
+    match c.as_slice() {
+        [Component::ParentDir, Component::ParentDir, Component::Normal(b), Component::Normal(xx), Component::Normal(name)]
+            if *b == "blobs" && xx.len() == 2 && xx.to_str().is_some_and(|x| x.bytes().all(|b| b.is_ascii_hexdigit())) && !name.is_empty() =>
+        {
+            Some(Path::new(xx).join(name))
+        }
+        _ => None,
+    }
+}
+
 /// Where a shard link's target lands, judged lexically from the link's own directory.
 #[cfg(unix)]
 #[derive(Debug, PartialEq, Eq)]
@@ -379,13 +407,6 @@ mod nofollow {
         openat(&parent, &last, DIR_FLAGS)
     }
 
-    /// Opens a file non-blocking, following symlinks: only for a target whose bytes are verified
-    /// afterwards (a Hugging Face blob, checked against its hash name).
-    pub fn open_file_following(dir: &File, name: &std::ffi::CStr) -> io::Result<File> {
-        let fd = unsafe { libc::openat(dir.as_raw_fd(), name.as_ptr(), libc::O_RDONLY | libc::O_NONBLOCK | libc::O_CLOEXEC) };
-        if fd < 0 { Err(io::Error::last_os_error()) } else { Ok(unsafe { File::from_raw_fd(fd) }) }
-    }
-
     /// Opens a file non-blocking; a symlink there fails with `ELOOP`.
     pub fn open_file(dir: &File, name: &std::ffi::CStr) -> io::Result<File> {
         openat(dir, name, libc::O_RDONLY | libc::O_NONBLOCK)
@@ -435,7 +456,7 @@ pub fn resolve_checkpoint_dir(dir: &Path) -> Result<CheckpointDir> {
         // O_NOFOLLOW: if the canonical entry became a symlink since `canonicalize`, fail.
         let open = |p: &Path| std::fs::OpenOptions::new().read(true).custom_flags(nofollow::DIR_FLAGS | libc::O_NOFOLLOW).open(p);
         let snapshot = path.parent().filter(|s| s.file_name().is_some_and(|n| n == "snapshots"));
-        let (fd, blobs) = match (snapshot.and_then(Path::parent), path.file_name()) {
+        let (fd, blobs, shared) = match (snapshot.and_then(Path::parent), path.file_name()) {
             // A Hugging Face snapshot: pin `<repo>` and open `snapshots/<rev>` and `blobs` downward
             // from it. Which bytes a blob link may yield is settled by `verify_blob`, not by this.
             (Some(repo), Some(rev)) => {
@@ -446,11 +467,12 @@ pub fn resolve_checkpoint_dir(dir: &Path) -> Result<CheckpointDir> {
                     std::io::ErrorKind::NotFound => format!("{} is missing", repo.join("blobs").display()),
                     _ => format!("{} cannot be opened as a real directory ({e})", repo.join("blobs").display()),
                 });
-                (fd, Some(blobs))
+                let shared = nofollow::open_dir(&repo_fd, Path::new("../blobs")).ok();
+                (fd, Some(blobs), shared)
             }
-            _ => (open(&path).with_context(|| format!("opening checkpoint directory {}", path.display()))?, None),
+            _ => (open(&path).with_context(|| format!("opening checkpoint directory {}", path.display()))?, None, None),
         };
-        Ok(CheckpointDir { path, fd, blobs })
+        Ok(CheckpointDir { path, fd, blobs, shared })
     }
     #[cfg(not(unix))]
     Ok(CheckpointDir { path })

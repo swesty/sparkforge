@@ -594,9 +594,13 @@ impl ModelSpec {
         // Either level declaring mixed precision is enough: an override never hides it.
         if r.tie_word_embeddings {
             // A tied head is the embedding matrix: entries for both must agree.
-            let at = |name: &str| formats.modules.iter().find(|(k, _)| strip_text_prefix(k) == name).map(|(k, f)| (k.clone(), *f));
-            if let (Some((hk, h)), Some((ek, e))) = (at("lm_head"), at("embed_tokens")) {
-                ensure!(h == e, "quantized_layers lists {hk} as {h:?} and {ek} as {e:?}, but the head is tied to the embedding: one matrix has one format");
+            // Every spelling of either name (`lm_head`, `model.lm_head`, ...) names the one matrix.
+            let mut seen: Option<(&String, WeightFormat)> = None;
+            for (k, f) in formats.modules.iter().filter(|(k, _)| matches!(strip_text_prefix(k), "lm_head" | "embed_tokens")) {
+                if let Some((other, g)) = seen {
+                    ensure!(g == *f, "quantized_layers lists {other} as {g:?} and {k} as {f:?}, but the head is tied to the embedding: one matrix has one format");
+                }
+                seen = Some((k, *f));
             }
         }
         let is_mixed = |q: &serde_json::Value| {
@@ -641,17 +645,22 @@ impl ModelSpec {
         let table = crate::modules::ModuleTable::from_tensor_names(names);
         let r = crate::modules::resolve(&self.formats, table)?;
         if let Some(h) = &self.hybrid {
+            // Canonical decimal indices only: the planner looks layers up as `mtp.layers.<n>`, so a
+            // `mtp.layers.00` beside `mtp.layers.0` would otherwise pass as index 0 and be ignored.
             let live: BTreeSet<u32> = r.table.children("mtp.layers").into_iter()
-                .map(|n| n.parse::<u32>().with_context(|| format!("the checkpoint has an MTP module under mtp.layers.{n}, which is not a layer index")))
+                .map(|n| n.parse::<u32>().ok().filter(|i| i.to_string() == n)
+                    .with_context(|| format!("the checkpoint has MTP modules under mtp.layers.{n}, which is not a canonical layer index")))
                 .collect::<Result<_>>()?;
             let want: BTreeSet<u32> = (0..h.mtp_layers).collect();
             ensure!(live == want, "the checkpoint holds MTP layer(s) {live:?}, but the config has {} MTP layer(s) ({want:?}); the draft layers can't be priced unambiguously", h.mtp_layers);
             let mut groups: Vec<String> = (0..h.schedule.len()).map(|i| format!("layers.{i}.mlp.experts")).collect();
             groups.extend((0..h.mtp_layers).map(|i| format!("mtp.layers.{i}.mlp.experts")));
+            // Every path the PLE table lookup accepts.
             groups.extend(h.ple.layer_ids.iter().flat_map(|&p| [Some(p), p.checked_sub(1)]).flatten()
                 .map(|n| format!("layers.{n}.ple.ple_embedding.ngram_embedding")));
+            groups.extend(["ple.ple_embedding.ngram_embedding".to_string(), "ple_embedding.ngram_embedding".to_string()]);
             for g in &groups {
-                let fs = r.formats_at(g, self.weights);
+                let fs = r.formats_under(g, self.weights);
                 ensure!(fs.len() <= 1, "the planner prices {g} as one format, but the checkpoint's modules there have {}; mixed formats inside one group are not supported",
                     fs.iter().map(|(f, n)| format!("{f:?} ({n} modules)")).collect::<Vec<_>>().join(" and "));
             }

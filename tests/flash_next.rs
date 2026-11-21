@@ -757,3 +757,83 @@ fn the_embedding_stays_bf16_whatever_the_general_weight_format() {
     assert_eq!(gather.format, Some(WeightFormat::Bf16));
     assert!((gather.bytes_per_token - 2560.0 * 2.0).abs() < 1e-9, "{}", gather.bytes_per_token);
 }
+
+// ---- SHA-785: codex-review cycle 2 follow-ups ----
+
+#[test]
+fn a_model_level_ple_table_split_across_formats_is_rejected() {
+    let mut v = raw();
+    ql(&mut v).remove("model.language_model.layers.1.ple.ple_embedding.ngram_embedding").unwrap();
+    ql(&mut v).insert("model.language_model.ple_embedding.ngram_embedding.shard_0".into(), json!({"quant_algo": "MXFP8", "group_size": 32}));
+    let err = format!("{:#}", resolved_with(&v, &[
+        "model.language_model.ple_embedding.ngram_embedding.shard_0.weight",
+        "model.language_model.ple_embedding.ngram_embedding.shard_1.weight",
+    ]).unwrap_err());
+    assert!(err.contains("ple_embedding.ngram_embedding") && err.contains("mixed formats"), "{err}");
+}
+
+#[test]
+fn more_than_one_mtp_layer_is_refused_before_formats_matter() {
+    // codex-review fp:752cfe280501 (two MTP layers in different formats priced at one) can't
+    // reach the planner: a config with more than one MTP layer is refused when parsed.
+    let mut v = raw();
+    fn set_mtp(v: &mut Value) {
+        if let Some(o) = v.as_object_mut() {
+            for (k, x) in o.iter_mut() {
+                if k == "mtp_num_hidden_layers" { *x = json!(2); }
+                if k == "mtp" { if let Some(n) = x.get_mut("num_hidden_layers") { *n = json!(2); } }
+                set_mtp(x);
+            }
+        }
+    }
+    set_mtp(&mut v);
+    let err = format!("{:#}", spec_of(&v).unwrap_err());
+    assert!(err.contains("at most one MTP layer"), "{err}");
+}
+
+#[test]
+fn mtp_layer_indices_must_be_canonical() {
+    let err = format!("{:#}", resolved_with(&raw(), &["mtp.layers.00.self_attn.v_proj.weight"]).unwrap_err());
+    assert!(err.contains("mtp.layers.00") && err.contains("canonical"), "{err}");
+}
+
+#[test]
+fn every_spelling_of_a_tied_head_must_agree() {
+    let mut v = raw();
+    v["tie_word_embeddings"] = json!(true);
+    if let Some(t) = v.get_mut("text_config") { t["tie_word_embeddings"] = json!(true); }
+    for k in ["model.language_model.embed_tokens", "lm_head"] {
+        ql(&mut v).insert(k.into(), json!({"quant_algo": "MXFP8", "group_size": 32}));
+    }
+    spec_of(&v).unwrap(); // agreeing spellings
+    ql(&mut v).insert("model.lm_head".into(), json!({"quant_algo": "NVFP4", "group_size": 16}));
+    let err = format!("{:#}", spec_of(&v).unwrap_err());
+    assert!(err.contains("model.lm_head") && (err.contains("tied") || err.contains("conflicting")), "{err}");
+}
+
+#[test]
+fn tensors_kept_under_a_projection_never_reprice_it() {
+    // codex-review fp:708c7a7b8993: layer 3's q_proj has no entry (BF16 default) and only an
+    // observer's tensor under it is declared MXFP8. Pricing q_proj looks at q_proj itself, so the
+    // projection stays BF16 and the observer entry is reported unused.
+    let mut v = raw();
+    ql(&mut v).remove("model.language_model.layers.3.self_attn.q_proj").unwrap();
+    let base = plan_of(&resolved(&v).unwrap());
+    ql(&mut v).insert("model.language_model.layers.3.self_attn.q_proj.observer".into(), json!({"quant_algo": "MXFP8", "group_size": 32}));
+    let s = resolved_with(&v, &["model.language_model.layers.3.self_attn.q_proj.observer.weight"]).unwrap();
+    assert!(s.hybrid.as_ref().unwrap().schedule[3] == LayerKind::FullAttention, "layer 3 is a sparse-attention layer");
+    let p = plan_of(&s);
+    assert_eq!(p.budget.weight_gib, base.budget.weight_gib);
+    assert!(unused_entries(&p).contains(&"model.language_model.layers.3.self_attn.q_proj.observer".to_string()), "{:#?}", p.notes);
+}
+
+#[test]
+fn agreeing_overlapping_entries_are_both_used() {
+    let mut v = raw();
+    ql(&mut v).insert("model.language_model.layers.1.ple.ple_embedding".into(), json!({"quant_algo": "NVFP4", "group_size": 16}));
+    let p = plan_of(&resolved(&v).unwrap());
+    let unused = unused_entries(&p);
+    for e in ["model.language_model.layers.1.ple.ple_embedding", "model.language_model.layers.1.ple.ple_embedding.ngram_embedding"] {
+        assert!(!unused.contains(&e.to_string()), "{e}: {unused:?}");
+    }
+}
