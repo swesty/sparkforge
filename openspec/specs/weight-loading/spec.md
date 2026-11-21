@@ -9,10 +9,11 @@ weight readable by the generated kernels on GB10.
 
 ### Requirement: Checkpoints are discovered and every byte range is checked
 
-Opening a checkpoint directory SHALL use `model.safetensors.index.json` when present and
-`model.safetensors` otherwise. Each tensor's offsets MUST lie inside its shard's data section,
-checked without overflow before forming file positions, and its byte count MUST match its dtype and
-shape; otherwise opening fails naming the shard and tensor.
+Opening a checkpoint directory SHALL open it once and read the config, index and shards relative
+to that opened directory. It SHALL use `model.safetensors.index.json` when that directory entry
+exists (a dangling link is an error) and `model.safetensors` otherwise. Each tensor's offsets MUST
+lie inside its shard's data section, checked without overflow, and its byte count MUST match its
+dtype and shape.
 
 #### Scenario: Truncated shard
 - **WHEN** a tensor's byte range ends past the end of its shard
@@ -21,6 +22,22 @@ shape; otherwise opening fails naming the shard and tensor.
 #### Scenario: Wrapping offsets
 - **WHEN** a tensor's offsets are near 2^64 so that adding the data start would wrap into the header
 - **THEN** opening fails instead of accepting header bytes as tensor data
+
+#### Scenario: Symlink switched after opening
+- **WHEN** a checkpoint is opened through a symlink that is then switched to another generation
+- **THEN** every read still comes from the generation that was opened
+
+#### Scenario: Directory replaced after the config read
+- **WHEN** the canonical directory is moved aside and replaced by another generation after the config is read
+- **THEN** the index and shards still come from the generation the config came from
+
+#### Scenario: Shard linked through an alias
+- **WHEN** a shard entry is a symlink whose target passes through another symlink, such as a `current` alias
+- **THEN** opening fails naming the shard, while a link straight to the file still opens
+
+#### Scenario: Dangling index link
+- **WHEN** `model.safetensors.index.json` is a dangling symlink beside a valid `model.safetensors`
+- **THEN** opening fails naming the index instead of loading the single file
 
 ### Requirement: Index entries match their shards
 
@@ -75,22 +92,31 @@ differs from when it was opened, checked after each read (to filesystem timestam
 
 ### Requirement: Shards are regular files opened without blocking
 
-Shards SHALL be opened without blocking, and the opened file MUST be a regular file.
+Shards, `config.json` and the index SHALL be opened without blocking, and each opened file MUST be
+a regular file; metadata files are also size-capped, counting bytes that arrive after the size check.
 
 #### Scenario: FIFO shard
 - **WHEN** the shard path is a FIFO with no writer
 - **THEN** opening fails promptly stating that it is not a regular file
 
+#### Scenario: FIFO metadata
+- **WHEN** `config.json` or the index is a FIFO with no writer
+- **THEN** reading it fails within 5 seconds stating that it is not a regular file
+
 ### Requirement: Every tensor the plan needs is present with the planned shape and dtype
 
 For each layer the loader SHALL require the attention projections, MLP projections and both norms,
-plus the embedding, the final norm and `lm_head`, each with the shape the plan implies and dtype
-BF16. A missing tensor or a wrong shape or dtype MUST fail before any GPU work, naming the tensor
-and the expected and found values.
+plus the embedding, the final norm and the resolved `lm_head` binding (the embedding when tied),
+each with the planned shape and dtype BF16. A missing tensor or a wrong shape or dtype MUST fail
+before any GPU work, naming the tensor and the expected and found values.
 
 #### Scenario: Wrong shape
 - **WHEN** `model.layers.0.self_attn.o_proj.weight` has shape [4096, 2048] but the plan needs [2048, 2048]
 - **THEN** loading fails with the tensor name and both shapes
+
+#### Scenario: Untied model without lm_head
+- **WHEN** an untied config is bound to a checkpoint without `lm_head.weight`
+- **THEN** binding fails before GPU allocation naming `lm_head.weight`, while the same checkpoint binds when the config ties embeddings
 
 ### Requirement: Optional tensors follow the model's flags
 
@@ -132,18 +158,39 @@ about 35% below device memory once warm. The load report SHALL state the bytes c
 
 ### Requirement: Loads never exhaust host memory
 
-On Linux, a load SHALL be refused before allocating if the bytes it would copy, plus its bounded
-staging buffer and, when verifying, the reference computation's scratch, exceed `MemAvailable`
-minus 4 GiB. Admission SHALL be serialized across the user's sparkforge processes until the admitted
-allocations are made. Neither uploads nor references SHALL hold a whole tensor in host memory.
+A load SHALL be refused before any CUDA call if its copied bytes, bounded staging buffer and, when
+verifying, reference scratch exceed `MemAvailable` minus 4 GiB, and rechecked before allocating.
+Admission SHALL be serialized until the allocations are made: always across this user's sparkforge
+processes, and across all users' through a group-shared node lock when provisioned, with locations
+chosen by ownership, never by environment.
 
 #### Scenario: Too large to copy
 - **WHEN** the bytes to copy plus overhead exceed `MemAvailable` minus 4 GiB
-- **THEN** loading fails before any GPU allocation, stating both numbers
+- **THEN** loading fails before any CUDA call, stating both numbers
 
 #### Scenario: Concurrent loads
 - **WHEN** two sparkforge loads of 14 GiB start together with 20 GiB available
 - **THEN** the second waits until the first has allocated, then is refused
+
+#### Scenario: Loads by two users
+- **WHEN** the node-wide lock is provisioned and two different users start loads
+- **THEN** both use the same lock, so the second waits for the first
+
+#### Scenario: Lock open to every account
+- **WHEN** the node-wide lock file grants access to every account
+- **THEN** admission refuses it, naming the mode, instead of letting any account hold it
+
+#### Scenario: Lock in the wrong group
+- **WHEN** the node-wide lock is mode 0640 but belongs to a group other than `sparkforge`
+- **THEN** admission refuses it, naming both groups
+
+#### Scenario: Login during a load
+- **WHEN** a user's load is admitted and a login then creates that user's runtime directory
+- **THEN** the user's next load waits on the same lock
+
+#### Scenario: Memory used after admission
+- **WHEN** `MemAvailable` drops below the guard between admission and upload
+- **THEN** the upload refuses before allocating
 
 #### Scenario: Wide vocabulary
 - **WHEN** `verify-weights` checks Llama 3.1 8B's `lm_head` (1.05 GB of weights)
