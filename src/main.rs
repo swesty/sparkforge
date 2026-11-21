@@ -169,11 +169,13 @@ fn main() -> Result<()> {
             use sparkforge::verify;
             let (p, ck, b) = open_checkpoint(&dir)?;
             let avail0 = sparkforge::weights::mem_available().unwrap_or(0);
-            // Admission (lock + memory guard) before any CUDA call; held through the upload.
+            // Admission (lock + memory guard) before any CUDA call; held until verification has
+            // freed the weights and its reference scratch.
             let admission = sparkforge::weights::admit_load(&ck, &b, true)?;
             let g = codegen::generate(&p);
             let e = sparkforge::runtime::Engine::load(&g, &cuda_include)?;
-            let rep = verify::verify_weights(&p, &g, &e, &ck, &b, seed, admission)?;
+            let rep = verify::verify_weights(&p, &g, &e, &ck, &b, seed, &admission)?;
+            drop(admission);
             println!("{} ({} layers), MemAvailable at start {:.1} GiB", p.model.arch, p.model.layers, avail0 as f64 / (1u64 << 30) as f64);
             // Sampled inside the upload while the weights were resident, not here after they were freed.
             println!("loaded {:.2} GiB into GPU memory in {:.2} s; MemAvailable with the weights resident {}", rep.bytes_copied as f64 / (1u64 << 30) as f64,
