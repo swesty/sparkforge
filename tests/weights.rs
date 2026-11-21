@@ -1077,3 +1077,28 @@ fn a_load_waiting_on_a_replaced_lock_moves_to_the_new_file() {
     drop(c);
     b.join().unwrap().unwrap();
 }
+
+// ---- SHA-785: a Hugging Face cache whose blobs link into a shared store ----
+
+#[cfg(unix)]
+#[test]
+fn a_blob_that_links_into_a_shared_store_is_followed_and_verified() {
+    // spark-5's cache: `<repo>/snapshots/<rev>/f -> ../../blobs/<sha256>`, and that blob is itself
+    // a link to `hub/blobs/<xx>/<other id>`. The chain is followed because the bytes are checked
+    // against the sha256 name; other bytes at the end of the chain are still refused.
+    let hub = std::fs::canonicalize(dir("hf-dedup")).unwrap();
+    let store = hub.join("blobs/ab");
+    std::fs::create_dir_all(&store).unwrap();
+    write_shard(&store.join("chunk-id-1"), &bf16(tensors(false)), 0);
+    let repo = hub.join("models--org--name");
+    let (blobs, snap) = (repo.join("blobs"), repo.join("snapshots/rev"));
+    std::fs::create_dir_all(&blobs).unwrap();
+    std::fs::create_dir_all(&snap).unwrap();
+    std::os::unix::fs::symlink("../../blobs/ab/chunk-id-1", blobs.join(hf_blob())).unwrap();
+    std::os::unix::fs::symlink(format!("../../blobs/{}", hf_blob()), snap.join("model.safetensors")).unwrap();
+    bind(&Checkpoint::open(&snap).unwrap(), &spec(false)).unwrap();
+    // The store's bytes change under the same chain: the name no longer matches, so it is refused.
+    write_shard(&store.join("chunk-id-1"), &bf16(tensors(true)), 0);
+    let err = format!("{:#}", Checkpoint::open(&snap).err().expect("mismatch"));
+    assert!(err.contains("hash to"), "{err}");
+}

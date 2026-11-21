@@ -63,6 +63,10 @@ shard's data section, checked without overflow, and byte counts MUST match dtype
 - **WHEN** a shard links to `sub/../weights.safetensors`
 - **THEN** it opens `weights.safetensors` in the checkpoint directory without resolving `..` through `sub`
 
+#### Scenario: Blob in a shared store
+- **WHEN** a snapshot's `../../blobs/<sha256>` is itself a link into a shared, deduplicated store under another name
+- **THEN** the link is followed and the bytes are verified against `<sha256>`, so other bytes at the end of the chain are refused
+
 #### Scenario: Search-only directory
 - **WHEN** the checkpoint directory and a shard's subdirectory grant search but not read permission
 - **THEN** the checkpoint opens on Linux

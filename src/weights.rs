@@ -138,7 +138,12 @@ impl CheckpointDir {
                         LinkTarget::HfBlob(blob) => match &self.blobs {
                             Some(Ok(blobs)) => {
                                 blob_name = blob.to_str().map(str::to_owned);
-                                nofollow::cstr(&blob).and_then(|c| nofollow::open_file(blobs, &c))
+                                // The blob itself may be a link into a shared, deduplicated store
+                                // (spark-5's cache links `<repo>/blobs/<sha256>` on to
+                                // `hub/blobs/<xx>/<other id>`). Its bytes are verified against
+                                // the name, so following links from here can't yield another
+                                // generation's bytes.
+                                nofollow::cstr(&blob).and_then(|c| nofollow::open_file_following(blobs, &c))
                             }
                             Some(Err(why)) => bail!("{} links into the blob store, but {why}", path.display()),
                             None => Err(std::io::Error::from(ErrorKind::NotFound)),
@@ -374,6 +379,13 @@ mod nofollow {
         openat(&parent, &last, DIR_FLAGS)
     }
 
+    /// Opens a file non-blocking, following symlinks: only for a target whose bytes are verified
+    /// afterwards (a Hugging Face blob, checked against its hash name).
+    pub fn open_file_following(dir: &File, name: &std::ffi::CStr) -> io::Result<File> {
+        let fd = unsafe { libc::openat(dir.as_raw_fd(), name.as_ptr(), libc::O_RDONLY | libc::O_NONBLOCK | libc::O_CLOEXEC) };
+        if fd < 0 { Err(io::Error::last_os_error()) } else { Ok(unsafe { File::from_raw_fd(fd) }) }
+    }
+
     /// Opens a file non-blocking; a symlink there fails with `ELOOP`.
     pub fn open_file(dir: &File, name: &std::ffi::CStr) -> io::Result<File> {
         openat(dir, name, libc::O_RDONLY | libc::O_NONBLOCK)
@@ -447,6 +459,23 @@ pub fn resolve_checkpoint_dir(dir: &Path) -> Result<CheckpointDir> {
 /// `config.json` of an opened checkpoint directory, read with the metadata open rules.
 pub fn read_config(dir: &CheckpointDir) -> Result<String> {
     dir.read_metadata("config.json")
+}
+
+/// The tensor names of a checkpoint, for resolving its module identities: the keys of
+/// `model.safetensors.index.json` when present (no shard is read), else the header of
+/// `model.safetensors`. `Checkpoint::open_dir` later checks that the index and the headers agree.
+pub fn tensor_names(dir: &CheckpointDir) -> Result<Vec<String>> {
+    const INDEX: &str = "model.safetensors.index.json";
+    if dir.has_entry(INDEX)? {
+        #[derive(serde::Deserialize)]
+        struct Index {
+            weight_map: UniqueMap<IgnoredAny>,
+        }
+        let idx: Index = serde_json::from_str(&dir.read_metadata(INDEX)?).with_context(|| format!("parsing {}", dir.entry(INDEX).display()))?;
+        return Ok(idx.weight_map.0.into_iter().map(|(k, _)| k).collect());
+    }
+    let ck = Checkpoint::open_dir(dir)?;
+    Ok(ck.tensors.into_keys().collect())
 }
 
 /// Index shard names must be plain relative paths inside the checkpoint directory: no absolute

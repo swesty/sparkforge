@@ -300,6 +300,11 @@ pub struct ModelSpec {
     /// Hybrid linear/sparse-attention layout (Qwen3.8 Flash Next). Planned, not generated.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hybrid: Option<Hybrid>,
+    /// `formats` resolved onto a checkpoint's modules (`resolve_modules`). With it, the planner
+    /// prices each module by the entries that cover it in that checkpoint; without it (planning
+    /// from a config alone), by path matching.
+    #[serde(skip)]
+    pub resolved: Option<crate::modules::ResolvedFormats>,
 }
 
 fn parse_rope_scaling(v: &Option<serde_json::Value>) -> Result<Option<RopeScaling>> {
@@ -613,7 +618,17 @@ impl ModelSpec {
             weights,
             formats,
             hybrid,
+            resolved: None,
         })
+    }
+
+    /// Resolves `formats` onto the modules of a checkpoint, given its tensor names: each entry
+    /// applies to the modules at or under its path, entries that cover one module must agree, and
+    /// entries that cover none are reported as unused instead of matching by pattern.
+    pub fn resolve_modules<'a>(&mut self, names: impl IntoIterator<Item = &'a str>) -> Result<()> {
+        let table = crate::modules::ModuleTable::from_tensor_names(names);
+        self.resolved = Some(crate::modules::resolve(&self.formats, table)?);
+        Ok(())
     }
 
     pub fn gqa_group(&self) -> u32 { self.heads / self.kv_heads }

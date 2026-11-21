@@ -17,9 +17,11 @@ enum Fmt { Auto, Bf16, W4a16, Nvfp4 }
 fn open_checkpoint(dir: &std::path::Path) -> Result<(plan::Plan, sparkforge::weights::Checkpoint, sparkforge::weights::Binding)> {
     // One opened directory for the config, the index and every shard.
     let dir = &sparkforge::weights::resolve_checkpoint_dir(dir)?;
-    let spec = ModelSpec::from_json(&sparkforge::weights::read_config(dir)?, None)?;
-    let p = plan::build(&spec, &GB10, &plan::PlanOpts { prefill_tokens: 2048, ctx: 4096 });
+    let mut spec = ModelSpec::from_json(&sparkforge::weights::read_config(dir)?, None)?;
     let ck = sparkforge::weights::Checkpoint::open_dir(dir)?;
+    // Formats are priced by the modules this checkpoint actually holds.
+    spec.resolve_modules(ck.tensors.keys().map(String::as_str))?;
+    let p = plan::build(&spec, &GB10, &plan::PlanOpts { prefill_tokens: 2048, ctx: 4096 });
     let b = sparkforge::weights::bind(&ck, &spec)?;
     Ok((p, ck, b))
 }
@@ -86,6 +88,10 @@ struct Common {
     ctx: u32,
     #[arg(long)]
     json: bool,
+    /// Checkpoint directory whose tensor names resolve the per-module formats (otherwise formats
+    /// are matched by path from config.json alone)
+    #[arg(long)]
+    checkpoint: Option<PathBuf>,
 }
 
 fn build(c: &Common) -> Result<plan::Plan> {
@@ -95,7 +101,11 @@ fn build(c: &Common) -> Result<plan::Plan> {
         Fmt::W4a16 => Some(WeightFormat::W4A16 { group: 128 }),
         Fmt::Nvfp4 => Some(WeightFormat::Nvfp4),
     };
-    let spec = ModelSpec::from_json(&std::fs::read_to_string(&c.config)?, fmt)?;
+    let mut spec = ModelSpec::from_json(&std::fs::read_to_string(&c.config)?, fmt)?;
+    if let Some(dir) = &c.checkpoint {
+        let names = sparkforge::weights::tensor_names(&sparkforge::weights::resolve_checkpoint_dir(dir)?)?;
+        spec.resolve_modules(names.iter().map(String::as_str))?;
+    }
     Ok(plan::build(&spec, &GB10, &plan::PlanOpts { prefill_tokens: c.prefill_tokens, ctx: c.ctx }))
 }
 
