@@ -1136,11 +1136,11 @@ fn a_node_lock_being_replaced_makes_loads_refuse_not_fall_back() {
 
 #[cfg(unix)]
 #[test]
-fn a_snapshot_moved_to_another_repository_during_resolution_keeps_its_own_blobs() {
+fn a_snapshot_moved_to_another_repository_during_resolution_is_refused() {
     // Between opening repo-a/snapshots/rev and opening the blob store, the revision is moved to
-    // repo-b, whose blobs hold different bytes under the same hash name. The blob store comes from
-    // the repository the snapshot was opened in.
-    use sparkforge::weights::{read_config, resolve_checkpoint_dir_between};
+    // repo-b, whose blobs hold different bytes under the same hash name. Resolution notices the
+    // revision is no longer where it was opened and fails, rather than pairing it with any store.
+    use sparkforge::weights::{read_config, resolve_checkpoint_dir_between, ResolveStep};
     let root = std::fs::canonicalize(dir("hf-move")).unwrap();
     for (repo, flip) in [("repo-a", false), ("repo-b", true)] {
         let blobs = root.join(repo).join("blobs");
@@ -1158,14 +1158,19 @@ fn a_snapshot_moved_to_another_repository_during_resolution_keeps_its_own_blobs(
     std::fs::create_dir(&snap).unwrap();
     std::fs::write(snap.join("config.json"), "{}").unwrap();
     std::os::unix::fs::symlink(format!("../../blobs/{HF_BLOB}"), snap.join("model.safetensors")).unwrap();
-    let opened = resolve_checkpoint_dir_between(&snap, || std::fs::rename(&snap, root.join("repo-b/snapshots/rev")).unwrap()).unwrap();
+    let err = format!("{:#}", resolve_checkpoint_dir_between(&snap, |step| if step == ResolveStep::RevisionOpened { std::fs::rename(&snap, root.join("repo-b/snapshots/rev")).unwrap() })
+        .err().expect("a moved revision must fail"));
+    assert!(err.contains("changed while"), "{err}");
+    // Without the move, the same snapshot opens and reads repo-a's blob.
+    std::fs::rename(root.join("repo-b/snapshots/rev"), &snap).unwrap();
+    let opened = resolve_checkpoint_dir_between(&snap, |_| {}).unwrap();
     read_config(&opened).unwrap();
     let ck = Checkpoint::open_dir(&opened).unwrap();
     let t = ck.tensors.values().max_by_key(|t| t.end).unwrap();
     let mut got = vec![0u8; 1];
     ck.read_range(t, t.len() - 1, &mut got).unwrap();
     let want = std::fs::read(root.join("repo-a/blobs").join(HF_BLOB)).unwrap();
-    assert_eq!(got[0], want[want.len() - 1], "repo-a's blob, not repo-b's");
+    assert_eq!(got[0], want[want.len() - 1], "repo-a's blob");
 }
 
 #[cfg(unix)]
@@ -1187,4 +1192,104 @@ fn an_unusable_blob_store_only_matters_to_checkpoints_that_link_into_it() {
     std::os::unix::fs::symlink(format!("../../blobs/{HF_BLOB}"), linked.join("model.safetensors")).unwrap();
     let err = format!("{:#}", Checkpoint::open(&linked).err().expect("blob store is a symlink"));
     assert!(err.contains("links into the blob store") && err.contains("blobs"), "{err}");
+}
+
+// ---- SHA-788: codex-review cycle 1 follow-ups ----
+
+/// A snapshot whose shard links into `blobs`; `flip` makes a second store's bytes differ.
+#[cfg(unix)]
+fn hf_repo(root: &std::path::Path) -> (PathBuf, PathBuf) {
+    let (blobs, snap) = (root.join("blobs"), root.join("snapshots/rev"));
+    std::fs::create_dir(&blobs).unwrap();
+    std::fs::create_dir_all(&snap).unwrap();
+    write_shard(&blobs.join(HF_BLOB), &bf16(tensors(false)), 0);
+    std::os::unix::fs::symlink(format!("../../blobs/{HF_BLOB}"), snap.join("model.safetensors")).unwrap();
+    (blobs, snap)
+}
+
+#[cfg(unix)]
+#[test]
+fn a_blob_store_swapped_after_it_was_opened_fails_resolution() {
+    // The blob store is opened, then `blobs` is moved aside and replaced by a store with other
+    // bytes under the same hash name, before the revision and store are checked as a pair.
+    use sparkforge::weights::{resolve_checkpoint_dir_between, ResolveStep};
+    let root = std::fs::canonicalize(dir("hf-swap-after")).unwrap();
+    let (blobs, snap) = hf_repo(&root);
+    let err = format!("{:#}", resolve_checkpoint_dir_between(&snap, |step| if step == ResolveStep::BlobsOpened {
+        std::fs::rename(&blobs, root.join("blobs-old")).unwrap();
+        std::fs::create_dir(&blobs).unwrap();
+        write_shard(&blobs.join(HF_BLOB), &bf16(tensors(true)), 0);
+    }).err().expect("a swapped blob store must fail"));
+    assert!(err.contains("changed while"), "{err}");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_revision_replaced_during_resolution_fails() {
+    use sparkforge::weights::{resolve_checkpoint_dir_between, ResolveStep};
+    let root = std::fs::canonicalize(dir("hf-rev-replaced")).unwrap();
+    let (_, snap) = hf_repo(&root);
+    let err = format!("{:#}", resolve_checkpoint_dir_between(&snap, |step| if step == ResolveStep::BlobsOpened {
+        std::fs::rename(&snap, root.join("snapshots/rev-old")).unwrap();
+        std::fs::create_dir(&snap).unwrap();
+    }).err().expect("a replaced revision must fail"));
+    assert!(err.contains("changed while"), "{err}");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_blob_store_swapped_before_it_is_opened_is_used_whole() {
+    // A swap that completes before the blob store is opened is simply the repository's state when
+    // the pair is checked: the new store is opened, and every read comes from it.
+    use sparkforge::weights::{resolve_checkpoint_dir_between, ResolveStep};
+    let root = std::fs::canonicalize(dir("hf-swap-before")).unwrap();
+    let (blobs, snap) = hf_repo(&root);
+    let d = resolve_checkpoint_dir_between(&snap, |step| if step == ResolveStep::RevisionOpened {
+        std::fs::rename(&blobs, root.join("blobs-old")).unwrap();
+        std::fs::create_dir(&blobs).unwrap();
+        write_shard(&blobs.join(HF_BLOB), &bf16(tensors(true)), 0);
+    }).unwrap();
+    std::fs::rename(&blobs, root.join("blobs-new")).unwrap();
+    std::fs::rename(root.join("blobs-old"), &blobs).unwrap();
+    let ck = Checkpoint::open_dir(&d).unwrap();
+    assert!(!ck.tensors.contains_key("lm_head.weight"), "reads come from the store that was opened, not the one restored later");
+}
+
+#[cfg(unix)]
+#[test]
+fn two_entries_for_one_lock_file_are_locked_once() {
+    use sparkforge::weights::{admit, LockFile, LockKind};
+    let lock = dir("dup-lock").join("sparkforge-gpu-admission.lock");
+    let e = LockFile { path: lock.clone(), kind: LockKind::User };
+    admit(&[e.clone(), e], 0, 0, || Some(64 << 30), std::time::Duration::from_millis(500)).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn a_load_waiting_on_a_replaced_lock_moves_to_the_new_file() {
+    // Load A holds the node lock. Load B opens it and waits. The repair replaces the file while
+    // A's lock is held, and a new load C takes the new file. When A finishes, B gets the old
+    // file's lock, sees it was replaced, and waits on the new file (held by C) instead of being
+    // admitted alongside C.
+    use sparkforge::weights::{admission_locks_in, admit};
+    use std::time::Duration;
+    let node = dir("node-relock").join("run-sparkforge");
+    provision_node(&node, 0o640);
+    let locks = admission_locks_in(&node, my_uid(), || Some(my_gid()), 1000, || None).unwrap();
+    let lock = node.join("admission.lock");
+    let a = std::fs::File::open(&lock).unwrap();
+    a.lock().unwrap();
+    let files = locks.files();
+    let b = std::thread::spawn(move || admit(&files, 0, 0, || Some(64 << 30), Duration::from_secs(10)).map(|_held| ()));
+    std::thread::sleep(Duration::from_millis(300));
+    std::fs::remove_file(&lock).unwrap();
+    std::fs::write(&lock, b"").unwrap();
+    chmod(&lock, 0o640);
+    let c = std::fs::File::open(&lock).unwrap();
+    c.lock().unwrap();
+    drop(a);
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(!b.is_finished(), "B must wait for C, which holds the file the path names now");
+    drop(c);
+    b.join().unwrap().unwrap();
 }

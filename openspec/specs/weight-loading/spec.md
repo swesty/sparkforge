@@ -47,6 +47,14 @@ shard's data section, checked without overflow, and byte counts MUST match dtype
 - **WHEN** a snapshot's `<repo>/blobs` is replaced, after the config read, by one holding other bytes under the same hash names
 - **THEN** the shards still come from the blob store the snapshot was opened with
 
+#### Scenario: Snapshot moved during resolution
+- **WHEN** a snapshot revision is moved or replaced, or its blob store is replaced, after it is opened and before both are checked as a pair
+- **THEN** resolution fails asking for a retry, instead of pairing one generation's config with another's blobs
+
+#### Scenario: Unused blob store
+- **WHEN** a snapshot of plain files sits beside a `blobs` path that is a symlink or not a directory
+- **THEN** it opens, while a snapshot that links into that blob store fails naming it
+
 #### Scenario: Link through a parent component
 - **WHEN** a shard links to `sub/../weights.safetensors`
 - **THEN** it opens `weights.safetensors` in the checkpoint directory without resolving `..` through `sub`
@@ -182,7 +190,7 @@ A load SHALL be refused before any CUDA call if its copied bytes, staging buffer
 verifying, reference scratch exceed `MemAvailable` minus 4 GiB, and rechecked before allocating.
 Admission SHALL be held until that memory is allocated, or freed after verification, and
 serialized across this user's processes and, through a group-only node lock when provisioned,
-across all users'. Lock locations come from ownership; the environment only finds an older loader's lock.
+across all users'. Lock locations come from ownership, never environment.
 
 #### Scenario: Too large to copy
 - **WHEN** the bytes to copy plus overhead exceed `MemAvailable` minus 4 GiB
@@ -208,13 +216,25 @@ across all users'. Lock locations come from ownership; the environment only find
 - **WHEN** the node-wide lock is mode 0640 in group `sparkforge` but an ACL entry grants a named user read access
 - **THEN** admission refuses it, naming that user and saying to replace the file, since removing the ACL leaves descriptors already opened usable
 
+#### Scenario: Lock swapped before locking
+- **WHEN** the node lock passes discovery and is then replaced by a file any account can open, or one with a named ACL entry
+- **THEN** admission refuses it, because the checks run again on the descriptor it locks
+
+#### Scenario: Lock being replaced
+- **WHEN** `/run/sparkforge` exists but `admission.lock` is missing, as during its repair
+- **THEN** loads refuse instead of falling back to the user lock
+
+#### Scenario: Waiting on a replaced lock
+- **WHEN** a load is waiting on the node lock and the file is replaced before it gets the lock
+- **THEN** once it gets the old file's lock it sees the path names a new file and waits on that one, so it is never admitted alongside a load holding the new file
+
 #### Scenario: Upgrade from a custom runtime directory
-- **WHEN** a load by the loader before SHA-765, run with a custom `XDG_RUNTIME_DIR`, holds its lock there, and the new load is started without that variable
-- **THEN** on Linux the new load finds it through the old process's environment and waits, and no lock is created there when none exists
+- **WHEN** a lock file the loader before SHA-765 used exists in `/run/user/<uid>`, a custom `$XDG_RUNTIME_DIR` or the temp directory
+- **THEN** admission neither takes nor creates it; upgrading from that loader drains running loads first
 
 #### Scenario: One lock under two spellings
-- **WHEN** two candidate paths name the same lock file
-- **THEN** admission locks it once instead of waiting on itself
+- **WHEN** two lock entries given to admission name the same file
+- **THEN** it is locked once, instead of the second waiting on this process's own first lock
 
 #### Scenario: Second load during verification
 - **WHEN** a second `verify-weights` starts while the first is copying or verifying, with room for only one

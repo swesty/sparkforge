@@ -304,6 +304,20 @@ mod nofollow {
         openat(&parent, &last, DIR_FLAGS)
     }
 
+    /// Whether `rel`, looked up from `dir` without following a final symlink, is the same file as
+    /// `f` (device and inode). A missing entry is `false`.
+    pub fn names(dir: &File, rel: &Path, f: &File) -> io::Result<bool> {
+        use std::os::unix::fs::MetadataExt;
+        let c = cstr(rel.as_os_str())?;
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        if unsafe { libc::fstatat(dir.as_raw_fd(), c.as_ptr(), &mut st, libc::AT_SYMLINK_NOFOLLOW) } != 0 {
+            let e = io::Error::last_os_error();
+            return if e.kind() == io::ErrorKind::NotFound { Ok(false) } else { Err(e) };
+        }
+        let m = f.metadata()?;
+        Ok(st.st_dev as u64 == m.dev() && st.st_ino as u64 == m.ino())
+    }
+
     /// Opens a file non-blocking; a symlink there fails with `ELOOP`.
     pub fn open_file(dir: &File, name: &std::ffi::CStr) -> io::Result<File> {
         openat(dir, name, libc::O_RDONLY | libc::O_NONBLOCK)
@@ -345,13 +359,23 @@ pub fn read_capped(r: impl std::io::Read, cap: u64, what: &str) -> Result<String
 /// Resolves a checkpoint directory once and opens it, so the config, the index and every shard
 /// come from one generation even if the directory or a symlink on its path is replaced mid-load.
 pub fn resolve_checkpoint_dir(dir: &Path) -> Result<CheckpointDir> {
-    resolve_checkpoint_dir_between(dir, || {})
+    resolve_checkpoint_dir_between(dir, |_| {})
 }
 
-/// `resolve_checkpoint_dir`, running `between` after a Hugging Face snapshot is opened and before
-/// its blob store is (a test seam for moves during resolution).
+/// A point inside snapshot resolution where `resolve_checkpoint_dir_between` calls its hook.
 #[doc(hidden)]
-pub fn resolve_checkpoint_dir_between(dir: &Path, between: impl FnOnce()) -> Result<CheckpointDir> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResolveStep {
+    /// The revision is open; the blob store is not yet.
+    RevisionOpened,
+    /// Both are open; the consistency check has not run yet.
+    BlobsOpened,
+}
+
+/// `resolve_checkpoint_dir`, calling `hook` at each `ResolveStep` of a Hugging Face snapshot (a
+/// test seam for moves during resolution).
+#[doc(hidden)]
+pub fn resolve_checkpoint_dir_between(dir: &Path, mut hook: impl FnMut(ResolveStep)) -> Result<CheckpointDir> {
     let path = std::fs::canonicalize(dir).with_context(|| format!("resolving checkpoint directory {}", dir.display()))?;
     ensure!(path.is_dir(), "{} is not a directory", path.display());
     #[cfg(unix)]
@@ -368,11 +392,23 @@ pub fn resolve_checkpoint_dir_between(dir: &Path, between: impl FnOnce()) -> Res
                 let repo_fd = open(repo).with_context(|| format!("opening the cache repository {}", repo.display()))?;
                 let fd = nofollow::open_dir(&repo_fd, &Path::new("snapshots").join(rev))
                     .map_err(|e| nofollow::explain(e, &path, "is not a real directory under its repository"))?;
-                between();
+                hook(ResolveStep::RevisionOpened);
                 let blobs = nofollow::open_dir(&repo_fd, Path::new("blobs")).map_err(|e| match e.kind() {
                     std::io::ErrorKind::NotFound => format!("{} is missing", repo.join("blobs").display()),
                     _ => format!("{} cannot be opened as a real directory ({e})", repo.join("blobs").display()),
                 });
+                hook(ResolveStep::BlobsOpened);
+                // Both entries must still name what was opened: then, at this moment, the
+                // repository held exactly this revision and this blob store, a consistent pair. A
+                // revision moved, or a blob store swapped, between the two opens fails here
+                // instead of pairing one generation's config with another's blobs (codex-review of
+                // SHA-788).
+                let rev_path = Path::new("snapshots").join(rev);
+                let mut unchanged = nofollow::names(&repo_fd, &rev_path, &fd)?;
+                if let Ok(b) = &blobs {
+                    unchanged &= nofollow::names(&repo_fd, Path::new("blobs"), b)?;
+                }
+                ensure!(unchanged, "the cache repository {} changed while {} was being opened (a revision or the blob store was moved or replaced); retry the load", repo.display(), path.display());
                 (fd, Some(blobs))
             }
             _ => (open(&path).with_context(|| format!("opening checkpoint directory {}", path.display()))?, None),
@@ -381,7 +417,7 @@ pub fn resolve_checkpoint_dir_between(dir: &Path, between: impl FnOnce()) -> Res
     }
     #[cfg(not(unix))]
     {
-        between();
+        let _ = &mut hook;
         Ok(CheckpointDir { path })
     }
 }
@@ -948,24 +984,55 @@ fn take_lock(lock: File, path: &Path, wait: std::time::Duration) -> Result<File>
 /// against `mem()` for `copy_bytes + overhead`. The locks are advisory `flock`s, so they coordinate
 /// sparkforge processes; other programs are seen only through `MemAvailable`.
 ///
-/// The node lock is checked again on the descriptor about to be locked (owner, group, mode and
-/// ACL), so a file swapped in after `admission_locks` inspected the path is held to the same rules
-/// (codex-review of SHA-787).
+/// - The node lock is checked again on the descriptor about to be locked (owner, group, mode and
+///   ACL), so a file swapped in after `admission_locks` inspected the path is held to the same
+///   rules (codex-review of SHA-787).
+/// - After a lock is taken, the path must still name the locked file. If the file was replaced
+///   while this process waited, it locks the new file instead, so every process ends up holding
+///   the file that the path names. A repair that replaces the file while holding the old one
+///   (see the runbook) therefore can't leave two lock generations admitting loads at once
+///   (codex-review of SHA-788).
+/// - Each file is locked once, even if two entries name it: a second descriptor's `flock` would
+///   wait on this process's own first one.
 pub fn admit(locks: &[LockFile], copy_bytes: u64, overhead: u64, mem: impl Fn() -> Option<u64>, wait: std::time::Duration) -> Result<Admission> {
     ensure!(!locks.is_empty(), "no admission lock to take");
     let mut held = Vec::new();
-    for l in locks {
-        let lock = open_lock(&l.path, l.kind == LockKind::User, l.kind == LockKind::User)?;
-        #[cfg(unix)]
-        if let LockKind::Node { owner, group } = l.kind {
-            let m = lock.metadata().with_context(|| format!("inspecting {}", l.path.display()))?;
-            #[cfg(target_os = "linux")]
-            let acl = fd_acl(&lock, &l.path)?;
-            #[cfg(not(target_os = "linux"))]
-            let acl = None;
-            check_node_lock(&m, acl, &l.path, owner, group)?;
+    #[cfg(unix)]
+    let mut taken: HashSet<(u64, u64)> = HashSet::new();
+    'locks: for l in locks {
+        let deadline = std::time::Instant::now() + wait;
+        loop {
+            let lock = open_lock(&l.path, l.kind == LockKind::User, l.kind == LockKind::User)?;
+            #[cfg(unix)]
+            let id = {
+                use std::os::unix::fs::MetadataExt;
+                let m = lock.metadata().with_context(|| format!("inspecting {}", l.path.display()))?;
+                if let LockKind::Node { owner, group } = l.kind {
+                    #[cfg(target_os = "linux")]
+                    let acl = fd_acl(&lock, &l.path)?;
+                    #[cfg(not(target_os = "linux"))]
+                    let acl = None;
+                    check_node_lock(&m, acl, &l.path, owner, group)?;
+                }
+                if taken.contains(&(m.dev(), m.ino())) {
+                    continue 'locks;
+                }
+                (m.dev(), m.ino())
+            };
+            let lock = take_lock(lock, &l.path, deadline.saturating_duration_since(std::time::Instant::now()))?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt;
+                let now = std::fs::symlink_metadata(&l.path).ok().map(|m| (m.dev(), m.ino()));
+                if now != Some(id) {
+                    eprintln!("{} was replaced while this load waited; locking the new file", l.path.display());
+                    continue;
+                }
+                taken.insert(id);
+            }
+            held.push(lock);
+            continue 'locks;
         }
-        held.push(take_lock(lock, &l.path, wait)?);
     }
     let avail = mem().context("cannot read MemAvailable from /proc/meminfo; refusing to allocate without the memory guard")?;
     check_headroom(copy_bytes + overhead, avail)?;

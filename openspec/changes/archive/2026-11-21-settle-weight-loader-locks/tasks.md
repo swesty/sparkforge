@@ -18,6 +18,13 @@
 - [x] 4.1 Gate Unix-only link code; `pread` fallback for targets that are neither Unix nor Windows
 - [x] 4.2 `cargo check --lib --target wasm32-unknown-unknown` with no errors or warnings (spark-5)
 
-## 5. Verification
-- [x] 5.1 `tools/code-factory/verify.sh` on macOS; `cargo test` and `cargo build --release --features cuda` on spark-5
-- [x] 5.2 `verify-weights` on Llama 3.1 8B on spark-5, from plain files and from a Hugging Face snapshot layout
+## 5. codex-review cycle 1 follow-ups
+- [x] 5.1 Archive the change in this PR, so `openspec/specs` matches the code at merge
+- [x] 5.2 Re-lock when the path no longer names the locked file; test: a load waiting on a replaced lock waits on the new file's holder
+- [x] 5.3 Lock each file once by (device, inode) on Unix; test: two entries for one file admit
+- [x] 5.4 Check the revision and blob store as a pair after both opens; tests: blob store swapped after its open, revision replaced, revision moved, store swapped before its open used whole
+- [x] 5.5 Runbook: replace the lock file while holding the old lock
+
+## 6. Verification
+- [x] 6.1 `tools/code-factory/verify.sh` on macOS; `cargo test` and `cargo build --release --features cuda` on spark-5
+- [x] 6.2 `verify-weights` on Llama 3.1 8B on spark-5, from plain files and from a Hugging Face snapshot layout

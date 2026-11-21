@@ -41,8 +41,8 @@ shard's data section, checked without overflow, and byte counts MUST match dtype
 - **THEN** the shards still come from the blob store the snapshot was opened with
 
 #### Scenario: Snapshot moved during resolution
-- **WHEN** a snapshot revision is moved to another cache repository after it is opened and before its blob store is
-- **THEN** its blob links still resolve into the repository it was opened in
+- **WHEN** a snapshot revision is moved or replaced, or its blob store is replaced, after it is opened and before both are checked as a pair
+- **THEN** resolution fails asking for a retry, instead of pairing one generation's config with another's blobs
 
 #### Scenario: Unused blob store
 - **WHEN** a snapshot of plain files sits beside a `blobs` path that is a symlink or not a directory
@@ -100,13 +100,17 @@ across all users'. Lock locations come from ownership, never environment.
 - **WHEN** `/run/sparkforge` exists but `admission.lock` is missing, as during its repair
 - **THEN** loads refuse instead of falling back to the user lock
 
+#### Scenario: Waiting on a replaced lock
+- **WHEN** a load is waiting on the node lock and the file is replaced before it gets the lock
+- **THEN** once it gets the old file's lock it sees the path names a new file and waits on that one, so it is never admitted alongside a load holding the new file
+
 #### Scenario: Upgrade from a custom runtime directory
 - **WHEN** a lock file the loader before SHA-765 used exists in `/run/user/<uid>`, a custom `$XDG_RUNTIME_DIR` or the temp directory
 - **THEN** admission neither takes nor creates it; upgrading from that loader drains running loads first
 
 #### Scenario: One lock under two spellings
-- **WHEN** `$XDG_RUNTIME_DIR` names `/run/user/<uid>` by another spelling, such as `/run/user/1000/../1000`
-- **THEN** admission is unaffected: it takes only the user lock and the node lock, which are always distinct files, in that order
+- **WHEN** two lock entries given to admission name the same file
+- **THEN** it is locked once, instead of the second waiting on this process's own first lock
 
 #### Scenario: Second load during verification
 - **WHEN** a second `verify-weights` starts while the first is copying or verifying, with room for only one
