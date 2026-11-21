@@ -27,13 +27,13 @@ pub struct DeviceWeights {
 }
 
 /// Copies every linear of `b` into GPU memory. `admission` comes from `weights::admit_load`,
-/// taken before the CUDA context was created; it is held until every allocation is made and
-/// filled, so a concurrent load's guard sees this one's memory as used. Before allocating, it
-/// confirms the admission covers this binding in this mode (`verifying` adds the reference's
-/// scratch) and that CUDA startup left the headroom.
-pub fn upload(stream: &Arc<CudaStream>, ck: &Checkpoint, b: &Binding, admission: Admission, verifying: bool) -> Result<DeviceWeights> {
+/// taken before the CUDA context was created. Before allocating, `upload` confirms the admission
+/// covers this binding in this mode (`verifying` adds the reference's scratch) and that CUDA
+/// startup left the headroom. It only borrows the admission: the caller holds it until every
+/// admitted allocation is made, including the verification scratch allocated after the copy, so a
+/// concurrent load's guard sees all of this one's memory as used (codex-review round 3 on #13).
+pub fn upload(stream: &Arc<CudaStream>, ck: &Checkpoint, b: &Binding, admission: &Admission, verifying: bool) -> Result<DeviceWeights> {
     admission.confirm(bytes_to_copy(ck, b), load_overhead_bytes(b, verifying), mem_available)?;
-    let _admission = admission;
     let t0 = Instant::now();
     let mut out = DeviceWeights { linears: HashMap::new(), bytes_copied: 0, load_secs: 0.0, mem_available_after: None };
     let mut buf = vec![0u8; STAGING_BYTES as usize];

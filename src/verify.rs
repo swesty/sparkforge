@@ -370,7 +370,9 @@ pub struct WeightReport {
     pub mem_available_after_load: Option<u64>,
 }
 
-/// GEMVs on real checkpoint weights against an f64 reference, timed across all layers.
+/// GEMVs on real checkpoint weights against an f64 reference, timed across all layers. The caller
+/// holds `admission` until this returns: the reference's scratch is allocated after the upload, and
+/// the admission covers it (`load_overhead_bytes` with `verifying`).
 pub fn verify_weights(
     p: &Plan,
     g: &Generated,
@@ -378,7 +380,7 @@ pub fn verify_weights(
     ck: &crate::weights::Checkpoint,
     b: &crate::weights::Binding,
     seed: u64,
-    admission: crate::weights::Admission,
+    admission: &crate::weights::Admission,
 ) -> Result<WeightReport> {
     use crate::device_weights::upload;
     unsafe { e.ctx.disable_event_tracking() };
@@ -424,5 +426,11 @@ pub fn verify_weights(
             rep.rows.push(WeightRow { linear: linear.into(), case: format!("all {} copies", ptrs.len()), err: None, us: Some(us), gbs: Some(bytes / (us * 1e3)) });
         }
     }
+    // Give the weights back before the caller drops the admission. cudarc frees into the stream's
+    // memory pool (`cuMemFreeAsync`), which returns memory to the system only at a synchronize, so
+    // without this a queued load would be admitted while `MemAvailable` still counts these weights
+    // and be refused for memory that is about to be free (measured on spark-5).
+    drop(dw);
+    s.synchronize()?;
     Ok(rep)
 }
