@@ -23,6 +23,13 @@
 - [x] 5.1 Open the checkpoint directory and walked directories with `O_PATH` on Linux
 - [x] 5.2 Test (Linux, non-root): an indexed checkpoint in a mode 0100 directory with a mode 0100 shard subdirectory loads
 
-## 6. Verification
-- [x] 6.1 `cargo test` on macOS and on spark-5; `cargo build --release --features cuda` on spark-5
-- [x] 6.2 `verify-weights` on Llama 3.1 8B passes on spark-5
+## 6. codex-review cycle 1 follow-ups
+- [x] 6.1 Pin a snapshot's `<repo>/blobs` at resolution and open blob links in it; test: `blobs` replaced after the config read still yields generation A
+- [x] 6.2 Resolve inside link targets lexically and walk them from the checkpoint descriptor; test: `sub/../w` opens without `sub`, and isn't redirected by `sub` leading outside
+- [x] 6.3 Find older loads' runtime directories from `/proc/<pid>/environ`; test (Linux): an old process started with a custom `XDG_RUNTIME_DIR` blocks a load that wasn't
+- [x] 6.4 Take each lock file once by (device, inode); test: two spellings of one unheld legacy lock admit
+- [x] 6.5 ACL repair replaces the file; test: a descriptor kept from before the replacement cannot block admission
+
+## 7. Verification
+- [x] 7.1 `cargo test` on macOS and on spark-5; `cargo build --release --features cuda` on spark-5
+- [x] 7.2 `verify-weights` on Llama 3.1 8B passes on spark-5, from plain files and from a Hugging Face snapshot layout

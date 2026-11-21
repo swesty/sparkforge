@@ -962,13 +962,13 @@ fn only_a_hugging_face_snapshot_may_link_into_its_blobs() {
 fn legacy_locks_include_a_custom_runtime_directory() {
     use sparkforge::weights::legacy_lock_dirs;
     let tmp = std::path::Path::new("/tmp");
-    let dirs = legacy_lock_dirs(1000, Some(std::path::Path::new("/srv/xdg/1000")), tmp);
+    let dirs = legacy_lock_dirs(1000, &["/srv/xdg/1000".into(), "/srv/xdg/1000".into()], tmp);
     assert_eq!(dirs, vec![PathBuf::from("/run/user/1000"), PathBuf::from("/tmp/sparkforge-1000"), PathBuf::from("/srv/xdg/1000")]);
     // The default runtime directory is not listed twice, and a relative value is ignored (XDG
     // Base Directory spec), as the old loader's lock could never have been there.
-    assert_eq!(legacy_lock_dirs(1000, Some(std::path::Path::new("/run/user/1000")), tmp).len(), 2);
-    assert_eq!(legacy_lock_dirs(1000, Some(std::path::Path::new("run/user")), tmp).len(), 2);
-    assert_eq!(legacy_lock_dirs(1000, None, tmp).len(), 2);
+    assert_eq!(legacy_lock_dirs(1000, &["/run/user/1000".into()], tmp).len(), 2);
+    assert_eq!(legacy_lock_dirs(1000, &["run/user".into()], tmp).len(), 2);
+    assert_eq!(legacy_lock_dirs(1000, &[], tmp).len(), 2);
 }
 
 #[cfg(unix)]
@@ -983,7 +983,7 @@ fn an_older_load_under_a_custom_runtime_directory_blocks_a_new_load() {
     // The old binary ran with XDG_RUNTIME_DIR=<custom-xdg> and holds its lock there.
     let old = std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(false).open(xdg.join("sparkforge-gpu-admission.lock")).unwrap();
     old.lock().unwrap();
-    let legacy = legacy_lock_dirs(my_uid(), Some(&xdg), &root.join("tmp"));
+    let legacy = legacy_lock_dirs(my_uid(), std::slice::from_ref(&xdg), &root.join("tmp"));
     let locks = admission_locks_in(&node, 0, || None, my_uid(), || Some(home.clone()), &legacy).unwrap();
     assert_eq!(locks.legacy, vec![xdg.join("sparkforge-gpu-admission.lock")]);
     assert_eq!(locks.files()[0].kind, LockKind::Legacy);
@@ -1045,7 +1045,7 @@ fn the_node_lock_refuses_access_granted_by_an_acl() {
         return;
     }
     let err = format!("{:#}", admission_locks_in(&node, my_uid(), || Some(my_gid()), 1000, || None, &[]).unwrap_err());
-    assert!(err.contains("ACL") && err.contains("user 65534"), "{err}");
+    assert!(err.contains("ACL") && err.contains("user 65534") && err.contains("Replace the file"), "{err}");
     // Removing the entry makes it acceptable again.
     assert!(std::process::Command::new("setfacl").arg("-b").arg(&lock).status().unwrap().success());
     admission_locks_in(&node, my_uid(), || Some(my_gid()), 1000, || None, &[]).unwrap();
@@ -1071,4 +1071,120 @@ fn a_checkpoint_in_a_search_only_directory_loads() {
     chmod(&d, 0o700);
     chmod(&d.join("sub"), 0o700);
     assert!(r.as_ref().is_ok_and(|b| *b), "{:#}", r.err().unwrap());
+}
+
+// ---- SHA-787: codex-review cycle 1 follow-ups ----
+
+#[cfg(unix)]
+#[test]
+fn a_replaced_hugging_face_blob_store_cannot_mix_generations() {
+    // After the config is read from `<repo>/snapshots/<rev>`, `<repo>/blobs` is replaced by one
+    // holding a different, shape-compatible shard under the same hash name. Reads still come from
+    // the blob store that existed when the snapshot was opened.
+    use sparkforge::weights::{read_config, resolve_checkpoint_dir};
+    let root = std::fs::canonicalize(dir("hf-blob-swap")).unwrap();
+    let (blobs, snap) = (root.join("blobs"), root.join("snapshots/rev1"));
+    std::fs::create_dir(&blobs).unwrap();
+    std::fs::create_dir_all(&snap).unwrap();
+    write_shard(&blobs.join(HF_BLOB), &bf16(tensors(false)), 0);
+    std::fs::write(snap.join("config.json"), "{}").unwrap();
+    std::os::unix::fs::symlink(format!("../../blobs/{HF_BLOB}"), snap.join("model.safetensors")).unwrap();
+    let opened = resolve_checkpoint_dir(&snap).unwrap();
+    read_config(&opened).unwrap();
+    std::fs::rename(&blobs, root.join("blobs-a")).unwrap();
+    std::fs::create_dir(&blobs).unwrap();
+    write_shard(&blobs.join(HF_BLOB), &bf16(tensors(false)), 0);
+    let mut bytes = std::fs::read(blobs.join(HF_BLOB)).unwrap();
+    let n = bytes.len();
+    bytes[n - 1] ^= 0xff;
+    std::fs::write(blobs.join(HF_BLOB), bytes).unwrap();
+    let ck = Checkpoint::open_dir(&opened).unwrap();
+    let t = ck.tensors.values().max_by_key(|t| t.end).unwrap();
+    let mut got = vec![0u8; 1];
+    ck.read_range(t, t.len() - 1, &mut got).unwrap();
+    let want = std::fs::read(root.join("blobs-a").join(HF_BLOB)).unwrap();
+    assert_eq!(got[0], want[want.len() - 1], "the shard comes from the blob store the snapshot was opened with");
+}
+
+#[cfg(unix)]
+#[test]
+fn an_inside_link_is_resolved_without_walking_its_dot_dot() {
+    // `sub/../weights.safetensors` is resolved to `weights.safetensors` before any open, so the
+    // filesystem never resolves `..` from `sub`, which could have been moved elsewhere by then.
+    // Here `sub` doesn't even exist: a walk of the link's text would fail on it.
+    let g = dir("dot-dot");
+    write_shard(&g.join("weights.safetensors"), &bf16(tensors(false)), 0);
+    std::os::unix::fs::symlink("sub/../weights.safetensors", g.join("model.safetensors")).unwrap();
+    bind(&Checkpoint::open(&g).unwrap(), &spec(false)).unwrap();
+    // Now `sub` leads to `<outside>/inner`, whose parent holds a different shard (no `lm_head`)
+    // under the same name, which is where a physical `..` from `sub` would land. It is not read.
+    let outside = dir("dot-dot-outside");
+    std::fs::create_dir(outside.join("inner")).unwrap();
+    write_shard(&outside.join("weights.safetensors"), &bf16(tensors(true)), 0);
+    std::os::unix::fs::symlink(outside.join("inner"), g.join("sub")).unwrap();
+    let ck = Checkpoint::open(&g).unwrap();
+    assert!(ck.tensors.contains_key("lm_head.weight"), "read the checkpoint's own shard");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn an_older_load_started_with_another_runtime_directory_is_found() {
+    // The old load was started with XDG_RUNTIME_DIR=<custom>; this process was not. Its runtime
+    // directory is read from the old process's own environment, so the new load still waits.
+    use sparkforge::weights::{admission_locks_in, admit, legacy_lock_dirs, runtime_dirs_of_processes};
+    let root = dir("legacy-proc");
+    let (node, home, xdg) = (root.join("absent-node-dir"), root.join("home"), root.join("old-xdg"));
+    std::fs::create_dir(&home).unwrap();
+    std::fs::create_dir(&xdg).unwrap();
+    chmod(&xdg, 0o700);
+    let mut old_proc = std::process::Command::new("sleep").arg("30").env("XDG_RUNTIME_DIR", &xdg).spawn().unwrap();
+    // The old load's lock, held for the duration (by this test, standing in for that process).
+    let old = std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(false).open(xdg.join("sparkforge-gpu-admission.lock")).unwrap();
+    old.lock().unwrap();
+    let found = runtime_dirs_of_processes(std::path::Path::new("/proc"), my_uid());
+    let legacy = legacy_lock_dirs(my_uid(), &found, &root.join("tmp"));
+    let locks = admission_locks_in(&node, 0, || None, my_uid(), || Some(home.clone()), &legacy);
+    let waited = locks.map(|l| admit(&l.files(), 0, 0, || Some(64 << 30), std::time::Duration::from_millis(200)).map(|_| ()));
+    old_proc.kill().unwrap();
+    old_proc.wait().unwrap();
+    assert!(found.contains(&xdg), "{found:?}");
+    let err = format!("{:#}", waited.unwrap().err().expect("must wait for the old load"));
+    assert!(err.contains("gave up after"), "{err}");
+}
+
+#[cfg(unix)]
+#[test]
+fn one_lock_reached_by_two_spellings_is_taken_once() {
+    // `$XDG_RUNTIME_DIR=/run/user/1000/../1000` and `/run/user/1000` name one leftover lock: it is
+    // locked once instead of waiting on this process's own first lock.
+    use sparkforge::weights::{admission_locks_in, admit};
+    let root = dir("alias-lock");
+    let (node, home, run) = (root.join("absent-node-dir"), root.join("home"), root.join("run"));
+    std::fs::create_dir(&home).unwrap();
+    std::fs::create_dir(&run).unwrap();
+    chmod(&run, 0o700);
+    std::fs::write(run.join("sparkforge-gpu-admission.lock"), b"").unwrap();
+    let aliased = root.join("run/../run");
+    let locks = admission_locks_in(&node, 0, || None, my_uid(), || Some(home.clone()), &[run.clone(), aliased]).unwrap();
+    assert_eq!(locks.legacy.len(), 2, "both spellings are eligible");
+    admit(&locks.files(), 0, 0, || Some(64 << 30), std::time::Duration::from_millis(500)).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn a_descriptor_kept_from_before_a_lock_was_replaced_cannot_block_admission() {
+    // An outside account opened the node lock while an ACL allowed it and still holds a lock on
+    // it. The documented repair replaces the file, and admission then uses the new inode.
+    use sparkforge::weights::{admission_locks_in, admit};
+    let node = dir("node-replace").join("run-sparkforge");
+    provision_node(&node, 0o640);
+    let lock = node.join("admission.lock");
+    let kept = std::fs::File::open(&lock).unwrap();
+    kept.lock().unwrap();
+    std::fs::remove_file(&lock).unwrap();
+    std::fs::write(&lock, b"").unwrap();
+    chmod(&lock, 0o640);
+    let locks = admission_locks_in(&node, my_uid(), || Some(my_gid()), 1000, || None, &[]).unwrap();
+    admit(&locks.files(), 0, 0, || Some(64 << 30), std::time::Duration::from_millis(500)).unwrap();
+    drop(kept);
 }

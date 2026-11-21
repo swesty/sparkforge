@@ -92,6 +92,11 @@ pub struct CheckpointDir {
     pub path: PathBuf,
     #[cfg(unix)]
     fd: File,
+    /// `<repo>/blobs` of a Hugging Face snapshot, opened when the snapshot is resolved, so blob
+    /// links resolve into the blob store that existed when the config was read, even if `blobs`
+    /// is replaced mid-load (codex-review cycle 1 on SHA-787).
+    #[cfg(unix)]
+    blobs: Option<File>,
 }
 
 impl CheckpointDir {
@@ -103,10 +108,12 @@ impl CheckpointDir {
     /// hang `open`) and requires the opened descriptor to be a regular file.
     ///
     /// No symlink on the way is followed, except one at the entry itself, and only when its target
-    /// stays inside this directory or is a Hugging Face cache blob (see `link_target`). That target
-    /// is walked the same way, one component at a time with `O_NOFOLLOW`, so a target that passes
-    /// through another symlink (for example a `current` alias that a publisher switches) is refused
-    /// rather than followed into whatever generation the alias names now (codex-review of SHA-765).
+    /// stays inside this directory or is a Hugging Face cache blob (see `link_target`). The target
+    /// is resolved lexically, so the filesystem never walks `..`: an inside target is walked from
+    /// this directory's descriptor, and a blob is opened in the blob store pinned at resolution.
+    /// That walk is one component at a time with `O_NOFOLLOW`, so a target that passes through
+    /// another symlink (for example a `current` alias that a publisher switches) is refused rather
+    /// than followed into whatever generation the alias names now (codex-review of SHA-765).
     fn open(&self, name: &str) -> Result<File> {
         let path = self.entry(name);
         #[cfg(unix)]
@@ -117,12 +124,17 @@ impl CheckpointDir {
             match nofollow::open_file(&parent, &last) {
                 Err(e) if e.raw_os_error() == Some(libc::ELOOP) => {
                     let target = nofollow::readlink(&parent, &last).with_context(|| format!("reading the link {}", path.display()))?;
-                    ensure!(
-                        link_target(Path::new(name), &target, self.is_hf_snapshot()) != LinkTarget::Outside,
-                        "{} links to {}, outside the checkpoint directory; a directory there can be replaced by another generation mid-load, so only links that stay inside the checkpoint, or a Hugging Face snapshot's links to ../../blobs/<hash>, are followed",
-                        path.display(), target.display()
-                    );
-                    let hop = nofollow::walk(&parent, &target).and_then(|(p, l)| nofollow::open_file(&p, &l));
+                    let hop = match link_target(Path::new(name), &target, self.is_hf_snapshot()) {
+                        LinkTarget::Inside(rel) => nofollow::walk(&self.fd, &rel).and_then(|(p, l)| nofollow::open_file(&p, &l)),
+                        LinkTarget::HfBlob(blob) => match &self.blobs {
+                            Some(blobs) => nofollow::cstr(&blob).and_then(|c| nofollow::open_file(blobs, &c)),
+                            None => Err(std::io::Error::from(ErrorKind::NotFound)),
+                        },
+                        LinkTarget::Outside => bail!(
+                            "{} links to {}, outside the checkpoint directory; a directory there can be replaced by another generation mid-load, so only links that stay inside the checkpoint, or a Hugging Face snapshot's links to ../../blobs/<hash>, are followed",
+                            path.display(), target.display()
+                        ),
+                    };
                     match hop {
                         Err(e) if e.kind() == ErrorKind::NotFound => Err(e),
                         Err(e) if matches!(e.raw_os_error(), Some(libc::ELOOP) | Some(libc::ENOTDIR)) => bail!(
@@ -185,12 +197,14 @@ impl CheckpointDir {
 /// Where a shard link's target lands, judged lexically from the link's own directory.
 #[derive(Debug, PartialEq, Eq)]
 enum LinkTarget {
-    /// Never leaves the checkpoint directory. The directory is pinned by descriptor and the walk
-    /// follows no symlink, so the target is part of the generation that was opened.
-    Inside,
-    /// `../../blobs/<sha1 or sha256>` from a Hugging Face snapshot. Blobs are content-addressed, so
-    /// the name cannot come to mean another generation's bytes.
-    HfBlob,
+    /// Never leaves the checkpoint directory; the path relative to it, with no `..` left. Walking
+    /// that from the pinned descriptor, rather than the link's text, means a subdirectory renamed
+    /// mid-walk cannot carry a `..` outside (codex-review cycle 1 on SHA-787).
+    Inside(PathBuf),
+    /// `../../blobs/<sha1 or sha256>` from a Hugging Face snapshot: the blob's name, opened in the
+    /// blob store pinned at resolution. Blobs are named by content hash, so within that store the
+    /// name keeps meaning the same bytes.
+    HfBlob(std::ffi::OsString),
     /// Anything else, including an absolute target or one that climbs out and back in: a real
     /// directory on that path can be replaced between the config read and the shard open
     /// (codex-review round 3 on #13).
@@ -220,8 +234,8 @@ fn link_target(entry: &Path, target: &Path, hf_snapshot: bool) -> LinkTarget {
     }
     let is_hash = |n: &std::ffi::OsStr| n.to_str().is_some_and(|h| matches!(h.len(), 40 | 64) && h.bytes().all(|b| b.is_ascii_hexdigit()));
     match (above, depth.is_empty(), tail.as_slice()) {
-        (0, false, _) => LinkTarget::Inside,
-        (2, true, [blobs, hash]) if hf_snapshot && *blobs == "blobs" && is_hash(hash) => LinkTarget::HfBlob,
+        (0, false, _) => LinkTarget::Inside(depth.iter().collect()),
+        (2, true, [blobs, hash]) if hf_snapshot && *blobs == "blobs" && is_hash(hash) => LinkTarget::HfBlob(hash.to_os_string()),
         _ => LinkTarget::Outside,
     }
 }
@@ -251,7 +265,7 @@ mod nofollow {
     #[cfg(not(target_os = "linux"))]
     pub const DIR_FLAGS: i32 = libc::O_RDONLY | libc::O_DIRECTORY;
 
-    fn cstr(s: &std::ffi::OsStr) -> io::Result<CString> {
+    pub fn cstr(s: &std::ffi::OsStr) -> io::Result<CString> {
         CString::new(s.as_bytes()).map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains a NUL byte"))
     }
 
@@ -275,6 +289,12 @@ mod nofollow {
             cur = openat(&cur, &name, DIR_FLAGS)?;
         }
         Ok((cur, cstr(last)?))
+    }
+
+    /// Opens the directory at `path` from `start` with no symlink anywhere on the way.
+    pub fn open_dir(start: &File, path: &Path) -> io::Result<File> {
+        let (parent, last) = walk(start, path)?;
+        openat(&parent, &last, DIR_FLAGS)
     }
 
     /// Opens a file non-blocking; a symlink there fails with `ELOOP`.
@@ -326,7 +346,17 @@ pub fn resolve_checkpoint_dir(dir: &Path) -> Result<CheckpointDir> {
         // O_NOFOLLOW: if the canonical entry became a symlink since `canonicalize`, fail.
         let fd = std::fs::OpenOptions::new().read(true).custom_flags(nofollow::DIR_FLAGS | libc::O_NOFOLLOW)
             .open(&path).with_context(|| format!("opening checkpoint directory {}", path.display()))?;
-        Ok(CheckpointDir { path, fd })
+        let mut dir = CheckpointDir { path, fd, blobs: None };
+        if dir.is_hf_snapshot() {
+            // `..` twice from the opened snapshot, then `blobs`, none of them a symlink. A cache
+            // without a blob store just has no blob links to follow.
+            dir.blobs = match nofollow::open_dir(&dir.fd, Path::new("../../blobs")) {
+                Ok(b) => Some(b),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+                Err(e) => return Err(nofollow::explain(e, &dir.path.join("../../blobs"), "is not a real directory")),
+            };
+        }
+        Ok(dir)
     }
     #[cfg(not(unix))]
     Ok(CheckpointDir { path })
@@ -862,10 +892,8 @@ fn open_lock(path: &Path, writable: bool, create: bool) -> Result<File> {
     Ok(lock)
 }
 
-/// Takes the `flock` on one lock, waiting at most `wait` for the current holder.
-fn take_lock(l: &LockFile, wait: std::time::Duration) -> Result<File> {
-    let path = l.path.as_path();
-    let lock = open_lock(path, l.kind != LockKind::Node, l.kind == LockKind::User)?;
+/// Takes the `flock` on an opened lock, waiting at most `wait` for the current holder.
+fn take_lock(lock: File, path: &Path, wait: std::time::Duration) -> Result<File> {
     let deadline = std::time::Instant::now() + wait;
     let mut told = false;
     loop {
@@ -888,9 +916,28 @@ fn take_lock(l: &LockFile, wait: std::time::Duration) -> Result<File> {
 /// Takes every lock in `locks`, in order (see `AdmissionLocks::files`), then runs the memory guard
 /// against `mem()` for `copy_bytes + overhead`. The locks are advisory `flock`s, so they coordinate
 /// sparkforge processes; other programs are seen only through `MemAvailable`.
+///
+/// Two entries naming one file (for example `$XDG_RUNTIME_DIR` spelled `/run/user/1000/../1000`)
+/// are locked once: `flock`s on two descriptors of one file conflict, so the second would wait for
+/// this process's own first one (codex-review cycle 1 on SHA-787).
 pub fn admit(locks: &[LockFile], copy_bytes: u64, overhead: u64, mem: impl Fn() -> Option<u64>, wait: std::time::Duration) -> Result<Admission> {
     ensure!(!locks.is_empty(), "no admission lock to take");
-    let held = locks.iter().map(|l| take_lock(l, wait)).collect::<Result<Vec<_>>>()?;
+    let mut held = Vec::new();
+    let mut seen = HashSet::new();
+    for l in locks {
+        let lock = open_lock(&l.path, l.kind != LockKind::Node, l.kind == LockKind::User)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let m = lock.metadata().with_context(|| format!("inspecting {}", l.path.display()))?;
+            if !seen.insert((m.dev(), m.ino())) {
+                continue;
+            }
+        }
+        #[cfg(not(unix))]
+        let _ = &mut seen;
+        held.push(take_lock(lock, &l.path, wait)?);
+    }
     let avail = mem().context("cannot read MemAvailable from /proc/meminfo; refusing to allocate without the memory guard")?;
     check_headroom(copy_bytes + overhead, avail)?;
     Ok(Admission { _locks: held, copy_bytes, overhead })
@@ -1005,7 +1052,7 @@ pub fn admission_locks_in(
                 #[cfg(target_os = "linux")]
                 if let Some(acl) = access_acl(&lock)? {
                     if let Some(who) = acl_named_grant(&acl).with_context(|| format!("reading the ACL of {}", lock.display()))? {
-                        bail!("{} has a POSIX ACL entry granting {who} access, so an account outside group {NODE_LOCK_GROUP} could hold it; remove it with `setfacl -b`", lock.display());
+                        bail!("{} has a POSIX ACL entry granting {who} access, so an account outside group {NODE_LOCK_GROUP} could hold it. Replace the file rather than editing its ACL, since a descriptor opened while the ACL allowed it keeps working: drain loads, remove it, and recreate it (`systemd-tmpfiles --create`)", lock.display());
                     }
                 }
                 Some(lock)
@@ -1043,8 +1090,11 @@ pub fn admission_locks() -> Result<AdmissionLocks> {
     #[cfg(unix)]
     {
         let uid = unsafe { libc::geteuid() };
-        let xdg = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from);
-        let legacy = legacy_lock_dirs(uid, xdg.as_deref(), &std::env::temp_dir());
+        #[allow(unused_mut)] // extended on Linux only
+        let mut xdg: Vec<PathBuf> = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from).into_iter().collect();
+        #[cfg(target_os = "linux")]
+        xdg.extend(runtime_dirs_of_processes(Path::new("/proc"), uid));
+        let legacy = legacy_lock_dirs(uid, &xdg, &std::env::temp_dir());
         admission_locks_in(Path::new(NODE_LOCK_DIR), 0, || gid_of(NODE_LOCK_GROUP), uid, || home_dir_of(uid), &legacy)
     }
     #[cfg(not(unix))]
@@ -1054,18 +1104,47 @@ pub fn admission_locks() -> Result<AdmissionLocks> {
 }
 
 /// Where a loader from before SHA-765 may hold its lock: `/run/user/<uid>`, `<tmp>/sparkforge-<uid>`,
-/// and `$XDG_RUNTIME_DIR`, which that loader used whatever it pointed to. The environment is read
-/// here only for compatibility: these locks are taken when they already exist and are this user's,
-/// never created, so a process without the variable still meets every other one at the user lock
-/// (codex-review round 3 on #13). A relative value is ignored, as the XDG spec requires.
-pub fn legacy_lock_dirs(uid: u32, xdg_runtime_dir: Option<&Path>, tmp: &Path) -> Vec<PathBuf> {
+/// and every `XDG_RUNTIME_DIR` value given, since that loader used whatever the variable named
+/// (codex-review round 3 on #13). Environment values are used here only for compatibility: these
+/// locks are taken when they already exist and are this user's, never created, so the user lock
+/// stays the one meeting point. Relative values are ignored, as the XDG spec requires.
+pub fn legacy_lock_dirs(uid: u32, xdg_runtime_dirs: &[PathBuf], tmp: &Path) -> Vec<PathBuf> {
     let mut dirs = vec![PathBuf::from(format!("/run/user/{uid}")), tmp.join(format!("sparkforge-{uid}"))];
-    if let Some(x) = xdg_runtime_dir.filter(|x| x.is_absolute()) {
-        if !dirs.iter().any(|d| d == x) {
-            dirs.push(x.to_path_buf());
+    for x in xdg_runtime_dirs.iter().filter(|x| x.is_absolute()) {
+        if !dirs.contains(x) {
+            dirs.push(x.clone());
         }
     }
     dirs
+}
+
+/// `XDG_RUNTIME_DIR` of every process `uid` runs, read from `<proc>/<pid>/environ` (the
+/// environment each started with). An old load may have been started with a runtime directory this
+/// process wasn't, and its own environment is the one place that records it (codex-review cycle 1
+/// on SHA-787). Processes that can't be read are skipped.
+#[cfg(target_os = "linux")]
+pub fn runtime_dirs_of_processes(proc: &Path, uid: u32) -> Vec<PathBuf> {
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::MetadataExt;
+    let mut out: Vec<PathBuf> = Vec::new();
+    let Ok(entries) = std::fs::read_dir(proc) else { return out };
+    for e in entries.flatten() {
+        if !e.file_name().to_str().is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit())) {
+            continue;
+        }
+        let dir = e.path();
+        if !std::fs::metadata(&dir).is_ok_and(|m| m.uid() == uid) {
+            continue;
+        }
+        let Ok(env) = std::fs::read(dir.join("environ")) else { continue };
+        for v in env.split(|&b| b == 0).filter_map(|kv| kv.strip_prefix(b"XDG_RUNTIME_DIR=")) {
+            let d = PathBuf::from(std::ffi::OsStr::from_bytes(v));
+            if d.is_absolute() && !out.contains(&d) {
+                out.push(d);
+            }
+        }
+    }
+    out
 }
 
 /// The first entry of a `system.posix_acl_access` value that grants a named user or a named group

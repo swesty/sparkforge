@@ -36,6 +36,14 @@ shard's data section, checked without overflow, and byte counts MUST match dtype
 - **WHEN** a shard in `<repo>/snapshots/<rev>` links to `../../blobs/<sha256>`
 - **THEN** it opens, while a blob name that is not a hash, or the same link from a directory that is not a snapshot, is refused
 
+#### Scenario: Blob store replaced after the config read
+- **WHEN** a snapshot's `<repo>/blobs` is replaced, after the config read, by one holding other bytes under the same hash names
+- **THEN** the shards still come from the blob store the snapshot was opened with
+
+#### Scenario: Link through a parent component
+- **WHEN** a shard links to `sub/../weights.safetensors`
+- **THEN** it opens `weights.safetensors` in the checkpoint directory without resolving `..` through `sub`
+
 #### Scenario: Search-only directory
 - **WHEN** the checkpoint directory and a shard's subdirectory grant search but not read permission
 - **THEN** the checkpoint opens on Linux
@@ -50,7 +58,7 @@ A load SHALL be refused before any CUDA call if its copied bytes, staging buffer
 verifying, reference scratch exceed `MemAvailable` minus 4 GiB, and rechecked before allocating.
 Admission SHALL be held until that memory is allocated, or freed after verification, and
 serialized across this user's processes and, through a group-only node lock when provisioned,
-across all users'. Lock locations come from ownership, never environment.
+across all users'. Lock locations come from ownership; the environment only finds an older loader's lock.
 
 #### Scenario: Too large to copy
 - **WHEN** the bytes to copy plus overhead exceed `MemAvailable` minus 4 GiB
@@ -74,11 +82,15 @@ across all users'. Lock locations come from ownership, never environment.
 
 #### Scenario: Lock opened to another account by an ACL
 - **WHEN** the node-wide lock is mode 0640 in group `sparkforge` but an ACL entry grants a named user read access
-- **THEN** admission refuses it, naming that user (mode bits and ACL entries both count)
+- **THEN** admission refuses it, naming that user and saying to replace the file, since removing the ACL leaves descriptors already opened usable
 
 #### Scenario: Upgrade from a custom runtime directory
-- **WHEN** a load by the loader before SHA-765, run with a custom `XDG_RUNTIME_DIR`, holds its lock there
-- **THEN** a new load waits for it, and no lock is created there when none exists
+- **WHEN** a load by the loader before SHA-765, run with a custom `XDG_RUNTIME_DIR`, holds its lock there, and the new load is started without that variable
+- **THEN** on Linux the new load finds it through the old process's environment and waits, and no lock is created there when none exists
+
+#### Scenario: One lock under two spellings
+- **WHEN** two candidate paths name the same lock file
+- **THEN** admission locks it once instead of waiting on itself
 
 #### Scenario: Second load during verification
 - **WHEN** a second `verify-weights` starts while the first is copying or verifying, with room for only one
