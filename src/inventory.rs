@@ -26,8 +26,8 @@ pub struct Want {
 
 /// What the inventory needs from the checkpoint beyond the spec.
 pub struct Layout {
-    /// The canonical path of the PLE module (`layers.1.ple` in the reference checkpoint).
-    pub ple: String,
+    /// Where the checkpoint keeps the PLE (see `ple_paths`).
+    pub ple: PlePaths,
     /// Rows in each PLE table shard for a tensor check. `None` lists modules only, for resolving
     /// tensor names when planning: each matrix appears as its `.weight` alone, whatever its format
     /// (a planning override such as W4A16 then needs no loadable tensor set), with empty dtypes and
@@ -35,24 +35,48 @@ pub struct Layout {
     pub table_rows: Option<usize>,
 }
 
-/// The canonical path of the checkpoint's PLE module: `layers.<n>.ple` with `n` the configured PLE
-/// layer `p` or `p - 1`, or a model-level `ple`. Exactly one may hold modules, and a model-level
-/// table under its bare name (`ple_embedding.ngram_embedding`) counts as a second location: the
-/// planner prices one PLE and one table (codex-review of #17).
-pub fn ple_path(table: &ModuleTable, h: &Hybrid) -> Result<String> {
+/// Canonical paths of the checkpoint's PLE.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlePaths {
+    /// The PLE module holding the projections, conv and norms (`layers.1.ple` in the reference).
+    pub module: String,
+    /// The n-gram embedding holding the table and its size tensors: `<module>.ple_embedding`, or a
+    /// model-level `ple_embedding` (the bare table path the planner also accepts).
+    pub embedding: String,
+}
+
+impl PlePaths {
+    /// The n-gram table, a group of shards.
+    pub fn table(&self) -> String {
+        format!("{}.ngram_embedding", self.embedding)
+    }
+}
+
+/// Where the checkpoint keeps its PLE: the module at `layers.<n>.ple` (`n` the configured PLE layer
+/// `p` or `p - 1`) or a model-level `ple`, and the n-gram embedding under that module or at the
+/// model-level `ple_embedding`. Each is resolved on its own, and exactly one location may hold
+/// each: the planner prices one PLE and one table (codex-review of #17 and #18).
+pub fn ple_paths(table: &ModuleTable, h: &Hybrid) -> Result<PlePaths> {
     let mut candidates: Vec<String> = h.ple.layer_ids.iter().flat_map(|&p| [Some(p), p.checked_sub(1)]).flatten()
         .map(|n| format!("layers.{n}.ple")).collect();
     candidates.dedup();
     candidates.push("ple".into());
-    let mut live: Vec<String> = candidates.iter().filter(|c| table.has(c)).cloned().collect();
-    if table.has(PLE_TABLE) {
-        live.push(PLE_TABLE.into());
-    }
-    match live.as_slice() {
-        [one] if one != PLE_TABLE => Ok(one.clone()),
-        [] | [_] => bail!("the checkpoint holds no PLE module at {}; the plan needs its projections and n-gram table", candidates.join(", ")),
-        _ => bail!("the checkpoint holds PLE modules at {}; the planner prices one PLE and one n-gram table, so only one location may hold them", live.join(" and ")),
-    }
+    let live: Vec<&String> = candidates.iter().filter(|c| table.has(c)).collect();
+    let module = match live.as_slice() {
+        [one] => (*one).clone(),
+        [] => bail!("the checkpoint holds no PLE module at {}; the plan needs its projections and n-gram table", candidates.join(", ")),
+        _ => bail!("the checkpoint holds PLE modules at {}; the planner prices one PLE, so only one location may hold it",
+            live.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(" and ")),
+    };
+    let bare = PLE_TABLE.trim_end_matches(".ngram_embedding");
+    let embeddings = [format!("{module}.{bare}"), bare.to_string()];
+    let live: Vec<&String> = embeddings.iter().filter(|e| table.has(e)).collect();
+    let embedding = match live.as_slice() {
+        [one] => (*one).clone(),
+        [] => bail!("the checkpoint holds no PLE n-gram embedding at {} or {}; the plan needs its table", embeddings[0], embeddings[1]),
+        _ => bail!("the checkpoint holds PLE n-gram tables at {} and {}; the planner prices one table, so only one location may hold it", embeddings[0], embeddings[1]),
+    };
+    Ok(PlePaths { module, embedding })
 }
 
 /// Every tensor a hybrid checkpoint must hold for `m`, with its dtype and shape. `f` must be the
@@ -93,7 +117,7 @@ pub fn hybrid(m: &ModelSpec, f: &Formats, layout: &Layout) -> Result<Vec<Want>> 
         inv.mixer(&format!("{p}.mlp_hyper_connection"), h, res, true, "F32");
     }
     // The PLE: projections widening to the residual, its conv and norms, and the n-gram table.
-    let ple = &layout.ple;
+    let ple = &layout.ple.module;
     let pd = h.ple.embed_dim;
     inv.projection(&format!("{ple}.key_proj"), h.hc.streams * m.hidden, pd, f.ple("key_proj"), "ple")?;
     inv.projection(&format!("{ple}.value_proj"), m.hidden, pd, f.ple("value_proj"), "ple")?;
@@ -101,13 +125,15 @@ pub fn hybrid(m: &ModelSpec, f: &Formats, layout: &Layout) -> Result<Vec<Want>> 
     for norm in ["norm_conv", "norm_key", "norm_query"] {
         inv.tensor(format!("{ple}.{norm}.weight"), "F32", vec![res], "ple");
     }
-    let emb = format!("{ple}.ple_embedding");
+    let emb = &layout.ple.embedding;
     inv.tensor(format!("{emb}.layer_multipliers"), "I64", vec![h.ple.ngram_size as usize], "ple");
     inv.tensor(format!("{emb}.ngram_heads_offsets"), "I64", vec![h.ple.heads() as usize], "ple");
     inv.tensor(format!("{emb}.ngram_heads_vocab_sizes"), "I64", vec![h.ple.heads() as usize], "ple");
-    let table = format!("{ple}.{PLE_TABLE}");
+    let table = layout.ple.table();
     let tf = f.ple_table();
-    if matches!(tf, WeightFormat::Nvfp4 | WeightFormat::Nvfp4WeightOnly) {
+    // The table's global scale is storage metadata of its format: checked with the tensors, never
+    // required when only modules are listed (a planning override then changes nothing stored).
+    if !inv.1 && matches!(tf, WeightFormat::Nvfp4 | WeightFormat::Nvfp4WeightOnly) {
         inv.tensor(format!("{table}.weight_scale_2"), "F32", vec![1], "ple_table");
     }
     // The shards are listed when the config says how many there are. Planning doesn't need the

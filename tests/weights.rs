@@ -1468,7 +1468,7 @@ fn without_a_shard_count_the_table_must_still_hold_numbered_shards() {
     assert!(err.contains("must hold shards") && err.contains("none"), "{err}");
     let gap: Vec<_> = tiny_tensors().into_iter().filter(|t| !t.0.contains(".shard_1.")).collect();
     let err = format!("{:#}", plan("hy-shards-gap", &gap).unwrap_err());
-    assert!(err.contains("must hold shards") && err.contains("shard_0, shard_2, shard_3"), "{err}");
+    assert!(err.contains("must hold shards") && err.contains("ngram_embedding.shard_3"), "{err}");
 }
 
 #[test]
@@ -1529,4 +1529,139 @@ fn checked_table_rows_do_not_survive_resolving_another_checkpoint() {
     let c = sparkforge::weights::check_hybrid(&b, &s).unwrap();
     sparkforge::weights::apply_checked_table(&mut s, &c);
     assert_eq!(rows(&s), Some(64));
+}
+
+// ---- SHA-767: codex-review cycle 3 follow-ups on #18 ----
+
+/// The tiny config with its PLE table left at the BF16 default, and matching tensors.
+fn bf16_table() -> (serde_json::Value, Vec<common::Tensor>) {
+    let mut cfg = common::tiny_config();
+    cfg["quantization_config"]["quantized_layers"].as_object_mut().unwrap().remove("model.language_model.layers.1.ple.ple_embedding.ngram_embedding");
+    let table = "model.language_model.layers.1.ple.ple_embedding.ngram_embedding";
+    let mut ts: Vec<common::Tensor> = tiny_tensors().into_iter().filter(|t| !t.0.starts_with(table)).collect();
+    for j in 0..4 {
+        ts.push((format!("{table}.shard_{j}.weight"), "BF16", vec![common::TINY_TABLE_ROWS, 16]));
+    }
+    (cfg, ts)
+}
+
+#[test]
+fn an_nvfp4_planning_override_needs_no_table_scale_from_a_bf16_table() {
+    // fp:8bf2edacbd78: a BF16 table has no global scale. Planning it with `--format nvfp4` lists
+    // modules only, so nothing format-specific is required; `weights` checks the table as BF16.
+    let (cfg, ts) = bf16_table();
+    let d = write_hybrid("hy-nvfp4-plan", &cfg, &ts, &common::TINY_VOCAB_SIZES);
+    let c = d.join("config.json");
+    let out = sparkforge_cli(&["plan".as_ref(), c.as_os_str(), "--checkpoint".as_ref(), d.as_os_str(), "--format".as_ref(), "nvfp4".as_ref()]);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let out = sparkforge_cli(&["weights".as_ref(), d.as_os_str()]);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let c = check_dir(&d).unwrap();
+    assert_eq!(c.groups.iter().find(|(g, _)| *g == "ple_table").unwrap().1, 4 * 15 * 16 * 2);
+}
+
+#[test]
+fn a_sole_model_level_table_beside_the_ple_projections_resolves() {
+    // fp:545c13177f21: projections under `model.language_model.ple` and the only n-gram embedding
+    // at the bare `model.language_model.ple_embedding` are one PLE and one table.
+    let mut cfg = common::tiny_config();
+    let q = cfg["quantization_config"]["quantized_layers"].as_object_mut().unwrap();
+    q.remove("model.language_model.layers.1.ple.ple_embedding.ngram_embedding");
+    q.insert("model.language_model.ple_embedding.ngram_embedding".into(), serde_json::json!({"quant_algo": "NVFP4", "group_size": 16}));
+    let ts: Vec<common::Tensor> = common::hybrid_tensors(&tiny_spec(), "ple", common::TINY_TABLE_ROWS).into_iter()
+        .map(|(n, d, s)| (n.replace("model.language_model.ple.ple_embedding", "model.language_model.ple_embedding"), d, s)).collect();
+    let d = write_hybrid("hy-bare", &cfg, &ts, &common::TINY_VOCAB_SIZES);
+    let c = check_dir(&d).unwrap();
+    assert_eq!(c.table_rows, 15);
+    // The same projections with tables at both the nested and the bare path: two tables.
+    let mut both = ts.clone();
+    both.push(("model.language_model.ple.ple_embedding.ngram_embedding.shard_0.weight".into(), "U8", vec![15, 8]));
+    let err = format!("{:#}", check_dir(&write_hybrid("hy-bare-both", &cfg, &both, &common::TINY_VOCAB_SIZES)).unwrap_err());
+    assert!(err.contains("PLE n-gram tables at ple.ple_embedding and ple_embedding"), "{err}");
+}
+
+#[test]
+fn a_hollow_shard_or_a_weight_at_the_experts_path_is_refused_on_resolve() {
+    // fp:a2758f4d8976: with no configured count, a shard holding only an observer has no module
+    // at its own path; a weight at `layers.0.mlp.experts` itself is no planned operand.
+    let mut cfg = common::tiny_config();
+    cfg["text_config"].as_object_mut().unwrap().remove("split_ngram_parts");
+    let resolve = |name: &str, ts: &[common::Tensor]| {
+        let d = write_hybrid(name, &cfg, ts, &common::TINY_VOCAB_SIZES);
+        sparkforge::weights::spec_from_checkpoint(&sparkforge::weights::resolve_checkpoint_dir(&d).unwrap(), None, None).map(|_| ())
+    };
+    let shard = "model.language_model.layers.1.ple.ple_embedding.ngram_embedding.shard_1";
+    let mut hollow: Vec<_> = tiny_tensors().into_iter().filter(|t| !t.0.starts_with(&format!("{shard}."))).collect();
+    hollow.push((format!("{shard}.observer.weight"), "BF16", vec![4]));
+    let err = format!("{:#}", resolve("hy-hollow", &hollow).unwrap_err());
+    assert!(err.contains("layers.1.ple.ple_embedding.ngram_embedding.shard_1") && err.contains("no tensors of their own"), "{err}");
+    let mut root = tiny_tensors();
+    root.push(("model.language_model.layers.0.mlp.experts.weight".into(), "BF16", vec![4]));
+    let err = format!("{:#}", resolve("hy-experts-root", &root).unwrap_err());
+    assert!(err.contains("under layers.0.mlp.experts that the plan doesn't price: layers.0.mlp.experts"), "{err}");
+}
+
+#[test]
+fn the_mtp_shared_expert_gate_is_priced_at_its_own_format() {
+    // fp:1a87af5b409b: an MXFP8 MTP shared-expert gate passes the tensor check, lowers the resident
+    // budget by 64 x (2 - 1.03125) = 62 bytes, and its entry is used.
+    use sparkforge::{plan, target::GB10};
+    let mut cfg = common::tiny_config();
+    let gate = "mtp.layers.0.mlp.shared_expert_gate";
+    cfg["quantization_config"]["quantized_layers"][gate] = serde_json::json!({"quant_algo": "MXFP8", "group_size": 32});
+    let mut ts: Vec<_> = tiny_tensors().into_iter().filter(|t| t.0 != format!("{gate}.weight")).collect();
+    ts.push((format!("{gate}.weight"), "F8_E4M3", vec![1, 64]));
+    ts.push((format!("{gate}.weight_scale"), "U8", vec![1, 2]));
+    let d = write_hybrid("hy-mtp-gate", &cfg, &ts, &common::TINY_VOCAB_SIZES);
+    check_dir(&d).unwrap();
+    let dir = sparkforge::weights::resolve_checkpoint_dir(&d).unwrap();
+    let opts = plan::PlanOpts { prefill_tokens: 2048, ctx: 4096 };
+    let p = plan::build(&sparkforge::weights::spec_from_checkpoint(&dir, None, None).unwrap(), &GB10, &opts);
+    let base = plan::build(&tiny_spec(), &GB10, &opts);
+    assert!(((base.budget.weight_gib - p.budget.weight_gib) * (1u64 << 30) as f64 - 62.0).abs() < 1e-3);
+    assert!(!p.notes.iter().any(|n| n.contains(gate)), "{:#?}", p.notes);
+}
+
+#[test]
+fn an_overflowing_ple_head_count_is_a_config_error() {
+    // fp:a6ec42c0ccb6: (3 - 1) x 2^31 heads overflows 32 bits before any row arithmetic.
+    let mut cfg = common::tiny_config();
+    cfg["text_config"]["heads_per_ngram"] = serde_json::json!(2147483648u64);
+    let err = format!("{:#}", ModelSpec::from_json(&cfg.to_string(), None).unwrap_err());
+    assert!(err.contains("overflows the PLE head count"), "{err}");
+}
+
+#[test]
+fn an_extreme_shard_count_fails_promptly_on_the_live_shards() {
+    // fp:d21035eb929c: split_ngram_parts of u32::MAX with 4 live shards fails from the live names,
+    // without listing a module per declared shard.
+    let mut cfg = common::tiny_config();
+    cfg["text_config"]["split_ngram_parts"] = serde_json::json!(u32::MAX);
+    let d = write_hybrid("hy-parts", &cfg, &tiny_tensors(), &common::TINY_VOCAB_SIZES);
+    let t0 = std::time::Instant::now();
+    let err = format!("{:#}", check_dir(&d).unwrap_err());
+    assert!(err.contains("split_ngram_parts is 4294967295") && err.contains("lacks 4294967291 of them"), "{err}");
+    assert!(t0.elapsed() < std::time::Duration::from_secs(5), "{:?}", t0.elapsed());
+}
+
+#[test]
+fn a_failed_switch_keeps_the_previous_checkpoints_resolution_and_rows() {
+    // fp:a2fd6e1bac29: a spec checked against checkpoint A, then resolved onto a checkpoint B with
+    // two PLE tables, fails and keeps A's formats, checked rows and budget.
+    use sparkforge::{plan, target::GB10};
+    let a = Checkpoint::open(&write_hybrid("hy-switch-a", &common::tiny_config(), &tiny_tensors(), &common::TINY_VOCAB_SIZES)).unwrap();
+    let mut s = tiny_spec();
+    s.resolve_modules(a.tensors.keys().map(String::as_str)).unwrap();
+    let c = sparkforge::weights::check_hybrid(&a, &s).unwrap();
+    sparkforge::weights::apply_checked_table(&mut s, &c);
+    let gib = |s: &ModelSpec| plan::build(s, &GB10, &plan::PlanOpts { prefill_tokens: 2048, ctx: 4096 }).budget.weight_gib;
+    let before = gib(&s);
+    let mut names: Vec<String> = a.tensors.keys().cloned().collect();
+    names.push("model.language_model.ple_embedding.ngram_embedding.shard_0.weight".into());
+    let err = format!("{:#}", s.resolve_modules(names.iter().map(String::as_str)).unwrap_err());
+    assert!(err.contains("PLE n-gram tables"), "{err}");
+    assert_eq!(s.hybrid.as_ref().unwrap().ple.checked_rows, Some(60));
+    assert!(s.resolved.is_some());
+    assert_eq!(gib(&s), before);
+    sparkforge::weights::check_hybrid(&a, &s).unwrap();
 }

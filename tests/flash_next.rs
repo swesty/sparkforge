@@ -827,7 +827,7 @@ fn a_checkpoint_with_the_ple_table_at_two_paths_is_refused() {
         "model.language_model.ple_embedding.ngram_embedding.shard_0.weight",
         "model.language_model.ple_embedding.ngram_embedding.shard_0.weight_scale",
     ]).unwrap_err());
-    assert!(err.contains("layers.1.ple and ple_embedding.ngram_embedding") && err.contains("one PLE"), "{err}");
+    assert!(err.contains("PLE n-gram tables at layers.1.ple.ple_embedding and ple_embedding") && err.contains("one table"), "{err}");
     // A PLE under layer 2 beside the one under layer 1 (both accepted paths) is refused the same way.
     let err = format!("{:#}", resolved_with(&raw(), &["model.language_model.layers.2.ple.key_proj.weight"]).unwrap_err());
     assert!(err.contains("layers.2.ple and layers.1.ple") || err.contains("layers.1.ple and layers.2.ple"), "{err}");
@@ -916,7 +916,7 @@ fn an_extra_table_shard_or_expert_is_refused_on_resolve() {
     let shard = "model.language_model.layers.1.ple.ple_embedding.ngram_embedding.shard_128";
     ql(&mut v).insert(shard.into(), json!({"quant_algo": "NVFP4", "group_size": 16}));
     let err = format!("{:#}", resolved_with(&v, &[&format!("{shard}.weight")]).unwrap_err());
-    assert!(err.contains("layers.1.ple.ple_embedding.ngram_embedding.shard_128") && err.contains("doesn't price"), "{err}");
+    assert!(err.contains("also holds layers.1.ple.ple_embedding.ngram_embedding.shard_128") && err.contains("split_ngram_parts is 128"), "{err}");
     let err = format!("{:#}", resolved_with(&raw(), &["model.language_model.layers.7.mlp.experts.512.up_proj.weight"]).unwrap_err());
     assert!(err.contains("layers.7.mlp.experts.512") && err.contains("doesn't price"), "{err}");
 }

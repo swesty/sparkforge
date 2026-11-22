@@ -1040,8 +1040,8 @@ pub fn check_hybrid(ck: &Checkpoint, m: &ModelSpec) -> Result<HybridCheck> {
             bail!("the checkpoint holds {a} and {b}, two names for the tensor {c}; only one can be loaded");
         }
     }
-    let ple = crate::inventory::ple_path(&r.table, h)?;
-    let table_rows = ple_table_rows(ck, &by_name, &ple, &h.ple)?;
+    let ple = crate::inventory::ple_paths(&r.table, h)?;
+    let table_rows = ple_table_rows(ck, &by_name, &ple.embedding, &h.ple)?;
     let f = crate::plan::Formats::new(m);
     let wants = crate::inventory::hybrid(m, &f, &crate::inventory::Layout { ple, table_rows: Some(table_rows) })?;
     let mut problems = vec![];
@@ -1086,10 +1086,10 @@ pub fn apply_checked_table(m: &mut ModelSpec, c: &HybridCheck) {
 /// `ngram_vocab_size_base`, so their sizes come from the checkpoint (`ngram_heads_vocab_sizes`,
 /// with `ngram_heads_offsets` their running sum); the total is padded to a multiple of
 /// `make_ngram_vocab_size_divisible_by` and split evenly into `split_ngram_parts` shards.
-fn ple_table_rows(ck: &Checkpoint, by_name: &HashMap<&str, &TensorInfo>, ple: &str, p: &crate::config::Ple) -> Result<usize> {
+fn ple_table_rows(ck: &Checkpoint, by_name: &HashMap<&str, &TensorInfo>, embedding: &str, p: &crate::config::Ple) -> Result<usize> {
     let heads = p.heads() as usize;
     let read = |rel: &str| -> Result<Vec<i64>> {
-        let name = format!("{ple}.ple_embedding.{rel}");
+        let name = format!("{embedding}.{rel}");
         let t = by_name.get(name.as_str()).with_context(|| format!("missing {name} (expected I64 [{heads}]), which sizes the PLE n-gram table"))?;
         ensure!(t.dtype == "I64" && t.shape == [heads], "{}: expected I64 [{heads}], found {} {:?}", t.name, t.dtype, t.shape);
         let mut buf = vec![];

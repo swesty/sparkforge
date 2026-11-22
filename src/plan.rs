@@ -515,7 +515,9 @@ fn mtp_weight_bytes(m: &ModelSpec, h: &Hybrid, f: &Formats) -> f64 {
             } else {
                 0.0
             };
-            projections + e.num_experts as f64 * hd * b("mlp.gate")
+            // The shared expert's one-row gate, at its own format.
+            let gate = if e.shared_intermediate > 0 { hd * b("mlp.shared_expert_gate") } else { 0.0 };
+            projections + gate + e.num_experts as f64 * hd * b("mlp.gate")
         });
         attn + experts + shared
     };
