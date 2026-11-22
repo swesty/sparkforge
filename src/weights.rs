@@ -924,7 +924,7 @@ pub struct Binding {
 /// Validates the checkpoint against the spec and returns which tensors make each linear.
 pub fn bind(ck: &Checkpoint, m: &ModelSpec) -> Result<Binding> {
     if m.hybrid.is_some() {
-        bail!("{} checkpoints are checked tensor by tensor (`sparkforge weights`) but do not load into GPU memory yet", m.arch);
+        bail!("{} checkpoints load into GPU memory with `sparkforge load-weights` (experts repacked, PLE table resident or on disk), not through the dense binding", m.arch);
     }
     if !m.formats.is_empty() || m.declared_mixed {
         bail!("{} checkpoints with mixed-precision weights do not load yet; only the hybrid layout reads per-module formats", m.arch);
@@ -1024,22 +1024,7 @@ const SKIPPED_TOWERS: [&str; 1] = ["visual."];
 pub fn check_hybrid(ck: &Checkpoint, m: &ModelSpec) -> Result<HybridCheck> {
     let Some(h) = &m.hybrid else { bail!("{} is not a hybrid model", m.arch) };
     let Some(r) = &m.resolved else { bail!("the spec must be resolved onto this checkpoint's modules before its tensors are checked") };
-    // Canonical name -> tensor, refusing two spellings of one tensor (`model.layers.0...` beside
-    // `model.language_model.layers.0...`): only one of them could be loaded.
-    let mut by_name: HashMap<&str, &TensorInfo> = HashMap::new();
-    let (mut skipped, mut skipped_bytes) = (0, 0);
-    for t in ck.tensors.values() {
-        let c = crate::modules::canonical(&t.name);
-        if SKIPPED_TOWERS.iter().any(|p| c.starts_with(p)) {
-            skipped += 1;
-            skipped_bytes += t.len();
-            continue;
-        }
-        if let Some(other) = by_name.insert(c, t) {
-            let (a, b) = if other.name < t.name { (&other.name, &t.name) } else { (&t.name, &other.name) };
-            bail!("the checkpoint holds {a} and {b}, two names for the tensor {c}; only one can be loaded");
-        }
-    }
+    let TextTensors { mut by_name, skipped, skipped_bytes } = text_tensors(ck)?;
     let ple = crate::inventory::ple_paths(&r.table, h)?;
     let table_rows = ple_table_rows(ck, &by_name, &ple.embedding, &h.ple)?;
     let f = crate::plan::Formats::new(m);
@@ -1072,6 +1057,33 @@ pub fn check_hybrid(ck: &Checkpoint, m: &ModelSpec) -> Result<HybridCheck> {
     }
     groups.sort_by_key(|g| std::cmp::Reverse(g.1));
     Ok(HybridCheck { tensors: wants.len(), bytes, groups, skipped, skipped_bytes, table_rows })
+}
+
+/// A checkpoint's text-model tensors by canonical name, and what the skipped towers hold.
+pub struct TextTensors<'a> {
+    pub by_name: HashMap<&'a str, &'a TensorInfo>,
+    pub skipped: usize,
+    pub skipped_bytes: u64,
+}
+
+/// Canonical name -> tensor for every tensor outside a skipped tower, refusing two spellings of one
+/// tensor (`model.layers.0...` beside `model.language_model.layers.0...`): only one could be loaded.
+pub fn text_tensors(ck: &Checkpoint) -> Result<TextTensors<'_>> {
+    let mut by_name: HashMap<&str, &TensorInfo> = HashMap::new();
+    let (mut skipped, mut skipped_bytes) = (0, 0);
+    for t in ck.tensors.values() {
+        let c = crate::modules::canonical(&t.name);
+        if SKIPPED_TOWERS.iter().any(|p| c.starts_with(p)) {
+            skipped += 1;
+            skipped_bytes += t.len();
+            continue;
+        }
+        if let Some(other) = by_name.insert(c, t) {
+            let (a, b) = if other.name < t.name { (&other.name, &t.name) } else { (&t.name, &other.name) };
+            bail!("the checkpoint holds {a} and {b}, two names for the tensor {c}; only one can be loaded");
+        }
+    }
+    Ok(TextTensors { by_name, skipped, skipped_bytes })
 }
 
 /// Prices `m`'s PLE table at the rows `c` found in the checkpoint, so a plan built afterwards

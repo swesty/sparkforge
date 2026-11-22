@@ -260,6 +260,16 @@ impl<'a> Formats<'a> {
         self.find(|k| k == path).unwrap_or(self.m.weights)
     }
 
+    /// Format of a module shared by every MTP draft layer (`fc_embedding`, `fc_hidden`): with a
+    /// checkpoint, the module at exactly `mtp.<rel>`; without one, the entry at that path.
+    pub fn mtp_shared(&self, rel: &str) -> WeightFormat {
+        let path = format!("mtp.{rel}");
+        if let Some(r) = &self.m.resolved {
+            return self.at(r, &path, self.m.weights).unwrap_or(self.m.weights);
+        }
+        self.find(|k| k == path).unwrap_or(self.m.weights)
+    }
+
     /// Format of a PLE projection `rel` (`key_proj`, `value_proj`). See `ple_lookup`.
     pub fn ple(&self, rel: &str) -> WeightFormat {
         self.ple_lookup(rel, false)
@@ -521,8 +531,11 @@ fn mtp_weight_bytes(m: &ModelSpec, h: &Hybrid, f: &Formats) -> f64 {
         });
         attn + experts + shared
     };
-    let fc = 2.0 * hd * hd * 2.0;
-    let mixer = |inject: bool| ((h.hc.lowrank + if inject { h.hc.streams } else { 0 }) as f64 * res + res * h.hc.lowrank as f64) * 2.0 + res * 4.0;
+    // Each input projection at its own format (codex-review fp:25aaaee34a54 on #18).
+    let fc = hd * hd * (f.mtp_shared("fc_embedding").bytes_per_elem() + f.mtp_shared("fc_hidden").bytes_per_elem());
+    // The MTP mixers' norms are BF16, as `inventory::hybrid` checks them (F32 in the main model;
+    // codex-review fp:cf55fb8f7ebd on #18).
+    let mixer = |inject: bool| ((h.hc.lowrank + if inject { h.hc.streams } else { 0 }) as f64 * res + res * h.hc.lowrank as f64) * 2.0 + res * 2.0;
     // The input projections (`mtp.fc_embedding`, `mtp.fc_hidden`) and the final mixer exist once;
     // each draft layer has its own attention, experts and two mixers.
     (0..h.mtp_layers).map(layer).sum::<f64>() + h.mtp_layers as f64 * 2.0 * mixer(true) + fc + mixer(false)

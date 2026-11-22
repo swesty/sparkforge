@@ -2,6 +2,9 @@ use sparkforge::config::{ModelSpec, WeightFormat};
 use sparkforge::weights::{bind, check_headroom, Checkpoint, HEADROOM_BYTES};
 use std::path::PathBuf;
 
+mod common;
+use common::{dir, fresh_private_dir, write_hybrid};
+
 // Tiny Llama-shaped model: hidden 16, 2 layers, 2 heads / 1 kv head of 8, inter 32, vocab 64.
 const CFG: &str = r#"{"architectures": ["LlamaForCausalLM"], "hidden_size": 16, "intermediate_size": 32,
   "num_hidden_layers": 2, "num_attention_heads": 2, "num_key_value_heads": 1, "head_dim": 8,
@@ -51,36 +54,6 @@ fn write_shard(path: &PathBuf, ts: &[(String, Vec<usize>, &str)], truncate: usiz
     out.extend(data);
     out.truncate(out.len() - truncate);
     std::fs::write(path, out).unwrap();
-}
-
-/// Creates `path` as a new directory only this user can enter. Non-recursive `mkdir` fails with
-/// `AlreadyExists` on any existing entry, including a directory or symlink another local user
-/// planted, so a fixture can never be written through someone else's path.
-fn fresh_private_dir(path: &std::path::Path) -> std::io::Result<()> {
-    let mut b = std::fs::DirBuilder::new();
-    #[cfg(unix)]
-    std::os::unix::fs::DirBuilderExt::mode(&mut b, 0o700);
-    b.create(path)
-}
-
-/// A fresh private directory per call. The name is unpredictable (time and a counter), and a
-/// collision with any existing entry picks a new name instead of reusing it.
-fn dir(name: &str) -> PathBuf {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static N: AtomicU64 = AtomicU64::new(0);
-    loop {
-        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
-        let d = std::env::temp_dir().join(format!(
-            "sparkforge-weights-{}-{nanos}-{}-{name}",
-            std::process::id(),
-            N.fetch_add(1, Ordering::Relaxed)
-        ));
-        match fresh_private_dir(&d) {
-            Ok(()) => return d,
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(e) => panic!("creating {}: {e}", d.display()),
-        }
-    }
 }
 
 #[test]
@@ -1174,40 +1147,6 @@ fn a_blob_link_out_of_the_shared_store_is_refused_before_opening() {
 
 // ---- SHA-767: hybrid checkpoints are checked tensor by tensor ----
 
-mod common;
-
-/// Writes a single-file hybrid checkpoint with `config` and the tensors `ts`. Tensor bytes are a
-/// pattern, except the PLE table sizes and offsets, which hold `vocab_sizes` and their running sum.
-fn write_hybrid(name: &str, config: &serde_json::Value, ts: &[common::Tensor], vocab_sizes: &[i64]) -> PathBuf {
-    let d = dir(name);
-    std::fs::write(d.join("config.json"), config.to_string()).unwrap();
-    let offsets: Vec<i64> = vocab_sizes.iter().scan(0i64, |acc, &s| { let o = *acc; *acc = acc.wrapping_add(s); Some(o) }).collect();
-    let mut header = serde_json::Map::new();
-    let mut data: Vec<u8> = vec![];
-    for (n, dtype, shape) in ts {
-        let elem = match *dtype { "I64" => 8, "F32" => 4, "F8_E4M3" | "U8" => 1, _ => 2 };
-        let bytes = shape.iter().product::<usize>() * elem;
-        let b = data.len();
-        if n.ends_with("ngram_heads_vocab_sizes") || n.ends_with("ngram_heads_offsets") {
-            let vals = if n.ends_with("sizes") { vocab_sizes } else { &offsets[..] };
-            let mut raw: Vec<u8> = vals.iter().flat_map(|x| x.to_le_bytes()).collect();
-            raw.resize(bytes, 0);
-            data.extend(raw);
-        } else {
-            data.extend((0..bytes).map(|i| (i % 251) as u8));
-        }
-        header.insert(n.clone(), serde_json::json!({"dtype": dtype, "shape": shape, "data_offsets": [b, b + bytes]}));
-    }
-    let mut h = serde_json::to_vec(&header).unwrap();
-    while h.len() % 8 != 0 {
-        h.push(b' ');
-    }
-    let mut out = (h.len() as u64).to_le_bytes().to_vec();
-    out.extend(h);
-    out.extend(data);
-    std::fs::write(d.join("model.safetensors"), out).unwrap();
-    d
-}
 
 fn tiny_spec() -> ModelSpec {
     ModelSpec::from_json(&common::tiny_config().to_string(), None).unwrap()
@@ -1318,12 +1257,12 @@ fn ple_table_rows_come_from_the_per_head_sizes() {
 }
 
 #[test]
-fn a_hybrid_checkpoint_is_checked_but_not_loaded_onto_the_gpu() {
+fn a_hybrid_checkpoint_is_refused_by_the_dense_binding() {
     let d = write_hybrid("hy-bind", &common::tiny_config(), &tiny_tensors(), &common::TINY_VOCAB_SIZES);
     let dir = sparkforge::weights::resolve_checkpoint_dir(&d).unwrap();
     let spec = sparkforge::weights::spec_from_checkpoint(&dir, None, None).unwrap();
     let err = format!("{:#}", bind(&Checkpoint::open_dir(&dir).unwrap(), &spec).unwrap_err());
-    assert!(err.contains("checked tensor by tensor") && err.contains("do not load into GPU memory yet"), "{err}");
+    assert!(err.contains("load into GPU memory with `sparkforge load-weights`") && err.contains("not through the dense binding"), "{err}");
 }
 
 // ---- SHA-767: codex-review cycle 1 follow-ups on #18 ----
@@ -1485,8 +1424,8 @@ fn the_shared_mtp_input_projections_are_resident_once() {
         plan::build(&s, &GB10, &plan::PlanOpts { prefill_tokens: 2048, ctx: 4096 }).budget.weight_gib * (1u64 << 30) as f64
     };
     let (w0, w1, w2) = (resident(0), resident(1), resident(2));
-    // fc: 2 x 64 x 64 BF16; final mixer: down and up (8 x 256 each, BF16) plus an F32 norm of 256.
-    let shared = 2.0 * 64.0 * 64.0 * 2.0 + (2.0 * 8.0 * 256.0) * 2.0 + 256.0 * 4.0;
+    // fc: 2 x 64 x 64 BF16; final mixer: down and up (8 x 256 each, BF16) plus a BF16 norm of 256.
+    let shared = 2.0 * 64.0 * 64.0 * 2.0 + (2.0 * 8.0 * 256.0) * 2.0 + 256.0 * 2.0;
     assert!((2.0 * (w1 - w0) - (w2 - w0) - shared).abs() < 1e-3, "{}", 2.0 * (w1 - w0) - (w2 - w0));
 }
 
@@ -1664,4 +1603,62 @@ fn a_failed_switch_keeps_the_previous_checkpoints_resolution_and_rows() {
     assert!(s.resolved.is_some());
     assert_eq!(gib(&s), before);
     sparkforge::weights::check_hybrid(&a, &s).unwrap();
+}
+
+// ---- SHA-791: codex-review follow-ups on #18 ----
+
+#[test]
+fn an_mtp_input_projection_is_checked_and_priced_at_its_declared_format() {
+    // fp:25aaaee34a54: an MXFP8 entry for `mtp.fc_embedding` beside a BF16 weight with no scale
+    // fails the tensor check; the MXFP8 tensors pass and price 64 x 64 x (2 - 1.03125) = 3,968
+    // bytes below the BF16 projection.
+    use sparkforge::{plan, target::GB10};
+    let mut cfg = common::tiny_config();
+    let fc = "mtp.fc_embedding";
+    cfg["quantization_config"]["quantized_layers"][fc] = serde_json::json!({"quant_algo": "MXFP8", "group_size": 32});
+    let err = format!("{:#}", check_dir(&write_hybrid("hy-fc-bf16", &cfg, &tiny_tensors(), &common::TINY_VOCAB_SIZES)).unwrap_err());
+    assert!(err.contains(&format!("{fc}.weight: expected F8_E4M3 [64, 64], found BF16 [64, 64]")) && err.contains(&format!("missing {fc}.weight_scale")), "{err}");
+    let mut ts: Vec<_> = tiny_tensors().into_iter().filter(|t| t.0 != format!("{fc}.weight")).collect();
+    ts.push((format!("{fc}.weight"), "F8_E4M3", vec![64, 64]));
+    ts.push((format!("{fc}.weight_scale"), "U8", vec![64, 2]));
+    let d = write_hybrid("hy-fc-mxfp8", &cfg, &ts, &common::TINY_VOCAB_SIZES);
+    check_dir(&d).unwrap();
+    let opts = plan::PlanOpts { prefill_tokens: 2048, ctx: 4096 };
+    let dir = sparkforge::weights::resolve_checkpoint_dir(&d).unwrap();
+    let p = plan::build(&sparkforge::weights::spec_from_checkpoint(&dir, None, None).unwrap(), &GB10, &opts);
+    let base = plan::build(&tiny_spec(), &GB10, &opts);
+    assert!(((base.budget.weight_gib - p.budget.weight_gib) * (1u64 << 30) as f64 - 3968.0).abs() < 1e-3);
+    assert!(!p.notes.iter().any(|n| n.contains(fc)), "{:#?}", p.notes);
+}
+
+#[test]
+fn a_matrix_at_the_table_root_is_refused_on_resolve() {
+    // fp:347106d738b2: a `weight` at the table's own path shares the module of the legitimate
+    // `weight_scale_2`, so module checks alone accepted it unpriced. Only the scalar may sit there,
+    // and a BF16 table with no scalar still plans under an NVFP4 override.
+    let mut ts = tiny_tensors();
+    let root = "model.language_model.layers.1.ple.ple_embedding.ngram_embedding";
+    ts.push((format!("{root}.weight"), "U8", vec![4, 8]));
+    let d = write_hybrid("hy-table-root", &common::tiny_config(), &ts, &common::TINY_VOCAB_SIZES);
+    let dir = sparkforge::weights::resolve_checkpoint_dir(&d).unwrap();
+    let err = format!("{:#}", sparkforge::weights::spec_from_checkpoint(&dir, None, None).unwrap_err());
+    assert!(err.contains("may hold only its shared weight_scale_2") && err.contains(&format!("{root}.weight")), "{err}");
+    let (cfg, ts) = bf16_table();
+    let d = write_hybrid("hy-table-root-override", &cfg, &ts, &common::TINY_VOCAB_SIZES);
+    let dir = sparkforge::weights::resolve_checkpoint_dir(&d).unwrap();
+    sparkforge::weights::spec_from_checkpoint(&dir, Some(sparkforge::config::WeightFormat::Nvfp4), None).unwrap();
+}
+
+#[test]
+fn an_oversized_expert_count_fails_on_the_live_experts() {
+    // fp:d0f47806a572: u32::MAX declared experts against a 4-expert checkpoint fails from the live
+    // members, naming the layer and the missing count, without building entries per declared expert.
+    let mut s = tiny_spec();
+    s.moe.as_mut().unwrap().num_experts = u32::MAX;
+    let names: Vec<String> = tiny_tensors().into_iter().map(|t| t.0).collect();
+    let t0 = std::time::Instant::now();
+    let err = format!("{:#}", s.resolve_modules(names.iter().map(String::as_str)).unwrap_err());
+    assert!(err.contains("declares 4294967295 routed experts") && err.contains("holds 4 of them under layers.0.mlp.experts (4294967291 missing)"), "{err}");
+    assert!(t0.elapsed() < std::time::Duration::from_secs(5), "{:?}", t0.elapsed());
+    assert!(s.resolved.is_none());
 }
