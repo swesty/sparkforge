@@ -241,15 +241,20 @@ pub struct Ple {
     /// (`make_ngram_vocab_size_divisible_by`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub vocab_multiple: Option<u32>,
+    /// Table rows as checked in a checkpoint (shards x rows per shard), when known; the budget then
+    /// prices the table at this size instead of `heads * vocab_base`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub checked_rows: Option<u64>,
 }
 
 impl Ple {
     /// One head set per n-gram order 2..=ngram_size.
     pub fn heads(&self) -> u32 { (self.ngram_size - 1) * self.heads_per_ngram }
     pub fn head_dim(&self) -> u32 { self.embed_dim / self.heads() }
-    /// Table rows, `heads * vocab_base`. The checkpoint's per-head tables are prime-sized near
-    /// `vocab_base`, so the true count differs by a few parts per million.
-    pub fn table_rows(&self) -> u64 { self.heads() as u64 * self.vocab_base }
+    /// Table rows: as checked in a checkpoint when known, else `heads * vocab_base`. The
+    /// checkpoint's per-head tables are prime-sized near `vocab_base` and padded, so the true count
+    /// differs by a few parts per million.
+    pub fn table_rows(&self) -> u64 { self.checked_rows.unwrap_or(self.heads() as u64 * self.vocab_base) }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -472,6 +477,7 @@ fn parse_hybrid(r: &RawConfig, body: &serde_json::Value, head_dim: u32, partial_
         vocab_base: need(h.ngram_vocab_size_base, "ngram_vocab_size_base")?,
         split_parts: h.split_ngram_parts.map(|x| dim(Some(x), "split_ngram_parts")).transpose()?,
         vocab_multiple: h.make_ngram_vocab_size_divisible_by.map(|x| dim(Some(x), "make_ngram_vocab_size_divisible_by")).transpose()?,
+        checked_rows: None,
     };
     ensure!(ple.ngram_size >= 2 && ple.embed_dim % ple.heads() == 0,
         "PLE embed_dim {} is not divisible into {} heads (orders 2..={})", ple.embed_dim, ple.heads(), ple.ngram_size);
@@ -700,11 +706,28 @@ impl ModelSpec {
     fn check_modules(&self, ple: String) -> Result<()> {
         let Some(r) = &self.resolved else { return Ok(()) };
         let f = crate::plan::Formats::new(self);
-        let wants = crate::inventory::hybrid(self, &f, &crate::inventory::Layout { ple, table_rows: None })?;
+        let wants = crate::inventory::hybrid(self, &f, &crate::inventory::Layout { ple: ple.clone(), table_rows: None })?;
         let modules: BTreeSet<&str> = wants.iter().filter_map(|w| w.name.rsplit_once('.').map(|(m, _)| m)).collect();
         let missing: Vec<&str> = modules.into_iter().filter(|m| !r.table.contains(m)).collect();
         ensure!(missing.is_empty(), "the checkpoint has no tensors for {} module(s) the plan needs: {}{}", missing.len(),
             missing.iter().take(8).copied().collect::<Vec<_>>().join(", "), if missing.len() > 8 { format!(" (and {} more)", missing.len() - 8) } else { String::new() });
+        // A group's members are exactly the planned ones: an extra expert or table shard would be
+        // covered by the group's entries, and so counted as used, without being budgeted.
+        let Some(h) = &self.hybrid else { return Ok(()) };
+        let mut groups: Vec<(String, BTreeSet<String>)> = vec![];
+        if let Some(e) = &self.moe {
+            let experts: BTreeSet<String> = (0..e.num_experts).map(|x| x.to_string()).collect();
+            groups.extend((0..h.schedule.len()).map(|i| (format!("layers.{i}.mlp.experts"), experts.clone())));
+            groups.extend((0..h.mtp_layers).map(|i| (format!("mtp.layers.{i}.mlp.experts"), experts.clone())));
+        }
+        if let Some(parts) = h.ple.split_parts {
+            groups.push((format!("{ple}.{}", crate::plan::PLE_TABLE), (0..parts).map(|j| format!("shard_{j}")).collect()));
+        }
+        for (g, want) in &groups {
+            let extra: Vec<String> = r.table.children(g).into_iter().filter(|c| !want.contains(*c)).map(|c| format!("{g}.{c}")).collect();
+            ensure!(extra.is_empty(), "the checkpoint holds {} module(s) under {g} beyond the {} the plan prices: {}{}", extra.len(), want.len(),
+                extra.iter().take(8).cloned().collect::<Vec<_>>().join(", "), if extra.len() > 8 { format!(" (and {} more)", extra.len() - 8) } else { String::new() });
+        }
         Ok(())
     }
 

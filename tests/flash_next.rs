@@ -904,3 +904,19 @@ fn the_checkpoint_layout_is_checked_module_by_module_on_resolve() {
         assert!(err.contains(sparkforge::modules::canonical(module)), "{gone}: {err}");
     }
 }
+
+// ---- SHA-767: codex-review cycle 1 follow-ups on #18 ----
+
+#[test]
+fn an_extra_table_shard_or_expert_is_refused_on_resolve() {
+    // fp:a93bb1c2cb52: a live `shard_128` beside the 128 configured shards, with an agreeing NVFP4
+    // entry, would be covered (and its entry used) without being budgeted. Resolution names it;
+    // an expert beyond the configured 512 is refused the same way.
+    let mut v = raw();
+    let shard = "model.language_model.layers.1.ple.ple_embedding.ngram_embedding.shard_128";
+    ql(&mut v).insert(shard.into(), json!({"quant_algo": "NVFP4", "group_size": 16}));
+    let err = format!("{:#}", resolved_with(&v, &[&format!("{shard}.weight")]).unwrap_err());
+    assert!(err.contains("layers.1.ple.ple_embedding.ngram_embedding.shard_128") && err.contains("beyond the 128"), "{err}");
+    let err = format!("{:#}", resolved_with(&raw(), &["model.language_model.layers.7.mlp.experts.512.up_proj.weight"]).unwrap_err());
+    assert!(err.contains("layers.7.mlp.experts.512") && err.contains("beyond the 512"), "{err}");
+}

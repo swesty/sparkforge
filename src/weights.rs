@@ -1074,6 +1074,14 @@ pub fn check_hybrid(ck: &Checkpoint, m: &ModelSpec) -> Result<HybridCheck> {
     Ok(HybridCheck { tensors: wants.len(), bytes, groups, skipped, skipped_bytes, table_rows })
 }
 
+/// Prices `m`'s PLE table at the rows `c` found in the checkpoint, so a plan built afterwards
+/// budgets the table as stored rather than from `ngram_vocab_size_base`.
+pub fn apply_checked_table(m: &mut ModelSpec, c: &HybridCheck) {
+    if let Some(h) = &mut m.hybrid {
+        h.ple.checked_rows = h.ple.split_parts.map(|parts| parts as u64 * c.table_rows as u64);
+    }
+}
+
 /// Rows in each shard of the PLE n-gram table. The per-head tables are prime-sized near
 /// `ngram_vocab_size_base`, so their sizes come from the checkpoint (`ngram_heads_vocab_sizes`,
 /// with `ngram_heads_offsets` their running sum); the total is padded to a multiple of
@@ -1093,11 +1101,12 @@ fn ple_table_rows(ck: &Checkpoint, by_name: &HashMap<&str, &TensorInfo>, ple: &s
     for (i, (&s, &o)) in sizes.iter().zip(&offsets).enumerate() {
         ensure!(u64::try_from(s).is_ok_and(|s| s >= p.vocab_base), "PLE head {i} has {s} rows, below ngram_vocab_size_base {}", p.vocab_base);
         ensure!(u64::try_from(o) == Ok(total), "PLE head {i} starts at row {o}, but the heads before it hold {total} rows");
-        total += s as u64;
+        total = total.checked_add(s as u64).context("the PLE n-gram table's per-head sizes overflow a 64-bit row count")?;
     }
     let multiple = p.vocab_multiple.unwrap_or(1) as u64;
     let parts = p.split_parts.context("config.json has no split_ngram_parts, so the PLE n-gram table's shards can't be checked")? as u64;
-    let padded = total.div_ceil(multiple) * multiple;
+    let padded = total.div_ceil(multiple).checked_mul(multiple)
+        .with_context(|| format!("the PLE n-gram table's {total} rows, padded to a multiple of {multiple}, overflow a 64-bit row count"))?;
     ensure!(padded % parts == 0, "the PLE n-gram table has {padded} rows (padded to a multiple of {multiple}), which do not split evenly into {parts} shards");
     Ok(usize::try_from(padded / parts)?)
 }

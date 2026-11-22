@@ -59,8 +59,12 @@ pub fn hybrid(m: &ModelSpec, f: &Formats, layout: &Layout) -> Result<Vec<Want>> 
     let mut inv = Inventory(vec![]);
     let (hd, res) = (m.hidden as usize, (h.hc.streams * m.hidden) as usize);
     let (g, q) = (&h.gdn, &h.qsa);
-    inv.gather("embed_tokens", m.vocab, m.hidden, f.embed(), "embed")?;
-    if !m.tie_embeddings {
+    if m.tie_embeddings {
+        // One matrix with two uses: gathered as the embedding and read by the head GEMV, so it
+        // carries a GEMV operand's tensors (an NVFP4 activation scale), counted once.
+        inv.projection("embed_tokens", m.vocab, m.hidden, f.embed(), "embed")?;
+    } else {
+        inv.gather("embed_tokens", m.vocab, m.hidden, f.embed(), "embed")?;
         inv.projection("lm_head", m.vocab, m.hidden, f.head(), "lm_head")?;
     }
     inv.mixer("hyper_connection_mixer", h, res, false, "F32");
@@ -98,17 +102,21 @@ pub fn hybrid(m: &ModelSpec, f: &Formats, layout: &Layout) -> Result<Vec<Want>> 
     inv.tensor(format!("{emb}.layer_multipliers"), "I64", vec![h.ple.ngram_size as usize], "ple");
     inv.tensor(format!("{emb}.ngram_heads_offsets"), "I64", vec![h.ple.heads() as usize], "ple");
     inv.tensor(format!("{emb}.ngram_heads_vocab_sizes"), "I64", vec![h.ple.heads() as usize], "ple");
-    let Some(parts) = h.ple.split_parts else {
-        bail!("config.json has no split_ngram_parts, so the PLE n-gram table's shards can't be checked");
-    };
     let table = format!("{ple}.{PLE_TABLE}");
-    let rows = layout.table_rows.unwrap_or(0);
     let tf = f.ple_table();
     if matches!(tf, WeightFormat::Nvfp4 | WeightFormat::Nvfp4WeightOnly) {
         inv.tensor(format!("{table}.weight_scale_2"), "F32", vec![1], "ple_table");
     }
-    for j in 0..parts {
-        inv.weights(&format!("{table}.shard_{j}"), rows, h.ple.head_dim(), tf, Scales::Shared, "ple_table")?;
+    // The shards are listed when the config says how many there are. Planning doesn't need the
+    // count (names only, `table_rows` unset); checking the tensors does.
+    match (h.ple.split_parts, layout.table_rows) {
+        (Some(parts), rows) => {
+            for j in 0..parts {
+                inv.weights(&format!("{table}.shard_{j}"), rows.unwrap_or(0), h.ple.head_dim(), tf, Scales::Shared, "ple_table")?;
+            }
+        }
+        (None, None) => {}
+        (None, Some(_)) => bail!("config.json has no split_ngram_parts, so the PLE n-gram table's shards can't be checked"),
     }
     // MTP draft layers: one sparse-attention layer with its own experts, the input projections and
     // three mixers. Their norms are BF16 in the reference checkpoint (F32 in the main model).
@@ -123,8 +131,8 @@ pub fn hybrid(m: &ModelSpec, f: &Formats, layout: &Layout) -> Result<Vec<Want>> 
     for i in 0..h.mtp_layers {
         let p = format!("mtp.layers.{i}");
         let start = inv.0.len();
-        inv.attention(&format!("{p}.self_attn"), m, q, |rel| f.mtp(rel), "mtp")?;
-        inv.mlp(&p, m, |rel| f.mtp(rel), f.mtp_group("mlp.experts"))?;
+        inv.attention(&format!("{p}.self_attn"), m, q, |rel| f.mtp(i, rel), "mtp")?;
+        inv.mlp(&p, m, |rel| f.mtp(i, rel), f.mtp_group(i, "mlp.experts"))?;
         inv.mixer(&format!("{p}.attn_hyper_connection"), h, res, true, "BF16");
         inv.mixer(&format!("{p}.mlp_hyper_connection"), h, res, true, "BF16");
         for w in &mut inv.0[start..] {

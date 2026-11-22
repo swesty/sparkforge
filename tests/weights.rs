@@ -1181,7 +1181,7 @@ mod common;
 fn write_hybrid(name: &str, config: &serde_json::Value, ts: &[common::Tensor], vocab_sizes: &[i64]) -> PathBuf {
     let d = dir(name);
     std::fs::write(d.join("config.json"), config.to_string()).unwrap();
-    let offsets: Vec<i64> = vocab_sizes.iter().scan(0, |acc, &s| { let o = *acc; *acc += s; Some(o) }).collect();
+    let offsets: Vec<i64> = vocab_sizes.iter().scan(0i64, |acc, &s| { let o = *acc; *acc = acc.wrapping_add(s); Some(o) }).collect();
     let mut header = serde_json::Map::new();
     let mut data: Vec<u8> = vec![];
     for (n, dtype, shape) in ts {
@@ -1324,4 +1324,105 @@ fn a_hybrid_checkpoint_is_checked_but_not_loaded_onto_the_gpu() {
     let spec = sparkforge::weights::spec_from_checkpoint(&dir, None, None).unwrap();
     let err = format!("{:#}", bind(&Checkpoint::open_dir(&dir).unwrap(), &spec).unwrap_err());
     assert!(err.contains("checked tensor by tensor") && err.contains("do not load into GPU memory yet"), "{err}");
+}
+
+// ---- SHA-767: codex-review cycle 1 follow-ups on #18 ----
+
+#[test]
+fn planning_needs_no_shard_count_but_checking_the_tensors_does() {
+    // fp:3600da7c4e15: `split_ngram_parts` is optional for planning. `plan --checkpoint` resolves
+    // the same checkpoint without it, while `weights` refuses to check the table's shards.
+    let mut cfg = common::tiny_config();
+    cfg["text_config"].as_object_mut().unwrap().remove("split_ngram_parts");
+    let d = write_hybrid("hy-noparts", &cfg, &tiny_tensors(), &common::TINY_VOCAB_SIZES);
+    let dir = sparkforge::weights::resolve_checkpoint_dir(&d).unwrap();
+    let given = std::fs::read_to_string(d.join("config.json")).unwrap();
+    let spec = sparkforge::weights::spec_from_checkpoint(&dir, None, Some(&given)).unwrap();
+    assert!(spec.hybrid.as_ref().unwrap().ple.split_parts.is_none() && spec.resolved.is_some());
+    let err = format!("{:#}", check_dir(&d).unwrap_err());
+    assert!(err.contains("split_ngram_parts"), "{err}");
+}
+
+#[test]
+fn the_checked_table_rows_price_the_resident_budget() {
+    // fp:06e6fe0d9f78: two checkpoints of one config whose per-head sizes make 15- and 16-row
+    // shards. Priced at the checked rows, the second costs 4 shards x 1 row x 9 bytes more.
+    use sparkforge::{plan, target::GB10};
+    let resident = |name: &str, sizes: &[i64], rows: usize| {
+        let ts = common::hybrid_tensors(&tiny_spec(), "layers.1.ple", rows);
+        let d = write_hybrid(name, &common::tiny_config(), &ts, sizes);
+        let dir = sparkforge::weights::resolve_checkpoint_dir(&d).unwrap();
+        let mut spec = sparkforge::weights::spec_from_checkpoint(&dir, None, None).unwrap();
+        let c = sparkforge::weights::check_hybrid(&Checkpoint::open_dir(&dir).unwrap(), &spec).unwrap();
+        assert_eq!(c.table_rows, rows);
+        sparkforge::weights::apply_checked_table(&mut spec, &c);
+        assert_eq!(spec.hybrid.as_ref().unwrap().ple.table_rows(), 4 * rows as u64);
+        plan::build(&spec, &GB10, &plan::PlanOpts { prefill_tokens: 2048, ctx: 4096 }).budget.weight_gib * (1u64 << 30) as f64
+    };
+    let (a, b) = (resident("hy-rows15", &[11, 13, 17, 19], 15), resident("hy-rows16", &[11, 13, 17, 23], 16));
+    assert!((b - a - 36.0).abs() < 1e-3, "{}", b - a);
+}
+
+#[test]
+fn each_mtp_layer_is_checked_and_priced_at_its_own_formats() {
+    // fp:de9c37520703: two draft layers (set on the spec; configs are still limited to one), with
+    // layer 0's v_proj MXFP8 and layer 1's BF16. Each layer's tensors follow its own format, and
+    // the budget prices layer 0's projection alone at MXFP8.
+    use sparkforge::{config::WeightFormat, plan, target::GB10};
+    let mut spec = tiny_spec();
+    spec.hybrid.as_mut().unwrap().mtp_layers = 2;
+    // Layer 1's experts get their own entry: each layer's formats are looked up at its own index.
+    spec.formats.modules.insert("mtp.layers.1.mlp.experts".into(), WeightFormat::Nvfp4WeightOnly);
+    let bf16 = spec.clone();
+    spec.formats.modules.insert("mtp.layers.0.self_attn.v_proj".into(), WeightFormat::Mxfp8);
+    let mut ts = common::hybrid_tensors(&spec, "layers.1.ple", common::TINY_TABLE_ROWS);
+    let v = "mtp.layers.0.self_attn.v_proj";
+    ts.retain(|t| t.0 != format!("{v}.weight"));
+    ts.push((format!("{v}.weight"), "F8_E4M3", vec![32, 64]));
+    ts.push((format!("{v}.weight_scale"), "U8", vec![32, 2]));
+    let d = write_hybrid("hy-mtp2", &common::tiny_config(), &ts, &common::TINY_VOCAB_SIZES);
+    let ck = Checkpoint::open(&d).unwrap();
+    let mut resolved = spec.clone();
+    resolved.resolve_modules(ck.tensors.keys().map(String::as_str)).unwrap();
+    sparkforge::weights::check_hybrid(&ck, &resolved).unwrap();
+    let gib = |s: &ModelSpec| plan::build(s, &GB10, &plan::PlanOpts { prefill_tokens: 2048, ctx: 4096 }).budget.weight_gib * (1u64 << 30) as f64;
+    assert!((gib(&bf16) - gib(&resolved) - 32.0 * 64.0 * (2.0 - 1.03125)).abs() < 1e-3, "{}", gib(&bf16) - gib(&resolved));
+    assert_eq!(gib(&spec), gib(&resolved), "config-only and checkpoint pricing agree");
+}
+
+#[test]
+fn a_tied_nvfp4_embedding_carries_the_head_gemvs_activation_scale() {
+    // fp:7027c462f116: tied, the embedding matrix is also the head GEMV's operand, so NVFP4 needs
+    // its `input_scale`; weight-only NVFP4 (W4A16) doesn't.
+    for (algo, scale) in [("NVFP4", true), ("W4A16_NVFP4", false)] {
+        let mut cfg = common::tiny_config();
+        cfg["tie_word_embeddings"] = serde_json::json!(true);
+        cfg["text_config"]["tie_word_embeddings"] = serde_json::json!(true);
+        cfg["quantization_config"]["quantized_layers"]["model.language_model.embed_tokens"] = serde_json::json!({"quant_algo": algo, "group_size": 16});
+        let spec = ModelSpec::from_json(&cfg.to_string(), None).unwrap();
+        let e = "model.language_model.embed_tokens";
+        let mut ts = common::hybrid_tensors(&spec, "layers.1.ple", common::TINY_TABLE_ROWS);
+        ts.retain(|t| t.0 != format!("{e}.weight"));
+        ts.extend([(format!("{e}.weight"), "U8", vec![128, 32]), (format!("{e}.weight_scale"), "F8_E4M3", vec![128, 4]), (format!("{e}.weight_scale_2"), "F32", vec![])]);
+        let without = check_dir(&write_hybrid(&format!("hy-tied-{scale}"), &cfg, &ts, &common::TINY_VOCAB_SIZES));
+        ts.push((format!("{e}.input_scale"), "F32", vec![]));
+        let with = check_dir(&write_hybrid(&format!("hy-tied-scale-{scale}"), &cfg, &ts, &common::TINY_VOCAB_SIZES));
+        if scale {
+            assert!(with.is_ok(), "{algo}: {:#}", with.unwrap_err());
+            let err = format!("{:#}", without.unwrap_err());
+            assert!(err.contains("missing embed_tokens.input_scale"), "{algo}: {err}");
+        } else {
+            assert!(without.is_ok(), "{algo}: {:#}", without.unwrap_err());
+            assert!(format!("{:#}", with.unwrap_err()).contains("unexpected model.language_model.embed_tokens.input_scale"), "{algo}");
+        }
+    }
+}
+
+#[test]
+fn ple_row_counts_that_overflow_when_padded_are_an_error() {
+    // fp:c89c702ebdf6: sizes whose total fits in 64 bits but whose padding to a multiple of 4
+    // doesn't.
+    let d = write_hybrid("hy-overflow", &common::tiny_config(), &tiny_tensors(), &[11, 13, i64::MAX - 24, i64::MAX]);
+    let err = format!("{:#}", check_dir(&d).unwrap_err());
+    assert!(err.contains("overflow a 64-bit row count"), "{err}");
 }

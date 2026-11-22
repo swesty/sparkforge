@@ -234,3 +234,7 @@ is above 0.
 #### Scenario: Flash Next config
 - **WHEN** the Flash Next config is parsed
 - **THEN** the PLE table has 128 shards and a size multiple of 128
+
+#### Scenario: Planning without the shard count
+- **WHEN** a hybrid config without `split_ngram_parts` is planned with `--checkpoint`
+- **THEN** planning succeeds, while `sparkforge weights` on the same checkpoint fails naming `split_ngram_parts`

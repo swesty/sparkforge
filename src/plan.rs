@@ -237,38 +237,27 @@ impl<'a> Formats<'a> {
         groups
     }
 
-    /// Format of `rel` in the MTP draft layers. With a checkpoint, only the layer indices it
-    /// holds; without one, only indices below the configured MTP layer count, so a stale entry such
-    /// as `mtp.layers.999.<rel>` never prices the real draft layer.
-    pub fn mtp(&self, rel: &str) -> WeightFormat {
-        self.mtp_lookup(rel, false)
+    /// Format of `rel` in MTP draft layer `layer`. With a checkpoint, the module at exactly
+    /// `mtp.layers.<layer>.<rel>`; without one, the entry at that path with the index spelled as a
+    /// canonical decimal, so neither `mtp.layers.0.aux.<rel>` nor `mtp.layers.00.<rel>` is the
+    /// module, and a stale index such as `mtp.layers.999` never prices a configured layer.
+    pub fn mtp(&self, layer: u32, rel: &str) -> WeightFormat {
+        self.mtp_lookup(layer, rel, false)
     }
 
-    /// Format of the group `rel` (`mlp.experts`) in the MTP draft layers.
-    pub fn mtp_group(&self, rel: &str) -> WeightFormat {
-        self.mtp_lookup(rel, true)
+    /// Format of the group `rel` (`mlp.experts`) in MTP draft layer `layer`.
+    pub fn mtp_group(&self, layer: u32, rel: &str) -> WeightFormat {
+        self.mtp_lookup(layer, rel, true)
     }
 
-    fn mtp_lookup(&self, rel: &str, group: bool) -> WeightFormat {
-        let layers = self.m.hybrid.as_ref().map_or(0, |h| h.mtp_layers);
+    fn mtp_lookup(&self, layer: u32, rel: &str, group: bool) -> WeightFormat {
+        let path = format!("mtp.layers.{layer}.{rel}");
         if let Some(r) = &self.m.resolved {
-            // `resolve_modules` checked that the checkpoint's MTP indices are exactly 0..layers.
-            return (0..layers)
-                .filter_map(|n| {
-                    let path = format!("mtp.layers.{n}.{rel}");
-                    if group { self.group_at(r, &path, self.m.weights) } else { self.at(r, &path, self.m.weights) }
-                })
-                .reduce(|a, b| if b.bytes_per_elem() > a.bytes_per_elem() { b } else { a })
-                .unwrap_or(self.m.weights);
+            // `resolve_modules` checked that the checkpoint's MTP indices are exactly the configured ones.
+            let f = if group { self.group_at(r, &path, self.m.weights) } else { self.at(r, &path, self.m.weights) };
+            return f.unwrap_or(self.m.weights);
         }
-        // Exactly `mtp.layers.<n>.<rel>` with `n` a configured layer spelled as a canonical decimal,
-        // so neither `mtp.layers.0.aux.<rel>` nor `mtp.layers.00.<rel>` is the module (a checkpoint
-        // lookup leaves both unused too).
-        self.find(|k| {
-            k.strip_prefix("mtp.layers.")
-                .and_then(|r| r.split_once('.'))
-                .is_some_and(|(n, rest)| n.parse::<u32>().is_ok_and(|i| i < layers && i.to_string() == n) && rest == rel)
-        }).unwrap_or(self.m.weights)
+        self.find(|k| k == path).unwrap_or(self.m.weights)
     }
 
     /// Format of a PLE projection `rel` (`key_proj`, `value_proj`). See `ple_lookup`.
@@ -505,31 +494,34 @@ fn hybrid_ctx_bytes(m: &ModelSpec, h: &Hybrid, ctx: u32) -> f64 {
     (gather + scan) * h.count(LayerKind::FullAttention) as f64
 }
 
-/// Resident bytes of the MTP draft layers: one sparse-attention layer with its own experts, plus
-/// the input projections and three HyperConnection mixers.
+/// Resident bytes of the MTP draft layers: each a sparse-attention layer with its own experts,
+/// at its own formats, plus the input projections and three HyperConnection mixers.
 fn mtp_weight_bytes(m: &ModelSpec, h: &Hybrid, f: &Formats) -> f64 {
     if h.mtp_layers == 0 { return 0.0; }
     let hd = m.hidden as f64;
     let res = (h.hc.streams * m.hidden) as f64;
     let e = m.moe.as_ref();
-    let b = |rel: &str| f.mtp(rel).bytes_per_elem();
-    let attn = (m.q_dim() * 2) as f64 * hd * b("self_attn.q_proj") + m.kv_dim() as f64 * hd * (b("self_attn.k_proj") + b("self_attn.v_proj"))
-        + h.qsa.index_qk_dim() as f64 * hd * b("self_attn.indexer.index_qk_proj") + hd * m.q_dim() as f64 * b("self_attn.o_proj");
-    let experts = e.map_or(0.0, |e| e.num_experts as f64 * 3.0 * e.expert_intermediate as f64 * hd * f.mtp_group("mlp.experts").bytes_per_elem());
-    // Shared-expert formats are looked up only when the shared expert exists, so a stale entry for
-    // an absent projection stays reported as unused. The router is counted either way.
-    let shared = e.map_or(0.0, |e| {
-        let projections = if e.shared_intermediate > 0 {
-            e.shared_intermediate as f64 * hd
-                * (b("mlp.shared_expert.gate_proj") + b("mlp.shared_expert.up_proj") + b("mlp.shared_expert.down_proj"))
-        } else {
-            0.0
-        };
-        projections + e.num_experts as f64 * hd * b("mlp.gate")
-    });
+    let layer = |i: u32| {
+        let b = |rel: &str| f.mtp(i, rel).bytes_per_elem();
+        let attn = (m.q_dim() * 2) as f64 * hd * b("self_attn.q_proj") + m.kv_dim() as f64 * hd * (b("self_attn.k_proj") + b("self_attn.v_proj"))
+            + h.qsa.index_qk_dim() as f64 * hd * b("self_attn.indexer.index_qk_proj") + hd * m.q_dim() as f64 * b("self_attn.o_proj");
+        let experts = e.map_or(0.0, |e| e.num_experts as f64 * 3.0 * e.expert_intermediate as f64 * hd * f.mtp_group(i, "mlp.experts").bytes_per_elem());
+        // Shared-expert formats are looked up only when the shared expert exists, so a stale entry
+        // for an absent projection stays reported as unused. The router is counted either way.
+        let shared = e.map_or(0.0, |e| {
+            let projections = if e.shared_intermediate > 0 {
+                e.shared_intermediate as f64 * hd
+                    * (b("mlp.shared_expert.gate_proj") + b("mlp.shared_expert.up_proj") + b("mlp.shared_expert.down_proj"))
+            } else {
+                0.0
+            };
+            projections + e.num_experts as f64 * hd * b("mlp.gate")
+        });
+        attn + experts + shared
+    };
     let fc = 2.0 * hd * hd * 2.0;
     let mixer = |inject: bool| ((h.hc.lowrank + if inject { h.hc.streams } else { 0 }) as f64 * res + res * h.hc.lowrank as f64) * 2.0 + res * 4.0;
-    h.mtp_layers as f64 * (attn + experts + shared + fc + 2.0 * mixer(true)) + mixer(false)
+    (0..h.mtp_layers).map(layer).sum::<f64>() + h.mtp_layers as f64 * (fc + 2.0 * mixer(true)) + mixer(false)
 }
 
 fn linear_op(l: &Linear, group: &'static str) -> OpClass {

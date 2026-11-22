@@ -178,7 +178,12 @@ fn main() -> Result<()> {
                 println!("{} tensors match the plan in name, dtype and shape ({:.2} GB); {} skipped tower tensor(s) ({:.2} GB); PLE table shards of {} rows",
                     c.tensors, c.bytes as f64 / 1e9, c.skipped, c.skipped_bytes as f64 / 1e9, c.table_rows);
                 for (g, b) in &c.groups { println!("  {g:<16} {:>9.2} GB", *b as f64 / 1e9); }
-                println!("plan prices {:.2} GB of resident text weights", p.budget.weight_gib * (1u64 << 30) as f64 / 1e9);
+                // The resident budget with the table at its checked size.
+                let mut spec = p.model.clone();
+                sparkforge::weights::apply_checked_table(&mut spec, &c);
+                let checked = plan::build(&spec, &GB10, &plan::PlanOpts { prefill_tokens: 2048, ctx: 4096 });
+                println!("plan prices {:.2} GB of resident text weights with the PLE table at its checked {} rows",
+                    checked.budget.weight_gib * (1u64 << 30) as f64 / 1e9, spec.hybrid.as_ref().and_then(|h| h.ple.checked_rows).unwrap_or(0));
                 for n in p.notes.iter().filter(|n| n.contains("quantized_layers")) { println!("note: {n}"); }
                 return Ok(());
             }
