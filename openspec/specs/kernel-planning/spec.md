@@ -209,11 +209,7 @@ naming it, so an unfamiliar module path layout never falls back to the default f
 
 ### Requirement: Formats resolve onto a checkpoint's modules
 
-Given a checkpoint's tensor names, the planner SHALL take each module's format from the map
-entries covering it (at or under the entry's path); entries covering one module MUST agree, and
-entries covering nothing, or modules no lookup prices, SHALL be reported as unused. MTP indices,
-single-format groups, a tied head and the config SHALL be checked against what the planner
-models.
+Given a checkpoint's tensor names, the planner SHALL take each projection's format from the entries covering its exact module, and each group's (routed experts, the PLE table) from its members. Entries covering one module MUST agree; entries covering nothing, or modules no lookup prices, SHALL be reported as unused. MTP indices, one PLE location, single-format groups, every planned module, a tied head and the config SHALL be checked.
 
 #### Scenario: The checkpoint's own map
 - **WHEN** the Flash Next plan is built with the checkpoint's tensor names
@@ -241,14 +237,14 @@ models.
 
 #### Scenario: Config from another checkpoint
 - **WHEN** the config given with `--checkpoint` differs from that checkpoint's own `config.json`
-- **THEN** planning fails instead of resolving one generation's map against another's modules
+- **THEN** planning fails instead of resolving one generation's map against another's modules, and the spec is always parsed from the checkpoint's own config
 
 #### Scenario: Invalid shard reference in the index
 - **WHEN** the index names a shard by a parent or absolute path, or not by a string
 - **THEN** reading its tensor names fails as the loader would, without opening any shard
 
 #### Scenario: Model-level table split across formats
-- **WHEN** the PLE table lives at `ple_embedding.ngram_embedding` with one shard MXFP8 and one at the default
+- **WHEN** the PLE lives at model level (`ple.`) and its table has one shard MXFP8 and the rest at the default
 - **THEN** resolution fails naming the table
 
 #### Scenario: Non-canonical MTP index
@@ -262,3 +258,91 @@ models.
 #### Scenario: Agreeing parent and child entries
 - **WHEN** `layers.1.ple.ple_embedding` and its `ngram_embedding` child are both NVFP4
 - **THEN** neither entry is reported as unused
+
+#### Scenario: Two PLE locations
+- **WHEN** the checkpoint holds an NVFP4 table under `layers.1.ple` and an MXFP8 table at `ple_embedding.ngram_embedding`
+- **THEN** resolution fails naming both locations
+
+#### Scenario: Shard entries beside a table scalar
+- **WHEN** the table keeps `weight_scale_2` at its own path and the map adds an agreeing NVFP4 entry for `shard_0`
+- **THEN** both entries are used, and with per-shard entries only the table is still one format
+
+#### Scenario: Projection only under an observer
+- **WHEN** layer 3's `q_proj` tensors are missing and only an observer's tensor under it is declared MXFP8
+- **THEN** resolution fails naming `layers.3.self_attn.q_proj`
+
+#### Scenario: Missing module
+- **WHEN** a GDN norm, one expert projection, one PLE table shard or an MTP mixer norm is missing
+- **THEN** resolution fails naming that module
+
+### Requirement: Lookups agree with and without a checkpoint
+
+Without a checkpoint, an MTP entry SHALL match only a configured layer index spelled as a canonical decimal, as a checkpoint lookup does. A dense head and embedding SHALL take their resolved formats: a tied head is the embedding matrix, resident once.
+
+#### Scenario: Non-canonical MTP index
+- **WHEN** the map lists `mtp.layers.00.self_attn.v_proj` as MXFP8 and a plan is built from the config alone
+- **THEN** the budget is unchanged and the entry is reported as unused, while `mtp.layers.0.self_attn.v_proj` lowers it
+
+#### Scenario: Tied dense embedding
+- **WHEN** a tied Llama 3.1 8B spec is resolved with `model.embed_tokens` as MXFP8
+- **THEN** the head GEMV reads MXFP8 bytes and the matrix is resident once at MXFP8
+
+### Requirement: Groups hold exactly their planned members
+
+On resolving a checkpoint, every module under a group SHALL be one the plan prices: experts `0..num_experts` with their three projections and nothing at the experts' own path, and table shards `shard_0..` with no gap, each a module at its exact path (exactly `split_ngram_parts` when configured, at least one otherwise). The shard count SHALL be compared before anything is built per declared shard. Other modules MUST fail, named.
+
+#### Scenario: Extra shard or expert
+- **WHEN** the checkpoint adds `shard_128` to the 128-shard table with an agreeing NVFP4 entry, or expert 512 to a 512-expert layer
+- **THEN** resolution fails naming the extra module
+
+#### Scenario: Module inside an expert
+- **WHEN** the checkpoint adds `layers.0.mlp.experts.0.observer` with an agreeing NVFP4 entry
+- **THEN** resolution fails naming the observer
+
+#### Scenario: No shard count and no shards
+- **WHEN** `split_ngram_parts` is omitted and the table holds no shards, or shards with a gap in their numbering
+- **THEN** resolution fails naming the table, while the complete checkpoint resolves
+
+#### Scenario: Hollow shard or experts-path weight
+- **WHEN** a shard holds only an observer's tensor, or a weight sits at `layers.0.mlp.experts` itself
+- **THEN** resolution fails naming the shard or the experts path
+
+#### Scenario: Extreme shard count
+- **WHEN** `split_ngram_parts` is 4294967295 and the checkpoint holds 4 shards
+- **THEN** the check fails promptly saying how many shards are missing, without enumerating them
+
+### Requirement: Each MTP layer has its own formats
+
+Every MTP lookup SHALL be made at one layer index, and the MTP budget and tensor schema SHALL use each layer's own formats, including the shared-expert gate's. The input projections (`mtp.fc_embedding`, `mtp.fc_hidden`) and the final mixer SHALL be counted once, however many draft layers there are.
+
+#### Scenario: Two draft layers in different formats
+- **WHEN** a spec with two MTP layers has layer 0's `v_proj` MXFP8 and layer 1's BF16, with tensors to match
+- **THEN** the tensor check passes, and only layer 0's projection is priced at MXFP8, with and without the checkpoint
+
+#### Scenario: Shared input projections
+- **WHEN** the tiny spec is planned with zero, one and two MTP layers in the same formats
+- **THEN** twice the one-layer MTP bytes minus the two-layer bytes equals the FC matrices plus the final mixer
+
+#### Scenario: MXFP8 shared-expert gate
+- **WHEN** the tiny checkpoint's `mtp.layers.0.mlp.shared_expert_gate` is MXFP8 with tensors to match
+- **THEN** the tensor check passes, the resident budget falls by 62 bytes, and the entry is used
+
+### Requirement: Planning against a checkpoint checks modules, not storage formats
+
+Resolving a checkpoint's tensor names for planning SHALL require each planned module to exist, whatever format it is priced at and without format-specific metadata (such as a table's global scale), so a planning override (W4A16, NVFP4) plans against the checkpoint. The tensor check SHALL still require the declared storage formats.
+
+#### Scenario: W4A16 override
+- **WHEN** `plan <config> --checkpoint <dir> --format w4a16` runs on a complete hybrid checkpoint
+- **THEN** it plans at W4A16, `weights <dir>` passes on the formats the checkpoint declares, and a tensor check with the override spec fails stating that only BF16, MXFP8 and NVFP4 tensors load
+
+#### Scenario: NVFP4 override on a BF16 table
+- **WHEN** `plan --checkpoint <dir> --format nvfp4` runs on a checkpoint whose PLE table is BF16 with no global scale
+- **THEN** it plans, and `weights <dir>` checks the table as BF16
+
+### Requirement: The PLE module and its table are located independently
+
+The PLE module (`layers.<n>.ple` or `ple`) and its n-gram embedding (under that module, or at the model-level `ple_embedding`) SHALL each be found at exactly one location; two locations for either MUST fail, naming both.
+
+#### Scenario: Sole model-level table
+- **WHEN** the projections are under `model.language_model.ple` and the only table is at `model.language_model.ple_embedding.ngram_embedding`
+- **THEN** resolution and the tensor check pass, while a second table under `ple.ple_embedding` fails naming both

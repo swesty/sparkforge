@@ -483,16 +483,22 @@ pub fn read_config(dir: &CheckpointDir) -> Result<String> {
     dir.read_metadata("config.json")
 }
 
-/// Resolves `spec`'s formats onto the checkpoint opened at `dir`, for planning with a checkpoint.
-/// `config_text` (the config the spec came from) must be the checkpoint's own `config.json`, read
-/// through the same opened directory as its tensor names, so a plan never pairs one generation's
-/// format map with another's modules (codex-review of #17).
-pub fn resolve_with_checkpoint(spec: &mut crate::config::ModelSpec, config_text: &str, dir: &CheckpointDir) -> Result<()> {
-    let ours: serde_json::Value = serde_json::from_str(config_text).context("parsing the config")?;
-    let theirs: serde_json::Value = serde_json::from_str(&read_config(dir)?).context("parsing the checkpoint's config.json")?;
-    ensure!(ours == theirs, "the config differs from {}'s own config.json; plan with that file, or with the checkpoint it belongs to", dir.path.display());
+/// The spec of the checkpoint opened at `dir`, for planning with a checkpoint: parsed from its own
+/// `config.json` (with `fmt` as an override) and resolved onto its tensor names, both read through
+/// the one opened directory, so a plan never pairs one generation's format map with another's
+/// modules (codex-review of #17). A caller holding a config file of its own passes its text as
+/// `given`, which must equal the checkpoint's.
+pub fn spec_from_checkpoint(dir: &CheckpointDir, fmt: Option<WeightFormat>, given: Option<&str>) -> Result<ModelSpec> {
+    let text = read_config(dir)?;
+    if let Some(given) = given {
+        let ours: serde_json::Value = serde_json::from_str(given).context("parsing the config")?;
+        let theirs: serde_json::Value = serde_json::from_str(&text).context("parsing the checkpoint's config.json")?;
+        ensure!(ours == theirs, "the config differs from {}'s own config.json; plan with that file, or with the checkpoint it belongs to", dir.path.display());
+    }
+    let mut spec = ModelSpec::from_json(&text, fmt)?;
     let names = tensor_names(dir)?;
-    spec.resolve_modules(names.iter().map(String::as_str))
+    spec.resolve_modules(names.iter().map(String::as_str))?;
+    Ok(spec)
 }
 
 /// The tensor names of a checkpoint, for resolving its module identities: the keys of
@@ -917,8 +923,11 @@ pub struct Binding {
 
 /// Validates the checkpoint against the spec and returns which tensors make each linear.
 pub fn bind(ck: &Checkpoint, m: &ModelSpec) -> Result<Binding> {
-    if m.hybrid.is_some() || !m.formats.is_empty() || m.declared_mixed {
-        bail!("{} checkpoints (hybrid layout or mixed-precision weights) do not load yet; the mixed-format loader is a later ticket", m.arch);
+    if m.hybrid.is_some() {
+        bail!("{} checkpoints are checked tensor by tensor (`sparkforge weights`) but do not load into GPU memory yet", m.arch);
+    }
+    if !m.formats.is_empty() || m.declared_mixed {
+        bail!("{} checkpoints with mixed-precision weights do not load yet; only the hybrid layout reads per-module formats", m.arch);
     }
     if m.moe.is_some() {
         bail!("MoE weight loading is not supported yet ({})", m.arch);
@@ -988,6 +997,118 @@ pub fn bind(ck: &Checkpoint, m: &ModelSpec) -> Result<Binding> {
     let mut unexpected: Vec<String> = ck.tensors.keys().filter(|k| !used.contains(k.as_str())).cloned().collect();
     unexpected.sort();
     Ok(Binding { linears, others, unexpected })
+}
+
+/// A hybrid checkpoint checked tensor by tensor against the plan.
+#[derive(Debug)]
+pub struct HybridCheck {
+    /// Tensors checked against the plan, and their bytes.
+    pub tensors: usize,
+    pub bytes: u64,
+    /// Bytes per inventory group (`routed_experts`, `ple_table`, ...), largest first.
+    pub groups: Vec<(&'static str, u64)>,
+    /// Tensors of towers the text model doesn't load (the vision tower), and their bytes.
+    pub skipped: usize,
+    pub skipped_bytes: u64,
+    /// Rows in each PLE table shard, derived from the checkpoint's per-head table sizes.
+    pub table_rows: usize,
+}
+
+/// Canonical prefix of the towers a text-only load skips.
+const SKIPPED_TOWERS: [&str; 1] = ["visual."];
+
+/// Checks every tensor of a hybrid checkpoint against the plan for `m`, which must be resolved
+/// onto this checkpoint (`ModelSpec::resolve_modules`): each tensor the plan needs exists once,
+/// with the dtype and shape of the format it is priced at, and every other tensor belongs to a
+/// skipped tower. Any problem fails, listing the tensors and the expected and found values.
+pub fn check_hybrid(ck: &Checkpoint, m: &ModelSpec) -> Result<HybridCheck> {
+    let Some(h) = &m.hybrid else { bail!("{} is not a hybrid model", m.arch) };
+    let Some(r) = &m.resolved else { bail!("the spec must be resolved onto this checkpoint's modules before its tensors are checked") };
+    // Canonical name -> tensor, refusing two spellings of one tensor (`model.layers.0...` beside
+    // `model.language_model.layers.0...`): only one of them could be loaded.
+    let mut by_name: HashMap<&str, &TensorInfo> = HashMap::new();
+    let (mut skipped, mut skipped_bytes) = (0, 0);
+    for t in ck.tensors.values() {
+        let c = crate::modules::canonical(&t.name);
+        if SKIPPED_TOWERS.iter().any(|p| c.starts_with(p)) {
+            skipped += 1;
+            skipped_bytes += t.len();
+            continue;
+        }
+        if let Some(other) = by_name.insert(c, t) {
+            let (a, b) = if other.name < t.name { (&other.name, &t.name) } else { (&t.name, &other.name) };
+            bail!("the checkpoint holds {a} and {b}, two names for the tensor {c}; only one can be loaded");
+        }
+    }
+    let ple = crate::inventory::ple_paths(&r.table, h)?;
+    let table_rows = ple_table_rows(ck, &by_name, &ple.embedding, &h.ple)?;
+    let f = crate::plan::Formats::new(m);
+    let wants = crate::inventory::hybrid(m, &f, &crate::inventory::Layout { ple, table_rows: Some(table_rows) })?;
+    let mut problems = vec![];
+    let mut groups: Vec<(&'static str, u64)> = vec![];
+    let mut bytes = 0;
+    for w in &wants {
+        match by_name.remove(w.name.as_str()) {
+            None => problems.push(format!("missing {} (expected {} {:?})", w.name, w.dtype, w.shape)),
+            Some(t) if t.dtype != w.dtype || t.shape != w.shape => {
+                problems.push(format!("{}: expected {} {:?}, found {} {:?}", t.name, w.dtype, w.shape, t.dtype, t.shape))
+            }
+            Some(t) => {
+                bytes += t.len();
+                match groups.iter_mut().find(|(g, _)| *g == w.group) {
+                    Some(g) => g.1 += t.len(),
+                    None => groups.push((w.group, t.len())),
+                }
+            }
+        }
+    }
+    let mut unexpected: Vec<&str> = by_name.values().map(|t| t.name.as_str()).collect();
+    unexpected.sort_unstable();
+    problems.extend(unexpected.iter().map(|n| format!("unexpected {n}: the plan has no use for it, and it is not in a skipped tower")));
+    if !problems.is_empty() {
+        let shown = problems.len().min(20);
+        bail!("checkpoint {} does not match the plan ({} problem(s)):\n  {}{}", ck.dir.display(), problems.len(), problems[..shown].join("\n  "),
+            if problems.len() > shown { format!("\n  ... and {} more", problems.len() - shown) } else { String::new() });
+    }
+    groups.sort_by_key(|g| std::cmp::Reverse(g.1));
+    Ok(HybridCheck { tensors: wants.len(), bytes, groups, skipped, skipped_bytes, table_rows })
+}
+
+/// Prices `m`'s PLE table at the rows `c` found in the checkpoint, so a plan built afterwards
+/// budgets the table as stored rather than from `ngram_vocab_size_base`.
+pub fn apply_checked_table(m: &mut ModelSpec, c: &HybridCheck) {
+    if let Some(h) = &mut m.hybrid {
+        h.ple.checked_rows = h.ple.split_parts.map(|parts| parts as u64 * c.table_rows as u64);
+    }
+}
+
+/// Rows in each shard of the PLE n-gram table. The per-head tables are prime-sized near
+/// `ngram_vocab_size_base`, so their sizes come from the checkpoint (`ngram_heads_vocab_sizes`,
+/// with `ngram_heads_offsets` their running sum); the total is padded to a multiple of
+/// `make_ngram_vocab_size_divisible_by` and split evenly into `split_ngram_parts` shards.
+fn ple_table_rows(ck: &Checkpoint, by_name: &HashMap<&str, &TensorInfo>, embedding: &str, p: &crate::config::Ple) -> Result<usize> {
+    let heads = p.heads() as usize;
+    let read = |rel: &str| -> Result<Vec<i64>> {
+        let name = format!("{embedding}.{rel}");
+        let t = by_name.get(name.as_str()).with_context(|| format!("missing {name} (expected I64 [{heads}]), which sizes the PLE n-gram table"))?;
+        ensure!(t.dtype == "I64" && t.shape == [heads], "{}: expected I64 [{heads}], found {} {:?}", t.name, t.dtype, t.shape);
+        let mut buf = vec![];
+        ck.read_into(t, &mut buf)?;
+        Ok(buf.chunks_exact(8).map(|b| i64::from_le_bytes(b.try_into().unwrap())).collect())
+    };
+    let (sizes, offsets) = (read("ngram_heads_vocab_sizes")?, read("ngram_heads_offsets")?);
+    let mut total: u64 = 0;
+    for (i, (&s, &o)) in sizes.iter().zip(&offsets).enumerate() {
+        ensure!(u64::try_from(s).is_ok_and(|s| s >= p.vocab_base), "PLE head {i} has {s} rows, below ngram_vocab_size_base {}", p.vocab_base);
+        ensure!(u64::try_from(o) == Ok(total), "PLE head {i} starts at row {o}, but the heads before it hold {total} rows");
+        total = total.checked_add(s as u64).context("the PLE n-gram table's per-head sizes overflow a 64-bit row count")?;
+    }
+    let multiple = p.vocab_multiple.unwrap_or(1) as u64;
+    let parts = p.split_parts.context("config.json has no split_ngram_parts, so the PLE n-gram table's shards can't be checked")? as u64;
+    let padded = total.div_ceil(multiple).checked_mul(multiple)
+        .with_context(|| format!("the PLE n-gram table's {total} rows, padded to a multiple of {multiple}, overflow a 64-bit row count"))?;
+    ensure!(padded % parts == 0, "the PLE n-gram table has {padded} rows (padded to a multiple of {multiple}), which do not split evenly into {parts} shards");
+    Ok(usize::try_from(padded / parts)?)
 }
 
 /// Bytes `MemAvailable` must keep after a load (design decision 5).

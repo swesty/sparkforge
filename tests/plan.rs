@@ -156,3 +156,22 @@ fn tile_choice_weighs_wave_efficiency_not_just_intensity() {
     assert_eq!((t.m, t.n, t.bm, t.bn), (128, 2048, 64, 64), "{t:?}");
     assert!(t.wave_efficiency > 16.0 / 48.0, "{t:?}");
 }
+
+#[test]
+fn a_tied_dense_head_takes_the_resolved_embedding_format() {
+    // codex-review fp:509d200bd957: a dense spec resolved with an MXFP8 entry for its tied
+    // embedding priced the head BF16 and the embedding at 2 bytes per element. A tied head is the
+    // embedding matrix, so both take the resolved format, counted once.
+    let mut s = ModelSpec::from_json(&std::fs::read_to_string("configs/llama-3.1-8b.json").unwrap(), None).unwrap();
+    s.tie_embeddings = true;
+    let opts = plan::PlanOpts { prefill_tokens: 2048, ctx: 32768 };
+    let bf16 = plan::build(&s, &GB10, &opts);
+    s.formats.modules.insert("model.embed_tokens".into(), sparkforge::config::WeightFormat::Mxfp8);
+    s.resolve_modules(["model.embed_tokens.weight", "model.layers.0.self_attn.q_proj.weight"]).unwrap();
+    let p = plan::build(&s, &GB10, &opts);
+    let saved = (bf16.budget.weight_gib - p.budget.weight_gib) * (1u64 << 30) as f64;
+    let once = 128_256.0 * 4096.0 * (2.0 - 1.03125);
+    assert!((saved - once).abs() < 1e3, "resident once at MXFP8: saved {saved} vs {once}");
+    let head = |p: &plan::Plan| p.gemv.iter().find(|g| g.linear == "lm_head").unwrap().est_us;
+    assert!((head(&p) / head(&bf16) - 1.03125 / 2.0).abs() < 1e-9, "the head GEMV reads MXFP8 bytes");
+}

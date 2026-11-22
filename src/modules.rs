@@ -56,6 +56,11 @@ impl ModuleTable {
         self.covered(path).filter_map(|m| m.strip_prefix(under.as_str())).map(|r| r.split('.').next().unwrap_or(r)).collect()
     }
 
+    /// Whether a module exists at exactly `path`.
+    pub fn contains(&self, path: &str) -> bool {
+        self.modules.contains(path)
+    }
+
     /// Whether any module exists at `path` or under it.
     pub fn has(&self, path: &str) -> bool {
         self.covered(path).next().is_some()
@@ -78,58 +83,58 @@ impl ResolvedFormats {
         self.by_module.get(module).map_or(default, |(f, _)| *f)
     }
 
-    /// The modules a lookup of `path` prices: the module at exactly `path` when the checkpoint
-    /// has one (a projection: tensors kept under it, such as an observer's, don't reprice it),
-    /// else every module under it (a group such as a layer's routed experts or a sharded table).
-    pub fn priced<'s>(&'s self, path: &'s str) -> Vec<&'s str> {
-        if self.table.covered(path).next() == Some(path) {
-            vec![path]
-        } else {
-            self.table.covered(path).collect()
-        }
-    }
-
-    /// The formats of the modules a lookup of `path` prices (see `priced`): `(format, count)` per
-    /// distinct format, with `default` for modules no entry covers. Empty when no module exists.
-    pub fn formats_at(&self, path: &str, default: WeightFormat) -> Vec<(WeightFormat, usize)> {
-        let mut out: Vec<(WeightFormat, usize)> = vec![];
-        for m in self.priced(path) {
-            let f = self.format_of(m, default);
-            match out.iter_mut().find(|(g, _)| *g == f) {
-                Some(g) => g.1 += 1,
-                None => out.push((f, 1)),
-            }
-        }
-        out
-    }
-
-    /// The formats of every module at or under `path`, for checking that a group the planner
-    /// prices as one format really has one (`formats_at` would stop at a module at `path` itself,
-    /// such as a table's scalar global scale beside its shards).
-    pub fn formats_under(&self, path: &str, default: WeightFormat) -> Vec<(WeightFormat, usize)> {
-        let mut out: Vec<(WeightFormat, usize)> = vec![];
-        for m in self.table.covered(path) {
-            let f = self.format_of(m, default);
-            match out.iter_mut().find(|(g, _)| *g == f) {
-                Some(g) => g.1 += 1,
-                None => out.push((f, 1)),
-            }
-        }
-        out
-    }
-
-    /// Every map entry that covers a module a lookup of `path` prices.
-    pub fn entries_at(&self, path: &str) -> BTreeSet<&str> {
-        self.priced(path).into_iter().filter_map(|m| self.by_module.get(m)).flat_map(|(_, es)| es.iter().map(String::as_str)).collect()
-    }
-
-    /// One format for the modules a lookup of `path` prices: the largest when they differ (the
-    /// budget then never undercounts), `None` when no module exists there.
+    /// The format of a single module (a projection): the module at exactly `path`, `None` when the
+    /// checkpoint has none there. Tensors kept under it, such as an observer's, never stand in for
+    /// it, so a projection missing from the checkpoint is not priced from its subtree.
     pub fn format_at(&self, path: &str, default: WeightFormat) -> Option<WeightFormat> {
-        self.formats_at(path, default)
+        self.table.contains(path).then(|| self.format_of(path, default))
+    }
+
+    /// Every map entry that covers the module at exactly `path`.
+    pub fn entries_at(&self, path: &str) -> BTreeSet<&str> {
+        self.by_module.get(path).into_iter().flat_map(|(_, es)| es.iter().map(String::as_str)).collect()
+    }
+
+    /// The members of a group (a layer's routed experts, a sharded table): the modules strictly
+    /// under `path` when there are any, else the module at `path`. A module at the group's own path
+    /// beside members holds only shared scalars (a table's global scale), so it has no format of
+    /// its own to price or to check.
+    pub fn group_members<'s>(&'s self, path: &str) -> Vec<&'s str> {
+        let all: Vec<&str> = self.table.covered(path).collect();
+        if all.len() > 1 && all[0] == path {
+            all[1..].to_vec()
+        } else {
+            all
+        }
+    }
+
+    /// The formats of a group's members (see `group_members`): `(format, count)` per distinct
+    /// format, with `default` for members no entry covers. Empty when the group is absent.
+    pub fn group_formats(&self, path: &str, default: WeightFormat) -> Vec<(WeightFormat, usize)> {
+        let mut out: Vec<(WeightFormat, usize)> = vec![];
+        for m in self.group_members(path) {
+            let f = self.format_of(m, default);
+            match out.iter_mut().find(|(g, _)| *g == f) {
+                Some(g) => g.1 += 1,
+                None => out.push((f, 1)),
+            }
+        }
+        out
+    }
+
+    /// One format for a group: the largest when its members differ (the budget then never
+    /// undercounts), `None` when the group is absent.
+    pub fn group_format(&self, path: &str, default: WeightFormat) -> Option<WeightFormat> {
+        self.group_formats(path, default)
             .into_iter()
             .map(|(f, _)| f)
             .reduce(|a, b| if b.bytes_per_elem() > a.bytes_per_elem() { b } else { a })
+    }
+
+    /// Every map entry that covers a module at or under `path`: the group's members and a module at
+    /// its own path both belong to it, so per-shard entries count as used beside a table scalar.
+    pub fn group_entries(&self, path: &str) -> BTreeSet<&str> {
+        self.table.covered(path).filter_map(|m| self.by_module.get(m)).flat_map(|(_, es)| es.iter().map(String::as_str)).collect()
     }
 }
 

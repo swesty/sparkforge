@@ -89,6 +89,8 @@ struct RawHybrid {
     ngram_size: Option<u32>,
     heads_per_ngram: Option<u32>,
     ngram_vocab_size_base: Option<u64>,
+    split_ngram_parts: Option<u32>,
+    make_ngram_vocab_size_divisible_by: Option<u32>,
     // Multi-token prediction draft layers (also given as `mtp.num_hidden_layers`)
     mtp_num_hidden_layers: Option<u32>,
     mtp: Option<RawMtp>,
@@ -232,15 +234,27 @@ pub struct Ple {
     pub ngram_size: u32,
     pub heads_per_ngram: u32,
     pub vocab_base: u64,
+    /// Shards the table is stored in (`split_ngram_parts`); the loader needs it, the planner doesn't.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub split_parts: Option<u32>,
+    /// The per-head table sizes sum to a multiple of this before splitting
+    /// (`make_ngram_vocab_size_divisible_by`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vocab_multiple: Option<u32>,
+    /// Table rows as checked in a checkpoint (shards x rows per shard), when known; the budget then
+    /// prices the table at this size instead of `heads * vocab_base`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub checked_rows: Option<u64>,
 }
 
 impl Ple {
     /// One head set per n-gram order 2..=ngram_size.
     pub fn heads(&self) -> u32 { (self.ngram_size - 1) * self.heads_per_ngram }
     pub fn head_dim(&self) -> u32 { self.embed_dim / self.heads() }
-    /// Table rows, `heads * vocab_base`. The checkpoint's per-head tables are prime-sized near
-    /// `vocab_base`, so the true count differs by a few parts per million.
-    pub fn table_rows(&self) -> u64 { self.heads() as u64 * self.vocab_base }
+    /// Table rows: as checked in a checkpoint when known, else `heads * vocab_base`. The
+    /// checkpoint's per-head tables are prime-sized near `vocab_base` and padded, so the true count
+    /// differs by a few parts per million.
+    pub fn table_rows(&self) -> u64 { self.checked_rows.unwrap_or(self.heads() as u64 * self.vocab_base) }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -461,8 +475,17 @@ fn parse_hybrid(r: &RawConfig, body: &serde_json::Value, head_dim: u32, partial_
         ngram_size: dim(h.ngram_size, "ngram_size")?,
         heads_per_ngram: dim(h.heads_per_ngram, "heads_per_ngram")?,
         vocab_base: need(h.ngram_vocab_size_base, "ngram_vocab_size_base")?,
+        split_parts: h.split_ngram_parts.map(|x| dim(Some(x), "split_ngram_parts")).transpose()?,
+        vocab_multiple: h.make_ngram_vocab_size_divisible_by.map(|x| dim(Some(x), "make_ngram_vocab_size_divisible_by")).transpose()?,
+        checked_rows: None,
     };
-    ensure!(ple.ngram_size >= 2 && ple.embed_dim % ple.heads() == 0,
+    // Checked before `heads()` is used: (ngram_size - 1) * heads_per_ngram, then times the base.
+    ensure!(ple.ngram_size >= 2, "ngram_size {} must be at least 2 (orders 2..=ngram_size)", ple.ngram_size);
+    ensure!((ple.ngram_size - 1).checked_mul(ple.heads_per_ngram).is_some(),
+        "{} n-gram orders times heads_per_ngram {} overflows the PLE head count", ple.ngram_size - 1, ple.heads_per_ngram);
+    ensure!((ple.heads() as u64).checked_mul(ple.vocab_base).is_some(),
+        "ngram_vocab_size_base {} times {} PLE heads overflows a 64-bit row count", ple.vocab_base, ple.heads());
+    ensure!(ple.embed_dim % ple.heads() == 0,
         "PLE embed_dim {} is not divisible into {} heads (orders 2..={})", ple.embed_dim, ple.heads(), ple.ngram_size);
     // The planner charges one PLE application and one table per token; other placements are not
     // modelled, so they are rejected rather than mis-budgeted.
@@ -527,6 +550,34 @@ fn check_hybrid_formats(formats: &FormatMap, h: &Hybrid) -> Result<()> {
             }
         }
     }
+    Ok(())
+}
+
+/// The PLE table's shards, before anything is built per declared shard: `split_ngram_parts` of
+/// them when configured (a count far beyond the checkpoint's fails here, not after listing every
+/// shard), else at least one; numbered `shard_0..` with no gap, each a module at its exact path
+/// (codex-review of #18).
+fn check_table_shards(t: &crate::modules::ModuleTable, table: &str, parts: Option<u32>) -> Result<()> {
+    let shards = t.children(table);
+    let n = parts.map_or(shards.len(), |p| p as usize);
+    // A shard name is `shard_<j>` with `j` a canonical index below the count.
+    let index = |c: &str| c.strip_prefix("shard_").and_then(|j| j.parse::<usize>().ok().filter(|&j| j < n && format!("shard_{j}") == c));
+    let extra: Vec<String> = shards.iter().filter(|c| index(c).is_none()).map(|c| format!("{table}.{c}")).collect();
+    let have: BTreeSet<usize> = shards.iter().filter_map(|c| index(c)).collect();
+    // Missing shards are listed only when few could be: a count far beyond the checkpoint's is
+    // reported by number, never enumerated.
+    let missing = n - have.len();
+    let listed: Vec<String> = if missing <= 8 { (0..n).filter(|j| !have.contains(j)).map(|j| format!("{table}.shard_{j}")).collect() } else { vec![] };
+    let what = match parts {
+        Some(p) => format!("split_ngram_parts is {p}, so the PLE table must hold shard_0..shard_{}", p.saturating_sub(1)),
+        None => "the PLE table must hold shards shard_0, shard_1, ... with no gap".to_string(),
+    };
+    ensure!(n > 0, "{what}, but {table} holds none");
+    ensure!(extra.is_empty(), "{what}; the checkpoint also holds {}{}", extra.iter().take(8).cloned().collect::<Vec<_>>().join(", "),
+        if extra.len() > 8 { format!(" (and {} more)", extra.len() - 8) } else { String::new() });
+    ensure!(missing == 0, "{what}; the checkpoint lacks {}", if listed.is_empty() { format!("{missing} of them") } else { listed.join(", ") });
+    let hollow: Vec<String> = shards.iter().map(|c| format!("{table}.{c}")).filter(|m| !t.contains(m)).collect();
+    ensure!(hollow.is_empty(), "the PLE table shard(s) {} hold no tensors of their own, only modules under them", hollow.join(", "));
     Ok(())
 }
 
@@ -638,12 +689,32 @@ impl ModelSpec {
     /// entries that cover none are reported as unused instead of matching by pattern.
     ///
     /// For a hybrid model it also checks what the planner relies on: the checkpoint's MTP layer
-    /// indices are exactly the configured ones, every group the planner prices as one format (a
-    /// layer's routed experts, the PLE table, the MTP experts) has one format, and a tied head
-    /// isn't given a format other than the embedding's (codex-review of #17).
+    /// indices are exactly the configured ones, the PLE lives at one path, every group the planner
+    /// prices as one format (a layer's routed experts, the PLE table, the MTP experts) has one
+    /// format, every module the plan prices exists at its exact path, and a tied head isn't given a
+    /// format other than the embedding's (codex-review of #17).
     pub fn resolve_modules<'a>(&mut self, names: impl IntoIterator<Item = &'a str>) -> Result<()> {
+        // A failed resolution leaves the spec as it was: an earlier checkpoint's formats and
+        // checked table rows still price it (codex-review of #18).
+        let prev = self.resolved.take();
+        let prev_rows = self.hybrid.as_mut().and_then(|h| h.ple.checked_rows.take());
+        let out = self.resolve_onto(names);
+        if out.is_err() {
+            self.resolved = prev;
+            if let Some(h) = &mut self.hybrid {
+                h.ple.checked_rows = prev_rows;
+            }
+        }
+        out
+    }
+
+    /// `resolve_modules` without the restore on failure. On success the new formats replace the
+    /// old ones and rows checked in another checkpoint are gone; this checkpoint's own tensor check
+    /// sets them again.
+    fn resolve_onto<'a>(&mut self, names: impl IntoIterator<Item = &'a str>) -> Result<()> {
         let table = crate::modules::ModuleTable::from_tensor_names(names);
         let r = crate::modules::resolve(&self.formats, table)?;
+        let mut ple = None;
         if let Some(h) = &self.hybrid {
             // Canonical decimal indices only: the planner looks layers up as `mtp.layers.<n>`, so a
             // `mtp.layers.00` beside `mtp.layers.0` would otherwise pass as index 0 and be ignored.
@@ -653,17 +724,18 @@ impl ModelSpec {
                 .collect::<Result<_>>()?;
             let want: BTreeSet<u32> = (0..h.mtp_layers).collect();
             ensure!(live == want, "the checkpoint holds MTP layer(s) {live:?}, but the config has {} MTP layer(s) ({want:?}); the draft layers can't be priced unambiguously", h.mtp_layers);
+            // One PLE module and one table, so one table is priced (codex-review of #17).
+            let p = crate::inventory::ple_paths(&r.table, h)?;
+            check_table_shards(&r.table, &p.table(), h.ple.split_parts)?;
             let mut groups: Vec<String> = (0..h.schedule.len()).map(|i| format!("layers.{i}.mlp.experts")).collect();
             groups.extend((0..h.mtp_layers).map(|i| format!("mtp.layers.{i}.mlp.experts")));
-            // Every path the PLE table lookup accepts.
-            groups.extend(h.ple.layer_ids.iter().flat_map(|&p| [Some(p), p.checked_sub(1)]).flatten()
-                .map(|n| format!("layers.{n}.ple.ple_embedding.ngram_embedding")));
-            groups.extend(["ple.ple_embedding.ngram_embedding".to_string(), "ple_embedding.ngram_embedding".to_string()]);
+            groups.push(p.table());
             for g in &groups {
-                let fs = r.formats_under(g, self.weights);
+                let fs = r.group_formats(g, self.weights);
                 ensure!(fs.len() <= 1, "the planner prices {g} as one format, but the checkpoint's modules there have {}; mixed formats inside one group are not supported",
                     fs.iter().map(|(f, n)| format!("{f:?} ({n} modules)")).collect::<Vec<_>>().join(" and "));
             }
+            ple = Some(p);
         }
         if self.tie_embeddings {
             let (head, embed) = (r.format_at("lm_head", self.weights), r.format_at("embed_tokens", WeightFormat::Bf16));
@@ -671,7 +743,49 @@ impl ModelSpec {
                 ensure!(h == e, "the head is tied to the embedding, but the checkpoint gives lm_head {h:?} and embed_tokens {e:?}; one matrix has one format");
             }
         }
+        // Every module the plan prices must exist at its exact path: a projection missing from the
+        // checkpoint is an error, never priced from whatever is stored under it (codex-review of
+        // #17). Each module's tensors, dtypes and shapes are checked when the checkpoint is loaded.
+        // `resolve_modules` restores the previous formats if this check fails.
         self.resolved = Some(r);
+        if let Some(ple) = ple {
+            self.check_modules(&ple)?;
+        }
+        if let Some(h) = &mut self.hybrid {
+            h.ple.checked_rows = None;
+        }
+        Ok(())
+    }
+
+    fn check_modules(&self, ple: &crate::inventory::PlePaths) -> Result<()> {
+        let Some(r) = &self.resolved else { return Ok(()) };
+        let f = crate::plan::Formats::new(self);
+        let wants = crate::inventory::hybrid(self, &f, &crate::inventory::Layout { ple: ple.clone(), table_rows: None })?;
+        let mut planned: BTreeSet<String> = wants.iter().filter_map(|w| w.name.rsplit_once('.').map(|(m, _)| m.to_owned())).collect();
+        let missing: Vec<&str> = planned.iter().map(String::as_str).filter(|m| !r.table.contains(m)).collect();
+        ensure!(missing.is_empty(), "the checkpoint has no tensors for {} module(s) the plan needs: {}{}", missing.len(),
+            missing.iter().take(8).copied().collect::<Vec<_>>().join(", "), if missing.len() > 8 { format!(" (and {} more)", missing.len() - 8) } else { String::new() });
+        // Every module under a group is a planned one: an extra expert, a tensor kept inside an
+        // expert or at the experts' own path, or an extra table shard would be covered by the
+        // group's entries, and so counted as used, without being budgeted (codex-review of #18).
+        let Some(h) = &self.hybrid else { return Ok(()) };
+        let table = ple.table();
+        if h.ple.split_parts.is_none() {
+            // No configured count: the shards `check_table_shards` found, each at its exact path.
+            planned.extend(r.table.children(&table).into_iter().map(|c| format!("{table}.{c}")));
+        }
+        // The table's own path may hold its shared scalars (an NVFP4 global scale) in any format.
+        planned.insert(table.clone());
+        let mut groups: Vec<String> = vec![table];
+        if self.moe.is_some() {
+            groups.extend((0..h.schedule.len()).map(|i| format!("layers.{i}.mlp.experts")));
+            groups.extend((0..h.mtp_layers).map(|i| format!("mtp.layers.{i}.mlp.experts")));
+        }
+        for g in &groups {
+            let extra: Vec<&str> = r.table.covered(g).filter(|m| !planned.contains(*m)).collect();
+            ensure!(extra.is_empty(), "the checkpoint holds {} module(s) under {g} that the plan doesn't price: {}{}", extra.len(),
+                extra.iter().take(8).copied().collect::<Vec<_>>().join(", "), if extra.len() > 8 { format!(" (and {} more)", extra.len() - 8) } else { String::new() });
+        }
         Ok(())
     }
 

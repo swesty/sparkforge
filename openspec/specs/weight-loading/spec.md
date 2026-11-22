@@ -207,25 +207,6 @@ time and GB/s. It MUST exit non-zero if any check fails.
 - **WHEN** `verify-weights` runs on the Llama 3.1 8B BF16 checkpoint on a GB10
 - **THEN** every check passes and the report shows load time and GB/s for every linear
 
-### Requirement: Hybrid and mixed-precision checkpoints are refused
-
-Binding MUST fail, before any GPU work, for a hybrid-layout checkpoint, one whose config declares
-mixed precision, or one whose planned tensors are not in the planned dtype, until the mixed-format
-loader exists, naming the architecture or the tensor. A format override used for planning MUST NOT
-lift this refusal.
-
-#### Scenario: Flash Next checkpoint
-- **WHEN** `sparkforge weights` opens a Qwen3.8 Flash Next checkpoint
-- **THEN** it fails stating that hybrid or mixed-precision checkpoints do not load yet
-
-#### Scenario: Override used for planning
-- **WHEN** a dense MIXED_PRECISION config is parsed with a BF16 override and its checkpoint is bound
-- **THEN** binding fails stating that mixed-precision checkpoints do not load yet
-
-#### Scenario: Quantized tensors behind a BF16 config
-- **WHEN** a config without `quantization_config` is bound to a checkpoint whose `o_proj` is F8_E4M3 with a scale tensor
-- **THEN** binding fails before GPU work, naming the tensor and its dtype
-
 ### Requirement: Loads never exhaust host memory on a single-account node
 
 A load SHALL be refused before any CUDA call if its copied bytes, staging buffer and, when
@@ -281,3 +262,75 @@ sparkforge assumes one account runs it per node.
 #### Scenario: Wide vocabulary
 - **WHEN** `verify-weights` checks Llama 3.1 8B's `lm_head` (1.05 GB of weights)
 - **THEN** the process's peak host memory stays bounded (measured 225 MB) instead of scaling with the tensor
+
+### Requirement: Hybrid checkpoints are checked tensor by tensor
+
+For a hybrid checkpoint, `sparkforge weights` SHALL check every tensor before any GPU work: each tensor the plan needs exists once, with the dtype and shape of the format its module is priced at, and every other tensor belongs to the skipped vision tower. PLE table shard rows SHALL come from the checkpoint's per-head table sizes. Any mismatch MUST fail naming the tensor and the expected and found values.
+
+#### Scenario: Flash Next checkpoint
+- **WHEN** `sparkforge weights` opens the Qwen3.8 Flash Next NVFP4 checkpoint (revision 6909a5bed089) on spark-5
+- **THEN** 301,260 tensors (105.40 GB) match the plan, the 333 vision-tower tensors are skipped, the PLE shards hold 2,500,012 rows, and the plan prices 105.40 GB of resident text weights
+
+#### Scenario: Wrong dtype or shape
+- **WHEN** a GDN projection's MXFP8 scale is F8_E4M3 and an expert's packed weight has twice its columns
+- **THEN** the check fails naming both tensors with the expected and found dtype and shape
+
+#### Scenario: Missing scale and unexpected tensor
+- **WHEN** an NVFP4 expert lacks its `input_scale` and a text layer holds a tensor the plan doesn't use
+- **THEN** the check fails naming both, while vision-tower tensors are not reported
+
+#### Scenario: Two spellings of one tensor
+- **WHEN** a tensor exists under both `model.language_model.` and `model.`
+- **THEN** the check fails naming both names
+
+#### Scenario: Format map disagrees with the tensors
+- **WHEN** the map lists a projection as NVFP4 and the checkpoint holds MXFP8 tensors for it
+- **THEN** the check fails naming the NVFP4 tensors that are missing or mismatched
+
+#### Scenario: PLE table sizes
+- **WHEN** the per-head table sizes imply a different shard row count, a head below `ngram_vocab_size_base`, or a padded total that doesn't split into `split_ngram_parts`
+- **THEN** the check fails saying which
+
+### Requirement: Only dense BF16 checkpoints load into GPU memory
+
+Binding for the GPU MUST fail, before any GPU work, for a hybrid-layout checkpoint (stating that it is checked but not loaded yet), for one whose config declares mixed precision, and for one whose planned tensors are not BF16, naming the architecture or the tensor. A format override used for planning MUST NOT lift this refusal.
+
+#### Scenario: Flash Next checkpoint
+- **WHEN** a Qwen3.8 Flash Next checkpoint is bound for the GPU
+- **THEN** binding fails stating that hybrid checkpoints are checked tensor by tensor but do not load into GPU memory yet
+
+#### Scenario: Override used for planning
+- **WHEN** a dense MIXED_PRECISION config is parsed with a BF16 override and its checkpoint is bound
+- **THEN** binding fails stating that mixed-precision checkpoints do not load yet
+
+#### Scenario: Quantized tensors behind a BF16 config
+- **WHEN** a config without `quantization_config` is bound to a checkpoint whose `o_proj` is F8_E4M3 with a scale tensor
+- **THEN** binding fails before GPU work, naming the tensor and its dtype
+
+### Requirement: The checked PLE table prices the reported budget
+
+`sparkforge weights` SHALL check a hybrid checkpoint's tensors before building any plan, and report the resident budget with the PLE table at the rows it checked. Resolving a spec onto another checkpoint MUST clear rows checked earlier, and a failed resolution MUST leave the spec's formats and checked rows as they were. PLE row totals and padding that cannot be represented in 64 bits MUST fail the check, not wrap or panic.
+
+#### Scenario: One more row per shard
+- **WHEN** two checkpoints of one config have per-head sizes making 15- and 16-row shards in 4 NVFP4 shards of 16 columns
+- **THEN** both pass, and the second's resident budget is 36 bytes larger
+
+#### Scenario: Overflowing padding
+- **WHEN** the per-head sizes sum within 64 bits but their padding to the configured multiple does not
+- **THEN** the check fails saying the row count overflows
+
+#### Scenario: Spec reused across checkpoints
+- **WHEN** a spec checked against the 15-row checkpoint is resolved onto the 16-row one
+- **THEN** its checked rows are cleared and its budget equals a fresh resolution's, until the 16-row checkpoint is checked
+
+#### Scenario: Failed switch
+- **WHEN** a spec checked against one checkpoint is resolved onto another that holds two PLE tables
+- **THEN** resolution fails, and the spec keeps the first checkpoint's formats, checked rows and budget
+
+### Requirement: A tied embedding carries the head GEMV's tensors
+
+With tied embeddings, the embedding matrix SHALL be checked as a GEMV operand, counted once: in NVFP4 it MUST have its activation scale, and in weight-only NVFP4 it MUST NOT.
+
+#### Scenario: Tied NVFP4 and weight-only NVFP4
+- **WHEN** a tied checkpoint's embedding is NVFP4, or W4A16 NVFP4
+- **THEN** NVFP4 fails without `embed_tokens.input_scale` and passes with it, and W4A16 NVFP4 passes without it and reports it as unexpected if present
