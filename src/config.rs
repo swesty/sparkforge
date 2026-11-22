@@ -479,6 +479,8 @@ fn parse_hybrid(r: &RawConfig, body: &serde_json::Value, head_dim: u32, partial_
         vocab_multiple: h.make_ngram_vocab_size_divisible_by.map(|x| dim(Some(x), "make_ngram_vocab_size_divisible_by")).transpose()?,
         checked_rows: None,
     };
+    ensure!((ple.heads() as u64).checked_mul(ple.vocab_base).is_some(),
+        "ngram_vocab_size_base {} times {} PLE heads overflows a 64-bit row count", ple.vocab_base, ple.heads());
     ensure!(ple.ngram_size >= 2 && ple.embed_dim % ple.heads() == 0,
         "PLE embed_dim {} is not divisible into {} heads (orders 2..={})", ple.embed_dim, ple.heads(), ple.ngram_size);
     // The planner charges one PLE application and one table per token; other placements are not
@@ -660,6 +662,10 @@ impl ModelSpec {
     /// format, every module the plan prices exists at its exact path, and a tied head isn't given a
     /// format other than the embedding's (codex-review of #17).
     pub fn resolve_modules<'a>(&mut self, names: impl IntoIterator<Item = &'a str>) -> Result<()> {
+        // Rows checked in another checkpoint never price this one; its own check sets them again.
+        if let Some(h) = &mut self.hybrid {
+            h.ple.checked_rows = None;
+        }
         let table = crate::modules::ModuleTable::from_tensor_names(names);
         let r = crate::modules::resolve(&self.formats, table)?;
         let mut ple = None;
@@ -711,22 +717,30 @@ impl ModelSpec {
         let missing: Vec<&str> = modules.into_iter().filter(|m| !r.table.contains(m)).collect();
         ensure!(missing.is_empty(), "the checkpoint has no tensors for {} module(s) the plan needs: {}{}", missing.len(),
             missing.iter().take(8).copied().collect::<Vec<_>>().join(", "), if missing.len() > 8 { format!(" (and {} more)", missing.len() - 8) } else { String::new() });
-        // A group's members are exactly the planned ones: an extra expert or table shard would be
-        // covered by the group's entries, and so counted as used, without being budgeted.
+        // Every module under a group is a planned one: an extra expert, a tensor kept inside an
+        // expert (an observer) or an extra table shard would be covered by the group's entries,
+        // and so counted as used, without being budgeted (codex-review of #18).
         let Some(h) = &self.hybrid else { return Ok(()) };
-        let mut groups: Vec<(String, BTreeSet<String>)> = vec![];
-        if let Some(e) = &self.moe {
-            let experts: BTreeSet<String> = (0..e.num_experts).map(|x| x.to_string()).collect();
-            groups.extend((0..h.schedule.len()).map(|i| (format!("layers.{i}.mlp.experts"), experts.clone())));
-            groups.extend((0..h.mtp_layers).map(|i| (format!("mtp.layers.{i}.mlp.experts"), experts.clone())));
+        let mut planned: BTreeSet<String> = wants.iter().filter_map(|w| w.name.rsplit_once('.').map(|(m, _)| m.to_owned())).collect();
+        let table = format!("{ple}.{}", crate::plan::PLE_TABLE);
+        if h.ple.split_parts.is_none() {
+            // No configured shard count: the table must still hold shards, numbered from 0 with no gap.
+            let shards = r.table.children(&table);
+            let want: BTreeSet<String> = (0..shards.len()).map(|j| format!("shard_{j}")).collect();
+            ensure!(!shards.is_empty() && shards.iter().all(|c| want.contains(*c)),
+                "the PLE table {table} must hold shards shard_0, shard_1, ... with no gap; the checkpoint has {}",
+                if shards.is_empty() { "none".to_string() } else { shards.iter().copied().collect::<Vec<_>>().join(", ") });
+            planned.extend(r.table.covered(&table).filter(|m| *m != table).map(str::to_owned));
         }
-        if let Some(parts) = h.ple.split_parts {
-            groups.push((format!("{ple}.{}", crate::plan::PLE_TABLE), (0..parts).map(|j| format!("shard_{j}")).collect()));
+        let mut groups: Vec<String> = vec![table];
+        if self.moe.is_some() {
+            groups.extend((0..h.schedule.len()).map(|i| format!("layers.{i}.mlp.experts")));
+            groups.extend((0..h.mtp_layers).map(|i| format!("mtp.layers.{i}.mlp.experts")));
         }
-        for (g, want) in &groups {
-            let extra: Vec<String> = r.table.children(g).into_iter().filter(|c| !want.contains(*c)).map(|c| format!("{g}.{c}")).collect();
-            ensure!(extra.is_empty(), "the checkpoint holds {} module(s) under {g} beyond the {} the plan prices: {}{}", extra.len(), want.len(),
-                extra.iter().take(8).cloned().collect::<Vec<_>>().join(", "), if extra.len() > 8 { format!(" (and {} more)", extra.len() - 8) } else { String::new() });
+        for g in &groups {
+            let extra: Vec<&str> = r.table.covered(g).filter(|m| m != g && !planned.contains(*m)).collect();
+            ensure!(extra.is_empty(), "the checkpoint holds {} module(s) under {g} that the plan doesn't price: {}{}", extra.len(),
+                extra.iter().take(8).copied().collect::<Vec<_>>().join(", "), if extra.len() > 8 { format!(" (and {} more)", extra.len() - 8) } else { String::new() });
         }
         Ok(())
     }

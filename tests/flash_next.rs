@@ -916,7 +916,20 @@ fn an_extra_table_shard_or_expert_is_refused_on_resolve() {
     let shard = "model.language_model.layers.1.ple.ple_embedding.ngram_embedding.shard_128";
     ql(&mut v).insert(shard.into(), json!({"quant_algo": "NVFP4", "group_size": 16}));
     let err = format!("{:#}", resolved_with(&v, &[&format!("{shard}.weight")]).unwrap_err());
-    assert!(err.contains("layers.1.ple.ple_embedding.ngram_embedding.shard_128") && err.contains("beyond the 128"), "{err}");
+    assert!(err.contains("layers.1.ple.ple_embedding.ngram_embedding.shard_128") && err.contains("doesn't price"), "{err}");
     let err = format!("{:#}", resolved_with(&raw(), &["model.language_model.layers.7.mlp.experts.512.up_proj.weight"]).unwrap_err());
-    assert!(err.contains("layers.7.mlp.experts.512") && err.contains("beyond the 512"), "{err}");
+    assert!(err.contains("layers.7.mlp.experts.512") && err.contains("doesn't price"), "{err}");
+}
+
+// ---- SHA-767: codex-review cycle 2 follow-ups on #18 ----
+
+#[test]
+fn a_module_kept_inside_an_expert_is_refused_on_resolve() {
+    // fp:901f1e212e37: an observer inside expert 0 with an agreeing NVFP4 entry would be covered
+    // by the experts group, and its entry used, though the budget prices only the three projections.
+    let mut v = raw();
+    let obs = "model.language_model.layers.0.mlp.experts.0.observer";
+    ql(&mut v).insert(obs.into(), json!({"quant_algo": "NVFP4", "group_size": 16}));
+    let err = format!("{:#}", resolved_with(&v, &[&format!("{obs}.weight")]).unwrap_err());
+    assert!(err.contains("layers.0.mlp.experts.0.observer") && err.contains("doesn't price"), "{err}");
 }

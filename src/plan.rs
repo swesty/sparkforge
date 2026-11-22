@@ -494,8 +494,8 @@ fn hybrid_ctx_bytes(m: &ModelSpec, h: &Hybrid, ctx: u32) -> f64 {
     (gather + scan) * h.count(LayerKind::FullAttention) as f64
 }
 
-/// Resident bytes of the MTP draft layers: each a sparse-attention layer with its own experts,
-/// at its own formats, plus the input projections and three HyperConnection mixers.
+/// Resident bytes of the MTP draft layers: each a sparse-attention layer with its own experts and
+/// two mixers, at its own formats, plus the shared input projections and final mixer.
 fn mtp_weight_bytes(m: &ModelSpec, h: &Hybrid, f: &Formats) -> f64 {
     if h.mtp_layers == 0 { return 0.0; }
     let hd = m.hidden as f64;
@@ -521,7 +521,9 @@ fn mtp_weight_bytes(m: &ModelSpec, h: &Hybrid, f: &Formats) -> f64 {
     };
     let fc = 2.0 * hd * hd * 2.0;
     let mixer = |inject: bool| ((h.hc.lowrank + if inject { h.hc.streams } else { 0 }) as f64 * res + res * h.hc.lowrank as f64) * 2.0 + res * 4.0;
-    (0..h.mtp_layers).map(layer).sum::<f64>() + h.mtp_layers as f64 * (fc + 2.0 * mixer(true)) + mixer(false)
+    // The input projections (`mtp.fc_embedding`, `mtp.fc_hidden`) and the final mixer exist once;
+    // each draft layer has its own attention, experts and two mixers.
+    (0..h.mtp_layers).map(layer).sum::<f64>() + h.mtp_layers as f64 * 2.0 * mixer(true) + fc + mixer(false)
 }
 
 fn linear_op(l: &Linear, group: &'static str) -> OpClass {

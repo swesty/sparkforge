@@ -28,7 +28,10 @@ pub struct Want {
 pub struct Layout {
     /// The canonical path of the PLE module (`layers.1.ple` in the reference checkpoint).
     pub ple: String,
-    /// Rows in each PLE table shard; `None` when only names are checked (shapes then hold 0 rows).
+    /// Rows in each PLE table shard for a tensor check. `None` lists modules only, for resolving
+    /// tensor names when planning: each matrix appears as its `.weight` alone, whatever its format
+    /// (a planning override such as W4A16 then needs no loadable tensor set), with empty dtypes and
+    /// shapes.
     pub table_rows: Option<usize>,
 }
 
@@ -56,7 +59,7 @@ pub fn ple_path(table: &ModuleTable, h: &Hybrid) -> Result<String> {
 /// planner's view of the same spec, so each module's tensor set follows the format it is priced at.
 pub fn hybrid(m: &ModelSpec, f: &Formats, layout: &Layout) -> Result<Vec<Want>> {
     let Some(h) = &m.hybrid else { bail!("{} is not a hybrid model", m.arch) };
-    let mut inv = Inventory(vec![]);
+    let mut inv = Inventory(vec![], layout.table_rows.is_none());
     let (hd, res) = (m.hidden as usize, (h.hc.streams * m.hidden) as usize);
     let (g, q) = (&h.gdn, &h.qsa);
     if m.tie_embeddings {
@@ -142,7 +145,8 @@ pub fn hybrid(m: &ModelSpec, f: &Formats, layout: &Layout) -> Result<Vec<Want>> 
     Ok(inv.0)
 }
 
-struct Inventory(Vec<Want>);
+/// The tensors so far, and whether only modules are listed (see `Layout::table_rows`).
+struct Inventory(Vec<Want>, bool);
 
 /// Where an NVFP4 matrix's scalar scales live.
 #[derive(Clone, Copy)]
@@ -171,6 +175,10 @@ impl Inventory {
 
     /// The tensors of a `rows` x `k` weight matrix stored at `path` in format `f`.
     fn weights(&mut self, path: &str, rows: usize, k: u32, f: WeightFormat, scales: Scales, group: &'static str) -> Result<()> {
+        if self.1 {
+            self.tensor(format!("{path}.weight"), "", vec![], group);
+            return Ok(());
+        }
         let k = k as usize;
         match f {
             WeightFormat::Bf16 => self.tensor(format!("{path}.weight"), "BF16", vec![rows, k], group),

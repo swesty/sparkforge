@@ -13,16 +13,20 @@ struct Cli {
 #[derive(Clone, Copy, ValueEnum)]
 enum Fmt { Auto, Bf16, W4a16, Nvfp4 }
 
-/// Spec, plan and opened checkpoint for a checkpoint directory (config.json beside the weights).
-fn open_checkpoint(dir: &std::path::Path) -> Result<(plan::Plan, sparkforge::weights::Checkpoint)> {
+/// Spec (resolved onto the checkpoint's modules) and opened checkpoint for a checkpoint directory
+/// (config.json beside the weights).
+fn open_checkpoint(dir: &std::path::Path) -> Result<(ModelSpec, sparkforge::weights::Checkpoint)> {
     // One opened directory for the config, the index and every shard.
     let dir = &sparkforge::weights::resolve_checkpoint_dir(dir)?;
     let mut spec = ModelSpec::from_json(&sparkforge::weights::read_config(dir)?, None)?;
     let ck = sparkforge::weights::Checkpoint::open_dir(dir)?;
     // Formats are priced by the modules this checkpoint actually holds.
     spec.resolve_modules(ck.tensors.keys().map(String::as_str))?;
-    let p = plan::build(&spec, &GB10, &plan::PlanOpts { prefill_tokens: 2048, ctx: 4096 });
-    Ok((p, ck))
+    Ok((spec, ck))
+}
+
+fn checkpoint_plan(spec: &ModelSpec) -> plan::Plan {
+    plan::build(spec, &GB10, &plan::PlanOpts { prefill_tokens: 2048, ctx: 4096 })
 }
 
 fn gib(bytes: u64) -> f64 {
@@ -169,24 +173,25 @@ fn main() -> Result<()> {
         }
         Cmd::Weights { dir } => {
             let t0 = std::time::Instant::now();
-            let (p, ck) = open_checkpoint(&dir)?;
+            let (mut spec, ck) = open_checkpoint(&dir)?;
             let bytes: u64 = ck.shards.iter().map(|s| s.len).sum();
-            if p.model.hybrid.is_some() {
-                let c = sparkforge::weights::check_hybrid(&ck, &p.model)?;
+            if spec.hybrid.is_some() {
+                // The tensors are checked before any plan is built; the plan then prices the PLE
+                // table at the rows the check found.
+                let c = sparkforge::weights::check_hybrid(&ck, &spec)?;
+                sparkforge::weights::apply_checked_table(&mut spec, &c);
+                let p = checkpoint_plan(&spec);
                 println!("{}: {} shard(s), {} tensors, {:.2} GiB, opened and checked in {:.2} s",
                     p.model.arch, ck.shards.len(), ck.tensors.len(), gib(bytes), t0.elapsed().as_secs_f64());
                 println!("{} tensors match the plan in name, dtype and shape ({:.2} GB); {} skipped tower tensor(s) ({:.2} GB); PLE table shards of {} rows",
                     c.tensors, c.bytes as f64 / 1e9, c.skipped, c.skipped_bytes as f64 / 1e9, c.table_rows);
                 for (g, b) in &c.groups { println!("  {g:<16} {:>9.2} GB", *b as f64 / 1e9); }
-                // The resident budget with the table at its checked size.
-                let mut spec = p.model.clone();
-                sparkforge::weights::apply_checked_table(&mut spec, &c);
-                let checked = plan::build(&spec, &GB10, &plan::PlanOpts { prefill_tokens: 2048, ctx: 4096 });
                 println!("plan prices {:.2} GB of resident text weights with the PLE table at its checked {} rows",
-                    checked.budget.weight_gib * (1u64 << 30) as f64 / 1e9, spec.hybrid.as_ref().and_then(|h| h.ple.checked_rows).unwrap_or(0));
+                    p.budget.weight_gib * (1u64 << 30) as f64 / 1e9, spec.hybrid.as_ref().and_then(|h| h.ple.checked_rows).unwrap_or(0));
                 for n in p.notes.iter().filter(|n| n.contains("quantized_layers")) { println!("note: {n}"); }
                 return Ok(());
             }
+            let p = checkpoint_plan(&spec);
             let b = sparkforge::weights::bind(&ck, &p.model)?;
             println!("{}: {} shard(s), {} tensors, {:.2} GiB, opened and validated in {:.2} s",
                 p.model.arch, ck.shards.len(), ck.tensors.len(), gib(bytes), t0.elapsed().as_secs_f64());
@@ -197,8 +202,9 @@ fn main() -> Result<()> {
         #[cfg(feature = "cuda")]
         Cmd::VerifyWeights { dir, cuda_include, seed } => {
             use sparkforge::verify;
-            let (p, ck) = open_checkpoint(&dir)?;
-            let b = sparkforge::weights::bind(&ck, &p.model)?;
+            let (spec, ck) = open_checkpoint(&dir)?;
+            let b = sparkforge::weights::bind(&ck, &spec)?;
+            let p = checkpoint_plan(&spec);
             let avail0 = sparkforge::weights::mem_available().unwrap_or(0);
             // Admission (lock + memory guard) before any CUDA call; held until verification has
             // freed the weights and its reference scratch.
