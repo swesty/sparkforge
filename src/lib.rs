@@ -6,6 +6,7 @@
 
 pub mod codegen;
 pub mod config;
+pub mod inventory;
 pub mod modules;
 pub mod plan;
 pub mod target;

@@ -44,6 +44,7 @@ that would otherwise be runtime heuristics.
 | `runtime.rs` | NVRTC compile for `sm_121a`, checks cc 12.1, loads every generated entry point via `cudarc`, opts kernels above 48 KB into larger dynamic smem. | Verified on GB10 |
 | `verify.rs` | Runs every generated kernel on random bf16 inputs, diffs against an f64 CPU reference, and optionally times it with weights rotated out of L2. `verify-weights` does the same on a real checkpoint. | Verified on GB10 |
 | `weights.rs`, `device_weights.rs` | Opens HF safetensors checkpoints (single file or sharded), validates every tensor against the plan, and copies each linear into GPU memory with q\|k\|v and gate\|up packed, behind a `MemAvailable` guard. Dense BF16 Llama-family only. | Verified on GB10 |
+| `inventory.rs` | Every tensor a Qwen3.8 Flash Next checkpoint must hold, with the dtype and shape of each module's format (BF16, MXFP8, NVFP4). `weights` checks all 301,593 tensors of the reference checkpoint against it; GPU loading of this layout is the next step. | Checked on GB10 (host only) |
 
 Generated kernels (all compile for `sm_121a` with NVRTC 13 and match the CPU reference; see "Measured on GB10"):
 
@@ -113,8 +114,8 @@ no CUDA graph.
   algorithms other than NVFP4 and MIXED_PRECISION; any other `quant_method`; hybrid linear-attention models other
   than `qwen4_exp`; partial rotary on dense models. `--format` overrides the quantization check.
 - Planned, not generated: Qwen3.8 Flash Next (`qwen4_exp`). `plan` derives its op classes and byte budget; `emit`
-  lists every op as planned, and `verify`, `weights` and `verify-weights` refuse it until its kernels and the
-  mixed-format loader exist.
+  lists every op as planned, and `verify` and `verify-weights` refuse it until its kernels and the GPU side of
+  the mixed-format loader exist. `weights` checks its checkpoint tensor by tensor.
 - Flagged in `plan` notes, output wrong until implemented: Qwen3 per-head q/k RMSNorm (`q_norm`/`k_norm`),
   q/k/v projection bias (Qwen2, `attention_bias: true`).
 - Also ignored today: sliding-window attention (Mistral v0.1) and DeepSeek-style dense-first layers.

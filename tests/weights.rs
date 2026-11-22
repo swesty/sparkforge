@@ -1127,15 +1127,27 @@ fn a_plan_config_must_be_the_checkpoints_own() {
     // `plan <config> --checkpoint <dir>` reads the checkpoint's config.json through the opened
     // directory; a config from another generation is refused instead of being mixed with this
     // checkpoint's modules.
-    use sparkforge::weights::{resolve_checkpoint_dir, resolve_with_checkpoint};
+    use sparkforge::weights::{resolve_checkpoint_dir, spec_from_checkpoint};
     let d = single("cfg-match", bf16(tensors(false)));
     let ours = CFG.replace("TIE", "false");
     std::fs::write(d.join("config.json"), &ours).unwrap();
-    let mut s = spec(false);
-    resolve_with_checkpoint(&mut s, &ours, &resolve_checkpoint_dir(&d).unwrap()).unwrap();
+    let s = spec_from_checkpoint(&resolve_checkpoint_dir(&d).unwrap(), None, Some(&ours)).unwrap();
+    assert!(s.resolved.is_some() && s.vocab == 64);
     let other = CFG.replace("TIE", "false").replace("\"vocab_size\": 64", "\"vocab_size\": 65");
-    let err = format!("{:#}", resolve_with_checkpoint(&mut spec(false), &other, &resolve_checkpoint_dir(&d).unwrap()).unwrap_err());
+    let err = format!("{:#}", spec_from_checkpoint(&resolve_checkpoint_dir(&d).unwrap(), None, Some(&other)).unwrap_err());
     assert!(err.contains("differs from"), "{err}");
+}
+
+#[test]
+fn a_checkpoint_spec_comes_from_the_checkpoints_own_config() {
+    // codex-review fp:4abc58b2da3e: the spec is parsed inside the helper from the config.json read
+    // through the opened directory, so a library caller can't resolve another checkpoint's spec
+    // against these tensor names.
+    use sparkforge::weights::{resolve_checkpoint_dir, spec_from_checkpoint};
+    let d = single("cfg-own", bf16(tensors(true)));
+    std::fs::write(d.join("config.json"), CFG.replace("TIE", "true")).unwrap();
+    let s = spec_from_checkpoint(&resolve_checkpoint_dir(&d).unwrap(), None, None).unwrap();
+    assert!(s.tie_embeddings && s.resolved.is_some(), "the checkpoint's own config ties embeddings");
 }
 
 #[cfg(unix)]
@@ -1158,4 +1170,158 @@ fn a_blob_link_out_of_the_shared_store_is_refused_before_opening() {
         let err = format!("{:#}", Checkpoint::open(&snap).err().expect("escaping chain"));
         assert!(err.contains("only into the cache's shared store"), "{target}: {err}");
     }
+}
+
+// ---- SHA-767: hybrid checkpoints are checked tensor by tensor ----
+
+mod common;
+
+/// Writes a single-file hybrid checkpoint with `config` and the tensors `ts`. Tensor bytes are a
+/// pattern, except the PLE table sizes and offsets, which hold `vocab_sizes` and their running sum.
+fn write_hybrid(name: &str, config: &serde_json::Value, ts: &[common::Tensor], vocab_sizes: &[i64]) -> PathBuf {
+    let d = dir(name);
+    std::fs::write(d.join("config.json"), config.to_string()).unwrap();
+    let offsets: Vec<i64> = vocab_sizes.iter().scan(0, |acc, &s| { let o = *acc; *acc += s; Some(o) }).collect();
+    let mut header = serde_json::Map::new();
+    let mut data: Vec<u8> = vec![];
+    for (n, dtype, shape) in ts {
+        let elem = match *dtype { "I64" => 8, "F32" => 4, "F8_E4M3" | "U8" => 1, _ => 2 };
+        let bytes = shape.iter().product::<usize>() * elem;
+        let b = data.len();
+        if n.ends_with("ngram_heads_vocab_sizes") || n.ends_with("ngram_heads_offsets") {
+            let vals = if n.ends_with("sizes") { vocab_sizes } else { &offsets[..] };
+            let mut raw: Vec<u8> = vals.iter().flat_map(|x| x.to_le_bytes()).collect();
+            raw.resize(bytes, 0);
+            data.extend(raw);
+        } else {
+            data.extend((0..bytes).map(|i| (i % 251) as u8));
+        }
+        header.insert(n.clone(), serde_json::json!({"dtype": dtype, "shape": shape, "data_offsets": [b, b + bytes]}));
+    }
+    let mut h = serde_json::to_vec(&header).unwrap();
+    while h.len() % 8 != 0 {
+        h.push(b' ');
+    }
+    let mut out = (h.len() as u64).to_le_bytes().to_vec();
+    out.extend(h);
+    out.extend(data);
+    std::fs::write(d.join("model.safetensors"), out).unwrap();
+    d
+}
+
+fn tiny_spec() -> ModelSpec {
+    ModelSpec::from_json(&common::tiny_config().to_string(), None).unwrap()
+}
+
+fn tiny_tensors() -> Vec<common::Tensor> {
+    common::hybrid_tensors(&tiny_spec(), "layers.1.ple", common::TINY_TABLE_ROWS)
+}
+
+/// Opens a hybrid checkpoint the way `sparkforge weights` does and checks every tensor.
+fn check_dir(d: &std::path::Path) -> anyhow::Result<sparkforge::weights::HybridCheck> {
+    use sparkforge::weights::{check_hybrid, resolve_checkpoint_dir, spec_from_checkpoint};
+    let dir = resolve_checkpoint_dir(d)?;
+    let spec = spec_from_checkpoint(&dir, None, None)?;
+    let ck = Checkpoint::open_dir(&dir)?;
+    check_hybrid(&ck, &spec)
+}
+
+fn check_tensors(name: &str, ts: &[common::Tensor]) -> String {
+    format!("{:#}", check_dir(&write_hybrid(name, &common::tiny_config(), ts, &common::TINY_VOCAB_SIZES)).unwrap_err())
+}
+
+#[test]
+fn a_hybrid_checkpoint_passes_when_every_tensor_matches_the_plan() {
+    let ts = tiny_tensors();
+    let c = check_dir(&write_hybrid("hy-ok", &common::tiny_config(), &ts, &common::TINY_VOCAB_SIZES)).unwrap();
+    // Every tensor but the two vision-tower ones is checked; the PLE shards hold 60 rows / 4.
+    assert_eq!((c.tensors, c.skipped, c.table_rows), (ts.len() - 2, 2, 15));
+    let group = |g: &str| c.groups.iter().find(|(k, _)| *k == g).map(|(_, b)| *b).unwrap();
+    // 4 layers x 4 experts x 3 projections of 32 x 64 NVFP4: values, E4M3 scales, two F32 scalars.
+    assert_eq!(group("routed_experts"), 4 * 4 * 3 * (32 * 32 + 32 * 4 + 8));
+    // 4 shards of 15 rows x 16 FP4 values (8 bytes) + 1 scale, and the F32 global scale.
+    assert_eq!(group("ple_table"), 4 * 15 * (8 + 1) + 4);
+    assert_eq!(c.bytes, ts.iter().filter(|t| !t.0.starts_with("model.visual.")).map(|t| {
+        t.2.iter().product::<usize>() as u64 * match t.1 { "I64" => 8, "F32" => 4, "BF16" => 2, _ => 1 }
+    }).sum::<u64>());
+}
+
+#[test]
+fn a_hybrid_tensor_with_the_wrong_dtype_or_shape_is_named() {
+    let mut ts = tiny_tensors();
+    let scale = "model.language_model.layers.0.linear_attn.in_proj_qkv.weight_scale";
+    ts.iter_mut().find(|t| t.0 == scale).unwrap().1 = "F8_E4M3";
+    let expert = "model.language_model.layers.2.mlp.experts.3.down_proj.weight";
+    ts.iter_mut().find(|t| t.0 == expert).unwrap().2 = vec![64, 32];
+    let err = check_tensors("hy-dtype", &ts);
+    assert!(err.contains(&format!("{scale}: expected U8 [96, 2], found F8_E4M3 [96, 2]")), "{err}");
+    assert!(err.contains(&format!("{expert}: expected U8 [64, 16], found U8 [64, 32]")), "{err}");
+    assert!(err.contains("2 problem(s)"), "{err}");
+}
+
+#[test]
+fn a_missing_scale_and_an_unexpected_text_tensor_fail_while_vision_is_skipped() {
+    // Module-level resolution passes (the expert's module exists); the tensor check names the
+    // missing activation scale and a text tensor the plan has no use for.
+    let mut ts = tiny_tensors();
+    let gone = "model.language_model.layers.1.mlp.experts.0.gate_proj.input_scale";
+    ts.retain(|t| t.0 != gone);
+    ts.push(("model.language_model.layers.0.linear_attn.extra.weight".into(), "BF16", vec![4]));
+    ts.push(("model.visual.merger.norm.weight".into(), "BF16", vec![4]));
+    let err = check_tensors("hy-missing", &ts);
+    assert!(err.contains("missing layers.1.mlp.experts.0.gate_proj.input_scale (expected F32 [])"), "{err}");
+    assert!(err.contains("unexpected model.language_model.layers.0.linear_attn.extra.weight"), "{err}");
+    assert!(!err.contains("model.visual"), "{err}");
+}
+
+#[test]
+fn two_spellings_of_one_hybrid_tensor_are_refused() {
+    let mut ts = tiny_tensors();
+    ts.push(("model.layers.0.linear_attn.A_log".into(), "BF16", vec![2]));
+    let err = check_tensors("hy-alias", &ts);
+    assert!(err.contains("model.language_model.layers.0.linear_attn.A_log") && err.contains("model.layers.0.linear_attn.A_log")
+        && err.contains("two names"), "{err}");
+}
+
+#[test]
+fn a_format_map_that_disagrees_with_the_tensors_is_refused() {
+    // The map says GDN in_proj_z is NVFP4, but the checkpoint holds MXFP8 tensors for it: the
+    // tensor set of the priced format is what must exist.
+    let mut cfg = common::tiny_config();
+    cfg["quantization_config"]["quantized_layers"]["model.language_model.layers.0.linear_attn.in_proj_z"] =
+        serde_json::json!({"quant_algo": "NVFP4", "group_size": 16});
+    let d = write_hybrid("hy-map", &cfg, &tiny_tensors(), &common::TINY_VOCAB_SIZES);
+    let err = format!("{:#}", check_dir(&d).unwrap_err());
+    let z = "layers.0.linear_attn.in_proj_z";
+    assert!(err.contains(&format!("model.language_model.{z}.weight: expected U8 [32, 32], found F8_E4M3 [32, 64]")), "{err}");
+    assert!(err.contains(&format!("model.language_model.{z}.weight_scale: expected F8_E4M3 [32, 4], found U8 [32, 2]")), "{err}");
+    assert!(err.contains(&format!("missing {z}.weight_scale_2")) && err.contains(&format!("missing {z}.input_scale")), "{err}");
+}
+
+#[test]
+fn ple_table_rows_come_from_the_per_head_sizes() {
+    // Sizes summing to 64 make shards of 16 rows, so the 15-row shards no longer match.
+    let d = write_hybrid("hy-rows", &common::tiny_config(), &tiny_tensors(), &[11, 13, 17, 23]);
+    let err = format!("{:#}", check_dir(&d).unwrap_err());
+    assert!(err.contains("shard_0.weight: expected U8 [16, 8], found U8 [15, 8]"), "{err}");
+    // A head below ngram_vocab_size_base (10) is refused.
+    let d = write_hybrid("hy-small", &common::tiny_config(), &tiny_tensors(), &[9, 13, 17, 21]);
+    let err = format!("{:#}", check_dir(&d).unwrap_err());
+    assert!(err.contains("PLE head 0 has 9 rows, below ngram_vocab_size_base 10"), "{err}");
+    // Sizes whose padded total doesn't split into 4 shards: 61 rows pad to 64 (multiple of 4),
+    // which does split, while a multiple of 6 doesn't.
+    let mut cfg = common::tiny_config();
+    cfg["text_config"]["make_ngram_vocab_size_divisible_by"] = serde_json::json!(6);
+    let d = write_hybrid("hy-split", &cfg, &tiny_tensors(), &[11, 13, 17, 20]);
+    let err = format!("{:#}", check_dir(&d).unwrap_err());
+    assert!(err.contains("66 rows (padded to a multiple of 6), which do not split evenly into 4 shards"), "{err}");
+}
+
+#[test]
+fn a_hybrid_checkpoint_is_checked_but_not_loaded_onto_the_gpu() {
+    let d = write_hybrid("hy-bind", &common::tiny_config(), &tiny_tensors(), &common::TINY_VOCAB_SIZES);
+    let dir = sparkforge::weights::resolve_checkpoint_dir(&d).unwrap();
+    let spec = sparkforge::weights::spec_from_checkpoint(&dir, None, None).unwrap();
+    let err = format!("{:#}", bind(&Checkpoint::open_dir(&dir).unwrap(), &spec).unwrap_err());
+    assert!(err.contains("checked tensor by tensor") && err.contains("do not load into GPU memory yet"), "{err}");
 }

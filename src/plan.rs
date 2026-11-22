@@ -168,10 +168,18 @@ pub struct Formats<'a> {
 impl<'a> Formats<'a> {
     pub fn new(m: &'a ModelSpec) -> Self { Formats { m, used: RefCell::new(BTreeSet::new()) } }
 
-    /// The format of the checkpoint modules at `path`, marking the entries that cover them as used.
+    /// The format of the checkpoint module at exactly `path` (a projection), marking the entries
+    /// that cover it as used.
     fn at(&self, r: &crate::modules::ResolvedFormats, path: &str, default: WeightFormat) -> Option<WeightFormat> {
         self.used.borrow_mut().extend(r.entries_at(path).into_iter().map(str::to_owned));
         r.format_at(path, default)
+    }
+
+    /// The format of the group at `path` (routed experts, a sharded table), marking every entry
+    /// that covers a module of the group as used.
+    fn group_at(&self, r: &crate::modules::ResolvedFormats, path: &str, default: WeightFormat) -> Option<WeightFormat> {
+        self.used.borrow_mut().extend(r.group_entries(path).into_iter().map(str::to_owned));
+        r.group_format(path, default)
     }
 
     /// Every matching entry counts as used (a map can list one module under two paths). Matches
@@ -188,9 +196,19 @@ impl<'a> Formats<'a> {
     /// Format of `rel` (for example `linear_attn.in_proj_qkv`) in main-model layer `layer`. Only
     /// language-model paths match, so another tower's `layers.N` (vision, MTP) never does.
     pub fn layer(&self, layer: u32, rel: &str) -> WeightFormat {
+        self.layer_lookup(layer, rel, false)
+    }
+
+    /// Format of the group `rel` (`mlp.experts`) in main-model layer `layer`.
+    pub fn layer_group(&self, layer: u32, rel: &str) -> WeightFormat {
+        self.layer_lookup(layer, rel, true)
+    }
+
+    fn layer_lookup(&self, layer: u32, rel: &str, group: bool) -> WeightFormat {
         let tail = format!("layers.{layer}.{rel}");
         if let Some(r) = &self.m.resolved {
-            return self.at(r, &tail, self.m.weights).unwrap_or(self.m.weights);
+            let f = if group { self.group_at(r, &tail, self.m.weights) } else { self.at(r, &tail, self.m.weights) };
+            return f.unwrap_or(self.m.weights);
         }
         self.find(|k| TEXT_PREFIXES.iter().any(|p| k.strip_prefix(p) == Some(tail.as_str()))).unwrap_or(self.m.weights)
     }
@@ -198,9 +216,18 @@ impl<'a> Formats<'a> {
     /// The formats of a module class across `layers`, with how many layers use each, most common
     /// first. Each format becomes its own op class, so the budget counts every instance at its own size.
     pub fn class(&self, layers: &[u32], rel: &str) -> Vec<(WeightFormat, u32)> {
+        self.class_lookup(layers, rel, false)
+    }
+
+    /// `class` for a group (`mlp.experts`).
+    pub fn class_group(&self, layers: &[u32], rel: &str) -> Vec<(WeightFormat, u32)> {
+        self.class_lookup(layers, rel, true)
+    }
+
+    fn class_lookup(&self, layers: &[u32], rel: &str, group: bool) -> Vec<(WeightFormat, u32)> {
         let mut groups: Vec<(WeightFormat, u32)> = vec![];
         for &l in layers {
-            let f = self.layer(l, rel);
+            let f = self.layer_lookup(l, rel, group);
             match groups.iter_mut().find(|(g, _)| *g == f) {
                 Some(g) => g.1 += 1,
                 None => groups.push((f, 1)),
@@ -214,27 +241,52 @@ impl<'a> Formats<'a> {
     /// holds; without one, only indices below the configured MTP layer count, so a stale entry such
     /// as `mtp.layers.999.<rel>` never prices the real draft layer.
     pub fn mtp(&self, rel: &str) -> WeightFormat {
+        self.mtp_lookup(rel, false)
+    }
+
+    /// Format of the group `rel` (`mlp.experts`) in the MTP draft layers.
+    pub fn mtp_group(&self, rel: &str) -> WeightFormat {
+        self.mtp_lookup(rel, true)
+    }
+
+    fn mtp_lookup(&self, rel: &str, group: bool) -> WeightFormat {
         let layers = self.m.hybrid.as_ref().map_or(0, |h| h.mtp_layers);
         if let Some(r) = &self.m.resolved {
             // `resolve_modules` checked that the checkpoint's MTP indices are exactly 0..layers.
             return (0..layers)
-                .filter_map(|n| self.at(r, &format!("mtp.layers.{n}.{rel}"), self.m.weights))
+                .filter_map(|n| {
+                    let path = format!("mtp.layers.{n}.{rel}");
+                    if group { self.group_at(r, &path, self.m.weights) } else { self.at(r, &path, self.m.weights) }
+                })
                 .reduce(|a, b| if b.bytes_per_elem() > a.bytes_per_elem() { b } else { a })
                 .unwrap_or(self.m.weights);
         }
-        // Exactly `mtp.layers.<n>.<rel>`, so `mtp.layers.0.aux.<rel>` is not the module.
+        // Exactly `mtp.layers.<n>.<rel>` with `n` a configured layer spelled as a canonical decimal,
+        // so neither `mtp.layers.0.aux.<rel>` nor `mtp.layers.00.<rel>` is the module (a checkpoint
+        // lookup leaves both unused too).
         self.find(|k| {
             k.strip_prefix("mtp.layers.")
                 .and_then(|r| r.split_once('.'))
-                .is_some_and(|(n, rest)| n.parse::<u32>().is_ok_and(|n| n < layers) && n.bytes().all(|b| b.is_ascii_digit()) && rest == rel)
+                .is_some_and(|(n, rest)| n.parse::<u32>().is_ok_and(|i| i < layers && i.to_string() == n) && rest == rel)
         }).unwrap_or(self.m.weights)
     }
 
+    /// Format of a PLE projection `rel` (`key_proj`, `value_proj`). See `ple_lookup`.
+    pub fn ple(&self, rel: &str) -> WeightFormat {
+        self.ple_lookup(rel, false)
+    }
+
+    /// Format of the PLE n-gram table, a group of shards; it is also accepted under its bare name.
+    pub fn ple_table(&self) -> WeightFormat {
+        self.ple_lookup(PLE_TABLE, true)
+    }
+
     /// Format of a PLE module `rel` at its language-model paths, under a text prefix: `ple.<rel>`,
-    /// `<rel>` itself when `bare` (the distinctive table name), or `layers.<n>.ple.<rel>` where `n`
-    /// is a configured PLE layer `p` or `p - 1`. The checkpoint files the PLE applied before layer 2
+    /// `<rel>` itself for the table (its distinctive name), or `layers.<n>.ple.<rel>` where `n` is
+    /// a configured PLE layer `p` or `p - 1`. The checkpoint files the PLE applied before layer 2
     /// under `layers.1.ple`, so both are accepted; any other layer is a stale entry, left unused.
-    pub fn ple(&self, rel: &str, bare: bool) -> WeightFormat {
+    /// `resolve_modules` refuses a checkpoint with the PLE at more than one of these paths.
+    fn ple_lookup(&self, rel: &str, bare: bool) -> WeightFormat {
         let want = format!("ple.{rel}");
         let layers: Vec<String> = self.m.hybrid.as_ref().map_or(vec![], |h| {
             h.ple.layer_ids.iter().flat_map(|&p| [Some(p), p.checked_sub(1)]).flatten()
@@ -245,7 +297,7 @@ impl<'a> Formats<'a> {
             let mut paths = layers.clone();
             paths.push(want.clone());
             if bare { paths.push(rel.to_owned()); }
-            return paths.iter().filter_map(|p| self.at(r, p, self.m.weights))
+            return paths.iter().filter_map(|p| if bare { self.group_at(r, p, self.m.weights) } else { self.at(r, p, self.m.weights) })
                 .reduce(|a, b| if b.bytes_per_elem() > a.bytes_per_elem() { b } else { a })
                 .unwrap_or(self.m.weights);
         }
@@ -258,14 +310,18 @@ impl<'a> Formats<'a> {
     /// never by suffix inside a layer. A tied head is the embedding matrix, so it always has the
     /// embedding's format; a conflicting `lm_head` entry is rejected when the spec is parsed or
     /// resolved (codex-review of swesty/sparkforge#10 and #17).
+    ///
+    /// Unlisted, the hybrid head takes the general weight format, while a dense head stays BF16:
+    /// the dense planner's `--format` describes the layers' linears only.
     pub fn head(&self) -> WeightFormat {
         if self.m.tie_embeddings {
             return self.embed();
         }
+        let default = if self.m.hybrid.is_some() { self.m.weights } else { WeightFormat::Bf16 };
         if let Some(r) = &self.m.resolved {
-            return self.at(r, "lm_head", self.m.weights).unwrap_or(self.m.weights);
+            return self.at(r, "lm_head", default).unwrap_or(default);
         }
-        self.find(|k| TEXT_PREFIXES.iter().any(|p| k.strip_prefix(p) == Some("lm_head"))).unwrap_or(self.m.weights)
+        self.find(|k| TEXT_PREFIXES.iter().any(|p| k.strip_prefix(p) == Some("lm_head"))).unwrap_or(default)
     }
 
     /// Format of the input embedding (`embed_tokens` under a text prefix). BF16 unless an entry
@@ -286,7 +342,10 @@ impl<'a> Formats<'a> {
     }
 }
 
-fn layers_of(h: &Hybrid, k: LayerKind) -> Vec<u32> {
+/// The PLE n-gram table's path under a PLE module.
+pub const PLE_TABLE: &str = "ple_embedding.ngram_embedding";
+
+pub fn layers_of(h: &Hybrid, k: LayerKind) -> Vec<u32> {
     h.schedule.iter().enumerate().filter(|(_, &x)| x == k).map(|(i, _)| i as u32).collect()
 }
 
@@ -351,7 +410,7 @@ fn hybrid_linears_noted(m: &ModelSpec, h: &Hybrid, f: &Formats, notes: &mut Vec<
     v.extend(class("qsa_o_proj", m.hidden, m.q_dim(), &qsa, "self_attn.o_proj", notes));
     if let Some(e) = &m.moe {
         v.extend(class("router", e.num_experts, m.hidden, &all, "mlp.gate", notes));
-        let ef = f.class(&all, "mlp.experts");
+        let ef = f.class_group(&all, "mlp.experts");
         v.extend(class_linears("expert_gate_up", 2 * e.expert_intermediate, m.hidden, e.num_experts, e.experts_per_tok, &ef, notes));
         v.extend(class_linears("expert_down", m.hidden, e.expert_intermediate, e.num_experts, e.experts_per_tok, &ef, notes));
         if e.shared_intermediate > 0 {
@@ -371,8 +430,8 @@ fn hybrid_linears_noted(m: &ModelSpec, h: &Hybrid, f: &Formats, notes: &mut Vec<
         }
     }
     // PLE projections run once per token (at the PLE layer). key_proj widens to the HC residual.
-    v.push(lin("ple_key_proj", res, h.ple.embed_dim, f.ple("key_proj", false), 1));
-    v.push(lin("ple_value_proj", m.hidden, h.ple.embed_dim, f.ple("value_proj", false), 1));
+    v.push(lin("ple_key_proj", res, h.ple.embed_dim, f.ple("key_proj"), 1));
+    v.push(lin("ple_value_proj", m.hidden, h.ple.embed_dim, f.ple("value_proj"), 1));
     v
 }
 
@@ -382,7 +441,7 @@ fn hybrid_other_ops(m: &ModelSpec, h: &Hybrid, f: &Formats) -> Vec<OpClass> {
     let res = (h.hc.streams * m.hidden) as f64;
     let ngdn = h.count(LayerKind::LinearAttention);
     let nqsa = h.count(LayerKind::FullAttention);
-    let table = f.ple("ple_embedding.ngram_embedding", true);
+    let table = f.ple_table();
     let op = |name: &str, kind, group, shape: String, format, per_token: u32, bytes_each: f64| OpClass {
         name: name.into(), kind, group, shape, format, per_token, bytes_per_token: bytes_each * per_token as f64,
     };
@@ -456,7 +515,7 @@ fn mtp_weight_bytes(m: &ModelSpec, h: &Hybrid, f: &Formats) -> f64 {
     let b = |rel: &str| f.mtp(rel).bytes_per_elem();
     let attn = (m.q_dim() * 2) as f64 * hd * b("self_attn.q_proj") + m.kv_dim() as f64 * hd * (b("self_attn.k_proj") + b("self_attn.v_proj"))
         + h.qsa.index_qk_dim() as f64 * hd * b("self_attn.indexer.index_qk_proj") + hd * m.q_dim() as f64 * b("self_attn.o_proj");
-    let experts = e.map_or(0.0, |e| e.num_experts as f64 * 3.0 * e.expert_intermediate as f64 * hd * b("mlp.experts"));
+    let experts = e.map_or(0.0, |e| e.num_experts as f64 * 3.0 * e.expert_intermediate as f64 * hd * f.mtp_group("mlp.experts").bytes_per_elem());
     // Shared-expert formats are looked up only when the shared expert exists, so a stale entry for
     // an absent projection stays reported as unused. The router is counted either way.
     let shared = e.map_or(0.0, |e| {
@@ -598,10 +657,10 @@ pub fn build(m: &ModelSpec, t: &Target, o: &PlanOpts) -> Plan {
         Some(h) => hybrid_linears_noted(m, h, &formats, &mut notes),
         None => linears(m),
     };
-    let lm = Linear { name: "lm_head".into(), n: m.vocab, k: m.hidden, copies: 1, active: 1,
-        format: if m.hybrid.is_some() { formats.head() } else { WeightFormat::Bf16 }, per_token: 1 };
-    // The embedding at its own format (BF16 unless a mixed-precision map quantizes it).
-    let emb = m.vocab as f64 * m.hidden as f64 * if m.hybrid.is_some() { formats.embed().bytes_per_elem() } else { 2.0 };
+    // The head and the embedding at their own formats (BF16 unless a format map quantizes them; a
+    // tied head is the embedding, codex-review of #17).
+    let lm = Linear { name: "lm_head".into(), n: m.vocab, k: m.hidden, copies: 1, active: 1, format: formats.head(), per_token: 1 };
+    let emb = m.vocab as f64 * m.hidden as f64 * formats.embed().bytes_per_elem();
     let usable = t.usable_mem_gib * (1u64 << 30) as f64;
     let mut ops: Vec<OpClass> = vec![];
     if m.hybrid.is_some() {
@@ -621,7 +680,7 @@ pub fn build(m: &ModelSpec, t: &Target, o: &PlanOpts) -> Plan {
         Some(h) => {
             ops.extend(hybrid_other_ops(m, h, &formats));
             let linear_total: f64 = ls.iter().chain(std::iter::once(&lm)).map(|l| l.bytes_one() * l.copies as f64 * l.per_token as f64).sum();
-            let table = formats.ple("ple_embedding.ngram_embedding", true);
+            let table = formats.ple_table();
             let ple_table = h.ple.table_rows() as f64 * h.ple.head_dim() as f64 * table.bytes_per_elem();
             let small: f64 = hybrid_param_bytes(m, h).iter().map(|(_, b)| b).sum();
             // A tied lm_head is the embedding matrix itself; count it once.

@@ -89,6 +89,8 @@ struct RawHybrid {
     ngram_size: Option<u32>,
     heads_per_ngram: Option<u32>,
     ngram_vocab_size_base: Option<u64>,
+    split_ngram_parts: Option<u32>,
+    make_ngram_vocab_size_divisible_by: Option<u32>,
     // Multi-token prediction draft layers (also given as `mtp.num_hidden_layers`)
     mtp_num_hidden_layers: Option<u32>,
     mtp: Option<RawMtp>,
@@ -232,6 +234,13 @@ pub struct Ple {
     pub ngram_size: u32,
     pub heads_per_ngram: u32,
     pub vocab_base: u64,
+    /// Shards the table is stored in (`split_ngram_parts`); the loader needs it, the planner doesn't.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub split_parts: Option<u32>,
+    /// The per-head table sizes sum to a multiple of this before splitting
+    /// (`make_ngram_vocab_size_divisible_by`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vocab_multiple: Option<u32>,
 }
 
 impl Ple {
@@ -461,6 +470,8 @@ fn parse_hybrid(r: &RawConfig, body: &serde_json::Value, head_dim: u32, partial_
         ngram_size: dim(h.ngram_size, "ngram_size")?,
         heads_per_ngram: dim(h.heads_per_ngram, "heads_per_ngram")?,
         vocab_base: need(h.ngram_vocab_size_base, "ngram_vocab_size_base")?,
+        split_parts: h.split_ngram_parts.map(|x| dim(Some(x), "split_ngram_parts")).transpose()?,
+        vocab_multiple: h.make_ngram_vocab_size_divisible_by.map(|x| dim(Some(x), "make_ngram_vocab_size_divisible_by")).transpose()?,
     };
     ensure!(ple.ngram_size >= 2 && ple.embed_dim % ple.heads() == 0,
         "PLE embed_dim {} is not divisible into {} heads (orders 2..={})", ple.embed_dim, ple.heads(), ple.ngram_size);
@@ -638,12 +649,14 @@ impl ModelSpec {
     /// entries that cover none are reported as unused instead of matching by pattern.
     ///
     /// For a hybrid model it also checks what the planner relies on: the checkpoint's MTP layer
-    /// indices are exactly the configured ones, every group the planner prices as one format (a
-    /// layer's routed experts, the PLE table, the MTP experts) has one format, and a tied head
-    /// isn't given a format other than the embedding's (codex-review of #17).
+    /// indices are exactly the configured ones, the PLE lives at one path, every group the planner
+    /// prices as one format (a layer's routed experts, the PLE table, the MTP experts) has one
+    /// format, every module the plan prices exists at its exact path, and a tied head isn't given a
+    /// format other than the embedding's (codex-review of #17).
     pub fn resolve_modules<'a>(&mut self, names: impl IntoIterator<Item = &'a str>) -> Result<()> {
         let table = crate::modules::ModuleTable::from_tensor_names(names);
         let r = crate::modules::resolve(&self.formats, table)?;
+        let mut ple = None;
         if let Some(h) = &self.hybrid {
             // Canonical decimal indices only: the planner looks layers up as `mtp.layers.<n>`, so a
             // `mtp.layers.00` beside `mtp.layers.0` would otherwise pass as index 0 and be ignored.
@@ -653,17 +666,17 @@ impl ModelSpec {
                 .collect::<Result<_>>()?;
             let want: BTreeSet<u32> = (0..h.mtp_layers).collect();
             ensure!(live == want, "the checkpoint holds MTP layer(s) {live:?}, but the config has {} MTP layer(s) ({want:?}); the draft layers can't be priced unambiguously", h.mtp_layers);
+            // One PLE location, so one table is priced (codex-review of #17).
+            let p = crate::inventory::ple_path(&r.table, h)?;
             let mut groups: Vec<String> = (0..h.schedule.len()).map(|i| format!("layers.{i}.mlp.experts")).collect();
             groups.extend((0..h.mtp_layers).map(|i| format!("mtp.layers.{i}.mlp.experts")));
-            // Every path the PLE table lookup accepts.
-            groups.extend(h.ple.layer_ids.iter().flat_map(|&p| [Some(p), p.checked_sub(1)]).flatten()
-                .map(|n| format!("layers.{n}.ple.ple_embedding.ngram_embedding")));
-            groups.extend(["ple.ple_embedding.ngram_embedding".to_string(), "ple_embedding.ngram_embedding".to_string()]);
+            groups.push(format!("{p}.{}", crate::plan::PLE_TABLE));
             for g in &groups {
-                let fs = r.formats_under(g, self.weights);
+                let fs = r.group_formats(g, self.weights);
                 ensure!(fs.len() <= 1, "the planner prices {g} as one format, but the checkpoint's modules there have {}; mixed formats inside one group are not supported",
                     fs.iter().map(|(f, n)| format!("{f:?} ({n} modules)")).collect::<Vec<_>>().join(" and "));
             }
+            ple = Some(p);
         }
         if self.tie_embeddings {
             let (head, embed) = (r.format_at("lm_head", self.weights), r.format_at("embed_tokens", WeightFormat::Bf16));
@@ -672,6 +685,26 @@ impl ModelSpec {
             }
         }
         self.resolved = Some(r);
+        // Every module the plan prices must exist at its exact path: a projection missing from the
+        // checkpoint is an error, never priced from whatever is stored under it (codex-review of
+        // #17). Each module's tensors, dtypes and shapes are checked when the checkpoint is loaded.
+        if let Some(ple) = ple {
+            if let Err(e) = self.check_modules(ple) {
+                self.resolved = None;
+                return Err(e);
+            }
+        }
+        Ok(())
+    }
+
+    fn check_modules(&self, ple: String) -> Result<()> {
+        let Some(r) = &self.resolved else { return Ok(()) };
+        let f = crate::plan::Formats::new(self);
+        let wants = crate::inventory::hybrid(self, &f, &crate::inventory::Layout { ple, table_rows: None })?;
+        let modules: BTreeSet<&str> = wants.iter().filter_map(|w| w.name.rsplit_once('.').map(|(m, _)| m)).collect();
+        let missing: Vec<&str> = modules.into_iter().filter(|m| !r.table.contains(m)).collect();
+        ensure!(missing.is_empty(), "the checkpoint has no tensors for {} module(s) the plan needs: {}{}", missing.len(),
+            missing.iter().take(8).copied().collect::<Vec<_>>().join(", "), if missing.len() > 8 { format!(" (and {} more)", missing.len() - 8) } else { String::new() });
         Ok(())
     }
 

@@ -8,6 +8,8 @@ use serde_json::{json, Value};
 use sparkforge::config::{LayerKind, ModelSpec, WeightFormat};
 use sparkforge::{codegen, plan, target::GB10};
 
+mod common;
+
 const CFG: &str = "configs/qwen3.8-flash-next-nvfp4.json";
 
 fn raw() -> Value {
@@ -560,40 +562,13 @@ fn an_override_also_skips_a_nested_quantization_conflict() {
 /// Tensor names laid out as in the Flash Next checkpoint (one `.weight` per module is enough for
 /// identities; the real checkpoint adds scales beside them): every text layer by kind, all routed
 /// experts, the PLE at `layers.1`, one MTP layer at index 0, and `lm_head` unless tied.
+/// The tensor names of a checkpoint for `s`, laid out like the reference (see `common`).
 fn checkpoint_names(s: &ModelSpec) -> Vec<String> {
-    let h = s.hybrid.as_ref().unwrap();
-    let experts = s.moe.as_ref().unwrap().num_experts;
-    let t = |rest: &str| format!("model.language_model.{rest}.weight");
-    let mut v = vec![t("embed_tokens")];
-    if !s.tie_embeddings {
-        v.push("lm_head.weight".into());
-    }
-    let block = |v: &mut Vec<String>, pre: &str, kind: LayerKind| {
-        let attn: &[&str] = match kind {
-            LayerKind::LinearAttention => &["linear_attn.in_proj_qkv", "linear_attn.in_proj_z", "linear_attn.in_proj_a", "linear_attn.in_proj_b", "linear_attn.out_proj"],
-            LayerKind::FullAttention => &["self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj", "self_attn.o_proj", "self_attn.indexer.index_qk_proj"],
-        };
-        for m in attn.iter().chain(&["mlp.gate", "mlp.shared_expert.gate_proj", "mlp.shared_expert.up_proj", "mlp.shared_expert.down_proj"]) {
-            v.push(format!("{pre}.{m}.weight"));
-        }
-        for e in 0..experts {
-            for p in ["gate_proj", "up_proj", "down_proj"] {
-                v.push(format!("{pre}.mlp.experts.{e}.{p}.weight"));
-            }
-        }
-    };
-    for (i, &k) in h.schedule.iter().enumerate() {
-        block(&mut v, &format!("model.language_model.layers.{i}"), k);
-    }
-    for &p in &h.ple.layer_ids {
-        for m in ["ple.key_proj", "ple.value_proj", "ple.ple_embedding.ngram_embedding.shard_0"] {
-            v.push(t(&format!("layers.{}.{m}", p - 1)));
-        }
-    }
-    for i in 0..h.mtp_layers {
-        block(&mut v, &format!("mtp.layers.{i}"), LayerKind::FullAttention);
-    }
-    v
+    names_with_ple(s, &format!("layers.{}.ple", s.hybrid.as_ref().unwrap().ple.layer_ids[0] - 1))
+}
+
+fn names_with_ple(s: &ModelSpec, ple: &str) -> Vec<String> {
+    common::hybrid_tensors(s, ple, 0).into_iter().map(|t| t.0).collect()
 }
 
 fn resolved(v: &Value) -> anyhow::Result<ModelSpec> {
@@ -762,14 +737,15 @@ fn the_embedding_stays_bf16_whatever_the_general_weight_format() {
 
 #[test]
 fn a_model_level_ple_table_split_across_formats_is_rejected() {
+    // The PLE at model level (`ple.`) instead of under layer 1: one shard MXFP8 and the rest at the
+    // default is a table the planner can't price as one format.
     let mut v = raw();
     ql(&mut v).remove("model.language_model.layers.1.ple.ple_embedding.ngram_embedding").unwrap();
-    ql(&mut v).insert("model.language_model.ple_embedding.ngram_embedding.shard_0".into(), json!({"quant_algo": "MXFP8", "group_size": 32}));
-    let err = format!("{:#}", resolved_with(&v, &[
-        "model.language_model.ple_embedding.ngram_embedding.shard_0.weight",
-        "model.language_model.ple_embedding.ngram_embedding.shard_1.weight",
-    ]).unwrap_err());
-    assert!(err.contains("ple_embedding.ngram_embedding") && err.contains("mixed formats"), "{err}");
+    ql(&mut v).insert("model.language_model.ple.ple_embedding.ngram_embedding.shard_0".into(), json!({"quant_algo": "MXFP8", "group_size": 32}));
+    let mut s = spec_of(&v).unwrap();
+    let names = names_with_ple(&s, "ple");
+    let err = format!("{:#}", s.resolve_modules(names.iter().map(String::as_str)).unwrap_err());
+    assert!(err.contains("ple.ple_embedding.ngram_embedding") && err.contains("mixed formats"), "{err}");
 }
 
 #[test]
@@ -835,5 +811,96 @@ fn agreeing_overlapping_entries_are_both_used() {
     let unused = unused_entries(&p);
     for e in ["model.language_model.layers.1.ple.ple_embedding", "model.language_model.layers.1.ple.ple_embedding.ngram_embedding"] {
         assert!(!unused.contains(&e.to_string()), "{e}: {unused:?}");
+    }
+}
+
+// ---- SHA-767: codex-review cycle 3 follow-ups on #17 ----
+
+#[test]
+fn a_checkpoint_with_the_ple_table_at_two_paths_is_refused() {
+    // codex-review fp:0b213af19511: the reference NVFP4 table under `layers.1.ple` plus an MXFP8
+    // table at the model-level `ple_embedding.ngram_embedding`, each of one format. The planner
+    // prices one table, so the checkpoint is refused naming both locations.
+    let mut v = raw();
+    ql(&mut v).insert("model.language_model.ple_embedding.ngram_embedding".into(), json!({"quant_algo": "MXFP8", "group_size": 32}));
+    let err = format!("{:#}", resolved_with(&v, &[
+        "model.language_model.ple_embedding.ngram_embedding.shard_0.weight",
+        "model.language_model.ple_embedding.ngram_embedding.shard_0.weight_scale",
+    ]).unwrap_err());
+    assert!(err.contains("layers.1.ple and ple_embedding.ngram_embedding") && err.contains("one PLE"), "{err}");
+    // A PLE under layer 2 beside the one under layer 1 (both accepted paths) is refused the same way.
+    let err = format!("{:#}", resolved_with(&raw(), &["model.language_model.layers.2.ple.key_proj.weight"]).unwrap_err());
+    assert!(err.contains("layers.2.ple and layers.1.ple") || err.contains("layers.1.ple and layers.2.ple"), "{err}");
+}
+
+#[test]
+fn shard_entries_beside_a_table_scalar_are_used() {
+    // codex-review fp:884bf7a92e48: the reference table keeps `weight_scale_2` at the table's own
+    // path, so a module exists there. An agreeing entry for one shard still covers part of the
+    // priced table and must not be reported as unused.
+    let mut v = raw();
+    ql(&mut v).insert("model.language_model.layers.1.ple.ple_embedding.ngram_embedding.shard_0".into(), json!({"quant_algo": "NVFP4", "group_size": 16}));
+    let p = plan_of(&resolved(&v).unwrap());
+    let unused = unused_entries(&p);
+    for e in ["model.language_model.layers.1.ple.ple_embedding.ngram_embedding", "model.language_model.layers.1.ple.ple_embedding.ngram_embedding.shard_0"] {
+        assert!(!unused.contains(&e.to_string()), "{e}: {unused:?}");
+    }
+    // With per-shard entries only (no table entry), the scalar's module is not a member with a
+    // format of its own, so the table is one format and priced NVFP4.
+    let mut v = raw();
+    ql(&mut v).remove("model.language_model.layers.1.ple.ple_embedding.ngram_embedding").unwrap();
+    for j in 0..128 {
+        ql(&mut v).insert(format!("model.language_model.layers.1.ple.ple_embedding.ngram_embedding.shard_{j}"), json!({"quant_algo": "NVFP4", "group_size": 16}));
+    }
+    let p = plan_of(&resolved(&v).unwrap());
+    assert_eq!(p.ops.iter().find(|o| o.name == "ple_ngram_gather").unwrap().format, Some(WeightFormat::Nvfp4));
+    assert_eq!(unused_entries(&p), vec!["mtp.layers.48.mlp.experts".to_string()]);
+}
+
+#[test]
+fn a_noncanonical_mtp_index_is_unused_from_the_config_too() {
+    // codex-review fp:ab21934c075a: from the config alone `mtp.layers.00` parsed as layer 0. It is
+    // now reported unused with the budget unchanged, as with a checkpoint; `mtp.layers.0` applies.
+    let base = plan_of(&spec_of(&raw()).unwrap());
+    let mut v = raw();
+    ql(&mut v).insert("mtp.layers.00.self_attn.v_proj".into(), json!({"quant_algo": "MXFP8", "group_size": 32}));
+    let p = plan_of(&spec_of(&v).unwrap());
+    assert_eq!(p.budget.weight_gib, base.budget.weight_gib);
+    assert!(unused_entries(&p).contains(&"mtp.layers.00.self_attn.v_proj".to_string()), "{:#?}", p.notes);
+    let mut v = raw();
+    ql(&mut v).insert("mtp.layers.0.self_attn.v_proj".into(), json!({"quant_algo": "MXFP8", "group_size": 32}));
+    let p = plan_of(&spec_of(&v).unwrap());
+    assert!(p.budget.weight_gib < base.budget.weight_gib);
+    assert!(!unused_entries(&p).contains(&"mtp.layers.0.self_attn.v_proj".to_string()));
+}
+
+#[test]
+fn a_projection_present_only_as_an_observer_subtree_is_an_error() {
+    // codex-review fp:93d321fef646: layer 3's q_proj tensors are missing, and only an observer's
+    // tensor under it is declared MXFP8. A projection is looked up at its exact path, so the
+    // observer never prices it, and resolution fails naming the missing module.
+    let mut v = raw();
+    ql(&mut v).remove("model.language_model.layers.3.self_attn.q_proj").unwrap();
+    ql(&mut v).insert("model.language_model.layers.3.self_attn.q_proj.observer".into(), json!({"quant_algo": "MXFP8", "group_size": 32}));
+    let mut s = spec_of(&v).unwrap();
+    let mut names: Vec<String> = checkpoint_names(&s).into_iter().filter(|n| !n.starts_with("model.language_model.layers.3.self_attn.q_proj.")).collect();
+    names.push("model.language_model.layers.3.self_attn.q_proj.observer.weight".into());
+    let err = format!("{:#}", s.resolve_modules(names.iter().map(String::as_str)).unwrap_err());
+    assert!(err.contains("no tensors for 1 module") && err.contains("layers.3.self_attn.q_proj"), "{err}");
+    assert!(s.resolved.is_none(), "a failed resolution leaves the spec unresolved");
+}
+
+#[test]
+fn the_checkpoint_layout_is_checked_module_by_module_on_resolve() {
+    // Any module the plan prices, missing from the checkpoint, fails resolution by name: a
+    // GDN norm, an expert, a PLE table shard, an MTP mixer.
+    let s = spec_of(&raw()).unwrap();
+    for gone in ["model.language_model.layers.0.linear_attn.norm.weight", "model.language_model.layers.5.mlp.experts.511.down_proj.",
+        "model.language_model.layers.1.ple.ple_embedding.ngram_embedding.shard_127.", "mtp.hyper_connection_mixer.hc_norm.weight"] {
+        let names: Vec<String> = checkpoint_names(&s).into_iter().filter(|n| !n.starts_with(gone)).collect();
+        let mut s = s.clone();
+        let err = format!("{:#}", s.resolve_modules(names.iter().map(String::as_str)).unwrap_err());
+        let module = gone.trim_end_matches('.').trim_end_matches(".weight");
+        assert!(err.contains(sparkforge::modules::canonical(module)), "{gone}: {err}");
     }
 }
