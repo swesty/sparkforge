@@ -1077,3 +1077,85 @@ fn a_load_waiting_on_a_replaced_lock_moves_to_the_new_file() {
     drop(c);
     b.join().unwrap().unwrap();
 }
+
+// ---- SHA-785: a Hugging Face cache whose blobs link into a shared store ----
+
+#[cfg(unix)]
+#[test]
+fn a_blob_that_links_into_a_shared_store_is_followed_and_verified() {
+    // spark-5's cache: `<repo>/snapshots/<rev>/f -> ../../blobs/<sha256>`, and that blob is itself
+    // a link to `hub/blobs/<xx>/<other id>`. The chain is followed because the bytes are checked
+    // against the sha256 name; other bytes at the end of the chain are still refused.
+    let hub = std::fs::canonicalize(dir("hf-dedup")).unwrap();
+    let store = hub.join("blobs/ab");
+    std::fs::create_dir_all(&store).unwrap();
+    write_shard(&store.join("chunk-id-1"), &bf16(tensors(false)), 0);
+    let repo = hub.join("models--org--name");
+    let (blobs, snap) = (repo.join("blobs"), repo.join("snapshots/rev"));
+    std::fs::create_dir_all(&blobs).unwrap();
+    std::fs::create_dir_all(&snap).unwrap();
+    std::os::unix::fs::symlink("../../blobs/ab/chunk-id-1", blobs.join(hf_blob())).unwrap();
+    std::os::unix::fs::symlink(format!("../../blobs/{}", hf_blob()), snap.join("model.safetensors")).unwrap();
+    bind(&Checkpoint::open(&snap).unwrap(), &spec(false)).unwrap();
+    // The store's bytes change under the same chain: the name no longer matches, so it is refused.
+    write_shard(&store.join("chunk-id-1"), &bf16(tensors(true)), 0);
+    let err = format!("{:#}", Checkpoint::open(&snap).err().expect("mismatch"));
+    assert!(err.contains("hash to"), "{err}");
+}
+
+// ---- SHA-785: codex-review cycle 1 follow-ups ----
+
+#[test]
+fn planning_from_an_index_applies_the_loaders_shard_name_rule() {
+    use sparkforge::weights::{resolve_checkpoint_dir, tensor_names};
+    let d = dir("names-escape");
+    for bad in [serde_json::json!("../outside.safetensors"), serde_json::json!("/abs/model.safetensors")] {
+        let mut map = serde_json::Map::new();
+        map.insert("model.embed_tokens.weight".into(), bad.clone());
+        write_index(&d, map);
+        let err = format!("{:#}", tensor_names(&resolve_checkpoint_dir(&d).unwrap()).unwrap_err());
+        assert!(err.contains("not a plain relative path"), "{bad}: {err}");
+    }
+    let mut map = serde_json::Map::new();
+    map.insert("model.embed_tokens.weight".into(), serde_json::json!(7));
+    write_index(&d, map);
+    assert!(tensor_names(&resolve_checkpoint_dir(&d).unwrap()).is_err(), "a non-string shard reference");
+}
+
+#[test]
+fn a_plan_config_must_be_the_checkpoints_own() {
+    // `plan <config> --checkpoint <dir>` reads the checkpoint's config.json through the opened
+    // directory; a config from another generation is refused instead of being mixed with this
+    // checkpoint's modules.
+    use sparkforge::weights::{resolve_checkpoint_dir, resolve_with_checkpoint};
+    let d = single("cfg-match", bf16(tensors(false)));
+    let ours = CFG.replace("TIE", "false");
+    std::fs::write(d.join("config.json"), &ours).unwrap();
+    let mut s = spec(false);
+    resolve_with_checkpoint(&mut s, &ours, &resolve_checkpoint_dir(&d).unwrap()).unwrap();
+    let other = CFG.replace("TIE", "false").replace("\"vocab_size\": 64", "\"vocab_size\": 65");
+    let err = format!("{:#}", resolve_with_checkpoint(&mut spec(false), &other, &resolve_checkpoint_dir(&d).unwrap()).unwrap_err());
+    assert!(err.contains("differs from"), "{err}");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_blob_link_out_of_the_shared_store_is_refused_before_opening() {
+    // Only `../../blobs/<xx>/<name>` is followed, inside the cache's shared store. A blob linking
+    // anywhere else (here an absolute path to a valid shard) is refused without opening it.
+    let hub = std::fs::canonicalize(dir("hf-escape")).unwrap();
+    let outside = std::fs::canonicalize(dir("hf-escape-outside")).unwrap();
+    write_shard(&outside.join("private.safetensors"), &bf16(tensors(false)), 0);
+    let repo = hub.join("models--org--name");
+    let (blobs, snap) = (repo.join("blobs"), repo.join("snapshots/rev"));
+    std::fs::create_dir_all(&blobs).unwrap();
+    std::fs::create_dir_all(&snap).unwrap();
+    std::fs::create_dir_all(hub.join("blobs")).unwrap();
+    std::os::unix::fs::symlink(format!("../../blobs/{}", hf_blob()), snap.join("model.safetensors")).unwrap();
+    for target in [outside.join("private.safetensors").display().to_string(), "../../blobs/ab/../../x".into(), "../../other/ab/x".into(), "../../blobs/abc/x".into()] {
+        let _ = std::fs::remove_file(blobs.join(hf_blob()));
+        std::os::unix::fs::symlink(&target, blobs.join(hf_blob())).unwrap();
+        let err = format!("{:#}", Checkpoint::open(&snap).err().expect("escaping chain"));
+        assert!(err.contains("only into the cache's shared store"), "{target}: {err}");
+    }
+}

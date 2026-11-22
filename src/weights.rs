@@ -102,6 +102,10 @@ pub struct CheckpointDir {
     /// beside a blob store it doesn't use.
     #[cfg(unix)]
     blobs: Option<std::result::Result<File, String>>,
+    /// The cache's shared, deduplicated store (`<repo>/../blobs`), when it exists. A blob may link
+    /// one hop into it, as `../../blobs/<xx>/<name>`, and nowhere else.
+    #[cfg(unix)]
+    shared: Option<File>,
 }
 
 impl CheckpointDir {
@@ -138,7 +142,21 @@ impl CheckpointDir {
                         LinkTarget::HfBlob(blob) => match &self.blobs {
                             Some(Ok(blobs)) => {
                                 blob_name = blob.to_str().map(str::to_owned);
-                                nofollow::cstr(&blob).and_then(|c| nofollow::open_file(blobs, &c))
+                                let c = nofollow::cstr(&blob)?;
+                                match nofollow::open_file(blobs, &c) {
+                                    // The blob may itself link one hop into the shared store
+                                    // (spark-5's cache links `<repo>/blobs/<sha256>` on to
+                                    // `hub/blobs/<xx>/<id>`), walked there without following any
+                                    // further link. Its bytes are verified against the name.
+                                    Err(e) if e.raw_os_error() == Some(libc::ELOOP) => {
+                                        let t = nofollow::readlink(blobs, &c).with_context(|| format!("reading the blob link behind {}", path.display()))?;
+                                        let (Some(rel), Some(shared)) = (shared_store_target(&t), &self.shared) else {
+                                            bail!("{} links to blob {}, which links on to {}; a blob may link only into the cache's shared store, as ../../blobs/<xx>/<name>", path.display(), blob.to_string_lossy(), t.display());
+                                        };
+                                        nofollow::walk(shared, &rel).and_then(|(d, l)| nofollow::open_file(&d, &l))
+                                    }
+                                    r => r,
+                                }
                             }
                             Some(Err(why)) => bail!("{} links into the blob store, but {why}", path.display()),
                             None => Err(std::io::Error::from(ErrorKind::NotFound)),
@@ -261,12 +279,27 @@ fn blob_digest(name: &str, len: u64, path: &Path, feed: impl FnOnce(&mut dyn FnM
 
 fn check_blob_digest(got: &str, name: &str, path: &Path) -> Result<()> {
     ensure!(got.eq_ignore_ascii_case(name),
-        "{} links to blob {name}, but that blob's bytes hash to {got}: the blob store holds other bytes under that name (replaced, rearranged or corrupt), so they are not used", path.display());
+        "{} links to blob {name}, but that blob's bytes do not hash to its name: the blob store holds other bytes under that name (replaced, rearranged or corrupt), so they are not used", path.display());
     Ok(())
 }
 
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// `<xx>/<name>` when a blob's own link is exactly `../../blobs/<xx>/<name>`: a two-hex-digit
+/// shard directory of the shared store, then a plain name.
+#[cfg(unix)]
+fn shared_store_target(t: &Path) -> Option<PathBuf> {
+    let c: Vec<Component> = t.components().collect();
+    match c.as_slice() {
+        [Component::ParentDir, Component::ParentDir, Component::Normal(b), Component::Normal(xx), Component::Normal(name)]
+            if *b == "blobs" && xx.len() == 2 && xx.to_str().is_some_and(|x| x.bytes().all(|b| b.is_ascii_hexdigit())) && !name.is_empty() =>
+        {
+            Some(Path::new(xx).join(name))
+        }
+        _ => None,
+    }
 }
 
 /// Where a shard link's target lands, judged lexically from the link's own directory.
@@ -423,7 +456,7 @@ pub fn resolve_checkpoint_dir(dir: &Path) -> Result<CheckpointDir> {
         // O_NOFOLLOW: if the canonical entry became a symlink since `canonicalize`, fail.
         let open = |p: &Path| std::fs::OpenOptions::new().read(true).custom_flags(nofollow::DIR_FLAGS | libc::O_NOFOLLOW).open(p);
         let snapshot = path.parent().filter(|s| s.file_name().is_some_and(|n| n == "snapshots"));
-        let (fd, blobs) = match (snapshot.and_then(Path::parent), path.file_name()) {
+        let (fd, blobs, shared) = match (snapshot.and_then(Path::parent), path.file_name()) {
             // A Hugging Face snapshot: pin `<repo>` and open `snapshots/<rev>` and `blobs` downward
             // from it. Which bytes a blob link may yield is settled by `verify_blob`, not by this.
             (Some(repo), Some(rev)) => {
@@ -434,11 +467,12 @@ pub fn resolve_checkpoint_dir(dir: &Path) -> Result<CheckpointDir> {
                     std::io::ErrorKind::NotFound => format!("{} is missing", repo.join("blobs").display()),
                     _ => format!("{} cannot be opened as a real directory ({e})", repo.join("blobs").display()),
                 });
-                (fd, Some(blobs))
+                let shared = nofollow::open_dir(&repo_fd, Path::new("../blobs")).ok();
+                (fd, Some(blobs), shared)
             }
-            _ => (open(&path).with_context(|| format!("opening checkpoint directory {}", path.display()))?, None),
+            _ => (open(&path).with_context(|| format!("opening checkpoint directory {}", path.display()))?, None, None),
         };
-        Ok(CheckpointDir { path, fd, blobs })
+        Ok(CheckpointDir { path, fd, blobs, shared })
     }
     #[cfg(not(unix))]
     Ok(CheckpointDir { path })
@@ -447,6 +481,40 @@ pub fn resolve_checkpoint_dir(dir: &Path) -> Result<CheckpointDir> {
 /// `config.json` of an opened checkpoint directory, read with the metadata open rules.
 pub fn read_config(dir: &CheckpointDir) -> Result<String> {
     dir.read_metadata("config.json")
+}
+
+/// Resolves `spec`'s formats onto the checkpoint opened at `dir`, for planning with a checkpoint.
+/// `config_text` (the config the spec came from) must be the checkpoint's own `config.json`, read
+/// through the same opened directory as its tensor names, so a plan never pairs one generation's
+/// format map with another's modules (codex-review of #17).
+pub fn resolve_with_checkpoint(spec: &mut crate::config::ModelSpec, config_text: &str, dir: &CheckpointDir) -> Result<()> {
+    let ours: serde_json::Value = serde_json::from_str(config_text).context("parsing the config")?;
+    let theirs: serde_json::Value = serde_json::from_str(&read_config(dir)?).context("parsing the checkpoint's config.json")?;
+    ensure!(ours == theirs, "the config differs from {}'s own config.json; plan with that file, or with the checkpoint it belongs to", dir.path.display());
+    let names = tensor_names(dir)?;
+    spec.resolve_modules(names.iter().map(String::as_str))
+}
+
+/// The tensor names of a checkpoint, for resolving its module identities: the keys of
+/// `model.safetensors.index.json` when present (no shard is read), else the header of
+/// `model.safetensors`. `Checkpoint::open_dir` later checks that the index and the headers agree.
+pub fn tensor_names(dir: &CheckpointDir) -> Result<Vec<String>> {
+    const INDEX: &str = "model.safetensors.index.json";
+    if dir.has_entry(INDEX)? {
+        #[derive(serde::Deserialize)]
+        struct Index {
+            weight_map: UniqueMap<String>,
+        }
+        let idx: Index = serde_json::from_str(&dir.read_metadata(INDEX)?).with_context(|| format!("parsing {}", dir.entry(INDEX).display()))?;
+        // The same shard-name rule the loader applies, so planning never accepts an index the
+        // loader refuses (no shard is opened here).
+        for (_, shard) in &idx.weight_map.0 {
+            check_shard_name(shard)?;
+        }
+        return Ok(idx.weight_map.0.into_iter().map(|(k, _)| k).collect());
+    }
+    let ck = Checkpoint::open_dir(dir)?;
+    Ok(ck.tensors.into_keys().collect())
 }
 
 /// Index shard names must be plain relative paths inside the checkpoint directory: no absolute

@@ -1,7 +1,7 @@
 //! Hugging Face `config.json` -> normalized ModelSpec.
 use anyhow::{bail, ensure, Context, Result};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Debug, Deserialize)]
 struct RawLayerQuant {
@@ -300,6 +300,11 @@ pub struct ModelSpec {
     /// Hybrid linear/sparse-attention layout (Qwen3.8 Flash Next). Planned, not generated.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hybrid: Option<Hybrid>,
+    /// `formats` resolved onto a checkpoint's modules (`resolve_modules`). With it, the planner
+    /// prices each module by the entries that cover it in that checkpoint; without it (planning
+    /// from a config alone), by path matching.
+    #[serde(skip)]
+    pub resolved: Option<crate::modules::ResolvedFormats>,
 }
 
 fn parse_rope_scaling(v: &Option<serde_json::Value>) -> Result<Option<RopeScaling>> {
@@ -587,6 +592,17 @@ impl ModelSpec {
         // Read from the raw strings, independently of format detection, so an override never
         // hides that the checkpoint itself is mixed precision.
         // Either level declaring mixed precision is enough: an override never hides it.
+        if r.tie_word_embeddings {
+            // A tied head is the embedding matrix: entries for both must agree.
+            // Every spelling of either name (`lm_head`, `model.lm_head`, ...) names the one matrix.
+            let mut seen: Option<(&String, WeightFormat)> = None;
+            for (k, f) in formats.modules.iter().filter(|(k, _)| matches!(strip_text_prefix(k), "lm_head" | "embed_tokens")) {
+                if let Some((other, g)) = seen {
+                    ensure!(g == *f, "quantized_layers lists {other} as {g:?} and {k} as {f:?}, but the head is tied to the embedding: one matrix has one format");
+                }
+                seen = Some((k, *f));
+            }
+        }
         let is_mixed = |q: &serde_json::Value| {
             q.get("quant_method").and_then(|v| v.as_str()) == Some("modelopt")
                 && q.get("quant_algo").and_then(|v| v.as_str()) == Some("MIXED_PRECISION")
@@ -613,7 +629,50 @@ impl ModelSpec {
             weights,
             formats,
             hybrid,
+            resolved: None,
         })
+    }
+
+    /// Resolves `formats` onto the modules of a checkpoint, given its tensor names: each entry
+    /// applies to the modules at or under its path, entries that cover one module must agree, and
+    /// entries that cover none are reported as unused instead of matching by pattern.
+    ///
+    /// For a hybrid model it also checks what the planner relies on: the checkpoint's MTP layer
+    /// indices are exactly the configured ones, every group the planner prices as one format (a
+    /// layer's routed experts, the PLE table, the MTP experts) has one format, and a tied head
+    /// isn't given a format other than the embedding's (codex-review of #17).
+    pub fn resolve_modules<'a>(&mut self, names: impl IntoIterator<Item = &'a str>) -> Result<()> {
+        let table = crate::modules::ModuleTable::from_tensor_names(names);
+        let r = crate::modules::resolve(&self.formats, table)?;
+        if let Some(h) = &self.hybrid {
+            // Canonical decimal indices only: the planner looks layers up as `mtp.layers.<n>`, so a
+            // `mtp.layers.00` beside `mtp.layers.0` would otherwise pass as index 0 and be ignored.
+            let live: BTreeSet<u32> = r.table.children("mtp.layers").into_iter()
+                .map(|n| n.parse::<u32>().ok().filter(|i| i.to_string() == n)
+                    .with_context(|| format!("the checkpoint has MTP modules under mtp.layers.{n}, which is not a canonical layer index")))
+                .collect::<Result<_>>()?;
+            let want: BTreeSet<u32> = (0..h.mtp_layers).collect();
+            ensure!(live == want, "the checkpoint holds MTP layer(s) {live:?}, but the config has {} MTP layer(s) ({want:?}); the draft layers can't be priced unambiguously", h.mtp_layers);
+            let mut groups: Vec<String> = (0..h.schedule.len()).map(|i| format!("layers.{i}.mlp.experts")).collect();
+            groups.extend((0..h.mtp_layers).map(|i| format!("mtp.layers.{i}.mlp.experts")));
+            // Every path the PLE table lookup accepts.
+            groups.extend(h.ple.layer_ids.iter().flat_map(|&p| [Some(p), p.checked_sub(1)]).flatten()
+                .map(|n| format!("layers.{n}.ple.ple_embedding.ngram_embedding")));
+            groups.extend(["ple.ple_embedding.ngram_embedding".to_string(), "ple_embedding.ngram_embedding".to_string()]);
+            for g in &groups {
+                let fs = r.formats_under(g, self.weights);
+                ensure!(fs.len() <= 1, "the planner prices {g} as one format, but the checkpoint's modules there have {}; mixed formats inside one group are not supported",
+                    fs.iter().map(|(f, n)| format!("{f:?} ({n} modules)")).collect::<Vec<_>>().join(" and "));
+            }
+        }
+        if self.tie_embeddings {
+            let (head, embed) = (r.format_at("lm_head", self.weights), r.format_at("embed_tokens", WeightFormat::Bf16));
+            if let (Some(h), Some(e)) = (head, embed) {
+                ensure!(h == e, "the head is tied to the embedding, but the checkpoint gives lm_head {h:?} and embed_tokens {e:?}; one matrix has one format");
+            }
+        }
+        self.resolved = Some(r);
+        Ok(())
     }
 
     pub fn gqa_group(&self) -> u32 { self.heads / self.kv_heads }

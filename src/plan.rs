@@ -155,9 +155,11 @@ pub fn linears(m: &ModelSpec) -> Vec<Linear> {
 
 fn ceil_div(a: u32, b: u32) -> u32 { a.div_ceil(b) }
 
-/// Looks up per-module formats in a mixed-precision map by path suffix, remembering which map
-/// entries were used so the plan can report entries it never consumed (a path layout it does not
-/// understand would otherwise fall back to BF16 silently).
+/// Per-module formats for the planner. With a checkpoint (`ModelSpec::resolved`), every lookup is
+/// exact: the format of the modules the checkpoint holds at that path, as the map's entries cover
+/// them. Without one, the map is matched by path, and the entries used are remembered so the plan
+/// can report entries it never consumed (a path layout it does not understand would otherwise fall
+/// back to BF16 silently).
 pub struct Formats<'a> {
     m: &'a ModelSpec,
     used: RefCell<BTreeSet<String>>,
@@ -165,6 +167,12 @@ pub struct Formats<'a> {
 
 impl<'a> Formats<'a> {
     pub fn new(m: &'a ModelSpec) -> Self { Formats { m, used: RefCell::new(BTreeSet::new()) } }
+
+    /// The format of the checkpoint modules at `path`, marking the entries that cover them as used.
+    fn at(&self, r: &crate::modules::ResolvedFormats, path: &str, default: WeightFormat) -> Option<WeightFormat> {
+        self.used.borrow_mut().extend(r.entries_at(path).into_iter().map(str::to_owned));
+        r.format_at(path, default)
+    }
 
     /// Every matching entry counts as used (a map can list one module under two paths). Matches
     /// that disagree resolve to the largest format.
@@ -181,6 +189,9 @@ impl<'a> Formats<'a> {
     /// language-model paths match, so another tower's `layers.N` (vision, MTP) never does.
     pub fn layer(&self, layer: u32, rel: &str) -> WeightFormat {
         let tail = format!("layers.{layer}.{rel}");
+        if let Some(r) = &self.m.resolved {
+            return self.at(r, &tail, self.m.weights).unwrap_or(self.m.weights);
+        }
         self.find(|k| TEXT_PREFIXES.iter().any(|p| k.strip_prefix(p) == Some(tail.as_str()))).unwrap_or(self.m.weights)
     }
 
@@ -199,13 +210,23 @@ impl<'a> Formats<'a> {
         groups
     }
 
-    /// Format of `rel` in the MTP draft layers.
+    /// Format of `rel` in the MTP draft layers. With a checkpoint, only the layer indices it
+    /// holds; without one, only indices below the configured MTP layer count, so a stale entry such
+    /// as `mtp.layers.999.<rel>` never prices the real draft layer.
     pub fn mtp(&self, rel: &str) -> WeightFormat {
+        let layers = self.m.hybrid.as_ref().map_or(0, |h| h.mtp_layers);
+        if let Some(r) = &self.m.resolved {
+            // `resolve_modules` checked that the checkpoint's MTP indices are exactly 0..layers.
+            return (0..layers)
+                .filter_map(|n| self.at(r, &format!("mtp.layers.{n}.{rel}"), self.m.weights))
+                .reduce(|a, b| if b.bytes_per_elem() > a.bytes_per_elem() { b } else { a })
+                .unwrap_or(self.m.weights);
+        }
         // Exactly `mtp.layers.<n>.<rel>`, so `mtp.layers.0.aux.<rel>` is not the module.
         self.find(|k| {
             k.strip_prefix("mtp.layers.")
                 .and_then(|r| r.split_once('.'))
-                .is_some_and(|(n, rest)| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()) && rest == rel)
+                .is_some_and(|(n, rest)| n.parse::<u32>().is_ok_and(|n| n < layers) && n.bytes().all(|b| b.is_ascii_digit()) && rest == rel)
         }).unwrap_or(self.m.weights)
     }
 
@@ -219,17 +240,46 @@ impl<'a> Formats<'a> {
             h.ple.layer_ids.iter().flat_map(|&p| [Some(p), p.checked_sub(1)]).flatten()
                 .map(|n| format!("layers.{n}.{want}")).collect()
         });
+        if let Some(r) = &self.m.resolved {
+            // Only paths where the checkpoint holds the module; an alias elsewhere is unused.
+            let mut paths = layers.clone();
+            paths.push(want.clone());
+            if bare { paths.push(rel.to_owned()); }
+            return paths.iter().filter_map(|p| self.at(r, p, self.m.weights))
+                .reduce(|a, b| if b.bytes_per_elem() > a.bytes_per_elem() { b } else { a })
+                .unwrap_or(self.m.weights);
+        }
         self.find(|k| TEXT_PREFIXES.iter().filter_map(|p| k.strip_prefix(p)).any(|r| {
             r == want || (bare && r == rel) || layers.iter().any(|l| r == l)
         })).unwrap_or(self.m.weights)
     }
 
-    /// Format of the output head, matched only at its model-level paths (`lm_head`,
-    /// `model.lm_head`, ...), never by suffix inside a layer.
+    /// Format of the output head, at its model-level paths (`lm_head`, `model.lm_head`, ...),
+    /// never by suffix inside a layer. A tied head is the embedding matrix, so it always has the
+    /// embedding's format; a conflicting `lm_head` entry is rejected when the spec is parsed or
+    /// resolved (codex-review of swesty/sparkforge#10 and #17).
     pub fn head(&self) -> WeightFormat {
+        if self.m.tie_embeddings {
+            return self.embed();
+        }
+        if let Some(r) = &self.m.resolved {
+            return self.at(r, "lm_head", self.m.weights).unwrap_or(self.m.weights);
+        }
         self.find(|k| TEXT_PREFIXES.iter().any(|p| k.strip_prefix(p) == Some("lm_head"))).unwrap_or(self.m.weights)
     }
 
+    /// Format of the input embedding (`embed_tokens` under a text prefix). BF16 unless an entry
+    /// covers it: the general weight format (`ModelSpec::weights`, for example from `--format`)
+    /// describes the linears, not the embedding table.
+    pub fn embed(&self) -> WeightFormat {
+        if let Some(r) = &self.m.resolved {
+            return self.at(r, "embed_tokens", WeightFormat::Bf16).unwrap_or(WeightFormat::Bf16);
+        }
+        self.find(|k| TEXT_PREFIXES.iter().any(|p| k.strip_prefix(p) == Some("embed_tokens"))).unwrap_or(WeightFormat::Bf16)
+    }
+
+    /// Map entries no lookup used: with a checkpoint, those that cover no module plus those whose
+    /// modules the plan never prices (for example a vision tower's).
     pub fn unused(&self) -> Vec<String> {
         let used = self.used.borrow();
         self.m.formats.modules.keys().filter(|k| !used.contains(*k)).cloned().collect()
@@ -337,7 +387,7 @@ fn hybrid_other_ops(m: &ModelSpec, h: &Hybrid, f: &Formats) -> Vec<OpClass> {
         name: name.into(), kind, group, shape, format, per_token, bytes_per_token: bytes_each * per_token as f64,
     };
     vec![
-        op("embed_gather", "gather", "other", format!("1 row of {}", m.hidden), Some(WeightFormat::Bf16), 1, m.hidden as f64 * 2.0),
+        op("embed_gather", "gather", "other", format!("1 row of {}", m.hidden), Some(f.embed()), 1, m.hidden as f64 * f.embed().bytes_per_elem()),
         op("ple_ngram_gather", "gather", "ple", format!("{} rows of {} ({} heads, orders 2..={})", h.ple.heads(), h.ple.head_dim(), h.ple.heads(), h.ple.ngram_size),
             Some(table), 1, (h.ple.heads() * h.ple.head_dim()) as f64 * table.bytes_per_elem()),
         // conv1d weights (BF16) and three F32 norms of the residual width.
@@ -550,7 +600,8 @@ pub fn build(m: &ModelSpec, t: &Target, o: &PlanOpts) -> Plan {
     };
     let lm = Linear { name: "lm_head".into(), n: m.vocab, k: m.hidden, copies: 1, active: 1,
         format: if m.hybrid.is_some() { formats.head() } else { WeightFormat::Bf16 }, per_token: 1 };
-    let emb = m.vocab as f64 * m.hidden as f64 * 2.0;
+    // The embedding at its own format (BF16 unless a mixed-precision map quantizes it).
+    let emb = m.vocab as f64 * m.hidden as f64 * if m.hybrid.is_some() { formats.embed().bytes_per_elem() } else { 2.0 };
     let usable = t.usable_mem_gib * (1u64 << 30) as f64;
     let mut ops: Vec<OpClass> = vec![];
     if m.hybrid.is_some() {
@@ -587,7 +638,7 @@ pub fn build(m: &ModelSpec, t: &Target, o: &PlanOpts) -> Plan {
             notes.push("router scoring (softmax or sigmoid) and top-k renormalization are not in the config; read them from the reference before generating the router kernel".into());
             let unused = formats.unused();
             if !unused.is_empty() {
-                notes.push(format!("{} quantized_layers entr{} not used by the plan (path layout not understood): {}",
+                notes.push(format!("{} quantized_layers entr{} not used by the plan (no module of this model at that path): {}",
                     unused.len(), if unused.len() == 1 { "y is" } else { "ies are" }, unused.join(", ")));
             }
             (weights, fixed, hybrid_kv_bytes_per_token(m, h), hybrid_ctx_bytes(m, h, o.ctx), decode)
