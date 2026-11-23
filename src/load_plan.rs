@@ -77,6 +77,8 @@ pub struct PleTable {
     pub shards: Vec<Vec<String>>,
     /// Bytes per row of each of those tensors (80 and 10 in the reference).
     pub row_bytes: Vec<usize>,
+    /// Each n-gram head's table as (first global row, rows), in table order (16 in the reference).
+    pub heads: Vec<(u64, u64)>,
 }
 
 impl PleTable {
@@ -88,6 +90,31 @@ impl PleTable {
     /// Bytes `gather` writes per row.
     pub fn bytes_per_row(&self) -> usize {
         self.row_bytes.iter().sum()
+    }
+
+    /// Rows and bytes `gather` reads for `tokens` tokens (one row per head each), or an error when
+    /// the count is zero or the products overflow.
+    pub fn gather_size(&self, tokens: usize) -> Result<(usize, u64)> {
+        ensure!(tokens > 0, "a PLE gather needs at least one token");
+        let rows = tokens.checked_mul(self.heads.len()).with_context(|| format!("{tokens} tokens x {} PLE heads overflow a row count", self.heads.len()))?;
+        let bytes = (rows as u64).checked_mul(self.bytes_per_row() as u64).with_context(|| format!("{rows} PLE rows x {} bytes overflow a byte count", self.bytes_per_row()))?;
+        Ok((rows, bytes))
+    }
+
+    /// The rows of `tokens` tokens for timing a gather: per token, one row inside each head's own
+    /// range (token-major, heads in order), drawn uniformly by a 64-bit LCG seeded with `seed`, as
+    /// distinct n-grams spread over each head's table.
+    pub fn sample_rows(&self, tokens: usize, seed: u64) -> Result<Vec<u64>> {
+        let (rows, _) = self.gather_size(tokens)?;
+        let mut x = seed;
+        let mut out = Vec::with_capacity(rows);
+        for _ in 0..tokens {
+            for &(first, n) in &self.heads {
+                x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                out.push(first + (x >> 11) % n);
+            }
+        }
+        Ok(out)
     }
 
     /// Reads table rows `rows` (global row `r` is row `r % rows_per_shard` of shard
@@ -122,6 +149,14 @@ pub struct LoadPlan {
     pub ple_table: PleTable,
     /// The tensor check the plan was built on.
     pub check: HybridCheck,
+}
+
+impl LoadPlan {
+    /// Host staging bytes `load` needs: `base`, or the largest packed or scale piece when that is
+    /// larger (those are produced whole; stored tensors go in parts of any staging size).
+    pub fn staging_bytes(&self, ck: &Checkpoint, base: u64) -> u64 {
+        self.buffers.iter().flat_map(|b| &b.pieces).filter(|p| !matches!(p, Piece::Tensor(_))).map(|p| p.len(ck)).fold(base, u64::max)
+    }
 }
 
 /// Builds the load plan for a hybrid checkpoint. `m` must be resolved onto `ck`
@@ -162,7 +197,7 @@ pub fn plan(ck: &Checkpoint, m: &ModelSpec, mode: PleMode) -> Result<LoadPlan> {
     }
     let bytes = buffers.iter().map(|b| b.bytes).sum();
     ensure!(bytes + on_disk_bytes == check.bytes, "the load plan covers {} bytes, but the checked tensors hold {}", bytes + on_disk_bytes, check.bytes);
-    let ple_table = ple_table(&names, &ple.table(), h.ple.split_parts.unwrap_or(0) as usize, check.table_rows)?;
+    let ple_table = ple_table(&names, &ple.table(), h.ple.split_parts.unwrap_or(0) as usize, check.table_rows, &check.table_heads)?;
     Ok(LoadPlan { mode, buffers, bytes, on_disk_bytes, ple_table, check })
 }
 
@@ -201,7 +236,7 @@ fn expert_buffers(ck: &Checkpoint, m: &ModelSpec, g: &str, fmt: WeightFormat, gr
     Ok(out)
 }
 
-fn ple_table(names: &HashMap<&str, &TensorInfo>, table: &str, parts: usize, rows: usize) -> Result<PleTable> {
+fn ple_table(names: &HashMap<&str, &TensorInfo>, table: &str, parts: usize, rows: usize, head_rows: &[u64]) -> Result<PleTable> {
     let mut shards = vec![];
     let mut row_bytes = vec![];
     for j in 0..parts {
@@ -217,7 +252,16 @@ fn ple_table(names: &HashMap<&str, &TensorInfo>, table: &str, parts: usize, rows
         }
         shards.push(ts);
     }
-    Ok(PleTable { rows_per_shard: rows, shards, row_bytes })
+    let mut heads = Vec::with_capacity(head_rows.len());
+    let mut first = 0u64;
+    for (i, &n) in head_rows.iter().enumerate() {
+        ensure!(n > 0, "PLE head {i} has no rows");
+        heads.push((first, n));
+        first += n;
+    }
+    let total = (rows as u64).checked_mul(parts as u64).context("the PLE table's row count overflows")?;
+    ensure!(first <= total, "the PLE heads hold {first} rows, more than the table's {total}");
+    Ok(PleTable { rows_per_shard: rows, shards, row_bytes, heads })
 }
 
 /// Produces the bytes of `piece` into `out` (exactly its length). A `Tensor` piece may be filled in
@@ -263,7 +307,12 @@ pub trait Device {
 pub const FILL_THREADS: usize = 16;
 
 /// Allocates and fills every buffer of `plan`, staging at most `staging` bytes on the host at a time.
+/// Fails before allocating anything when `staging` is zero or smaller than a packed or scale piece
+/// (see `LoadPlan::staging_bytes`).
 pub fn load<D: Device>(dev: &mut D, ck: &Checkpoint, plan: &LoadPlan, staging: usize) -> Result<Vec<D::Buf>> {
+    ensure!(staging > 0, "the staging buffer must hold at least one byte");
+    let need = plan.staging_bytes(ck, 0);
+    ensure!(need <= staging as u64, "a packed or scale piece of {need} bytes does not fit the {staging}-byte staging buffer (pieces of that kind are produced whole)");
     let mut stage = vec![0u8; staging];
     let mut out = Vec::with_capacity(plan.buffers.len());
     for b in &plan.buffers {
@@ -328,7 +377,8 @@ fn fill_parallel(ck: &Checkpoint, slots: Vec<(&Piece, &mut [u8])>) -> Result<()>
     })
 }
 
-/// Buffers up to this size are read back whole; larger ones by their first and last piece.
+/// Buffers up to this size are read back whole; larger ones by their first and last piece, and a
+/// stored tensor among those by its two ends.
 pub const VERIFY_WHOLE_BYTES: u64 = 64 << 20;
 /// A stored tensor longer than this is read back by its first and last this many bytes.
 pub const VERIFY_EDGE_BYTES: u64 = 4 << 20;
@@ -341,9 +391,9 @@ pub struct Verified {
     pub bytes: u64,
 }
 
-/// The ranges `verify` reads back: `(buffer, piece, offset in the piece, length)`. Every piece of
+/// The ranges `verify` reads back: `(buffer, piece, offset in the piece, length)`. Every byte of
 /// a buffer up to `VERIFY_WHOLE_BYTES`; the first and last piece of a larger one (experts 0 and
-/// E-1 of a grouped expert buffer); a long tensor piece by its two ends.
+/// E-1 of a grouped expert buffer), with a long stored tensor there read by its two ends.
 pub fn samples(plan: &LoadPlan, ck: &Checkpoint) -> Vec<(usize, usize, u64, u64)> {
     samples_with(plan, ck, VERIFY_WHOLE_BYTES, VERIFY_EDGE_BYTES)
 }
@@ -352,7 +402,8 @@ pub fn samples(plan: &LoadPlan, ck: &Checkpoint) -> Vec<(usize, usize, u64, u64)
 pub fn samples_with(plan: &LoadPlan, ck: &Checkpoint, whole: u64, edge: u64) -> Vec<(usize, usize, u64, u64)> {
     let mut out = vec![];
     for (bi, b) in plan.buffers.iter().enumerate() {
-        let pieces: Vec<usize> = if b.bytes <= whole || b.pieces.len() == 1 {
+        let sampled = b.bytes > whole;
+        let pieces: Vec<usize> = if !sampled || b.pieces.len() == 1 {
             (0..b.pieces.len()).collect()
         } else {
             vec![0, b.pieces.len() - 1]
@@ -361,7 +412,7 @@ pub fn samples_with(plan: &LoadPlan, ck: &Checkpoint, whole: u64, edge: u64) -> 
             let p = &b.pieces[pi];
             let len = p.len(ck);
             match p {
-                Piece::Tensor(_) if len > 2 * edge => {
+                Piece::Tensor(_) if sampled && len > 2 * edge => {
                     out.push((bi, pi, 0, edge));
                     out.push((bi, pi, len - edge, edge));
                 }

@@ -1012,6 +1012,9 @@ pub struct HybridCheck {
     pub skipped_bytes: u64,
     /// Rows in each PLE table shard, derived from the checkpoint's per-head table sizes.
     pub table_rows: usize,
+    /// Rows of each n-gram head's table (`ngram_heads_vocab_sizes`), in table order; head `i`
+    /// starts at the sum of the sizes before it (checked against `ngram_heads_offsets`).
+    pub table_heads: Vec<u64>,
 }
 
 /// Canonical prefix of the towers a text-only load skips.
@@ -1026,7 +1029,7 @@ pub fn check_hybrid(ck: &Checkpoint, m: &ModelSpec) -> Result<HybridCheck> {
     let Some(r) = &m.resolved else { bail!("the spec must be resolved onto this checkpoint's modules before its tensors are checked") };
     let TextTensors { mut by_name, skipped, skipped_bytes } = text_tensors(ck)?;
     let ple = crate::inventory::ple_paths(&r.table, h)?;
-    let table_rows = ple_table_rows(ck, &by_name, &ple.embedding, &h.ple)?;
+    let (table_rows, table_heads) = ple_table_rows(ck, &by_name, &ple.embedding, &h.ple)?;
     let f = crate::plan::Formats::new(m);
     let wants = crate::inventory::hybrid(m, &f, &crate::inventory::Layout { ple, table_rows: Some(table_rows) })?;
     let mut problems = vec![];
@@ -1056,7 +1059,7 @@ pub fn check_hybrid(ck: &Checkpoint, m: &ModelSpec) -> Result<HybridCheck> {
             if problems.len() > shown { format!("\n  ... and {} more", problems.len() - shown) } else { String::new() });
     }
     groups.sort_by_key(|g| std::cmp::Reverse(g.1));
-    Ok(HybridCheck { tensors: wants.len(), bytes, groups, skipped, skipped_bytes, table_rows })
+    Ok(HybridCheck { tensors: wants.len(), bytes, groups, skipped, skipped_bytes, table_rows, table_heads })
 }
 
 /// A checkpoint's text-model tensors by canonical name, and what the skipped towers hold.
@@ -1094,11 +1097,11 @@ pub fn apply_checked_table(m: &mut ModelSpec, c: &HybridCheck) {
     }
 }
 
-/// Rows in each shard of the PLE n-gram table. The per-head tables are prime-sized near
+/// Rows in each shard of the PLE n-gram table, and each head's rows. The per-head tables are prime-sized near
 /// `ngram_vocab_size_base`, so their sizes come from the checkpoint (`ngram_heads_vocab_sizes`,
 /// with `ngram_heads_offsets` their running sum); the total is padded to a multiple of
 /// `make_ngram_vocab_size_divisible_by` and split evenly into `split_ngram_parts` shards.
-fn ple_table_rows(ck: &Checkpoint, by_name: &HashMap<&str, &TensorInfo>, embedding: &str, p: &crate::config::Ple) -> Result<usize> {
+fn ple_table_rows(ck: &Checkpoint, by_name: &HashMap<&str, &TensorInfo>, embedding: &str, p: &crate::config::Ple) -> Result<(usize, Vec<u64>)> {
     let heads = p.heads() as usize;
     let read = |rel: &str| -> Result<Vec<i64>> {
         let name = format!("{embedding}.{rel}");
@@ -1120,7 +1123,7 @@ fn ple_table_rows(ck: &Checkpoint, by_name: &HashMap<&str, &TensorInfo>, embeddi
     let padded = total.div_ceil(multiple).checked_mul(multiple)
         .with_context(|| format!("the PLE n-gram table's {total} rows, padded to a multiple of {multiple}, overflow a 64-bit row count"))?;
     ensure!(padded % parts == 0, "the PLE n-gram table has {padded} rows (padded to a multiple of {multiple}), which do not split evenly into {parts} shards");
-    Ok(usize::try_from(padded / parts)?)
+    Ok((usize::try_from(padded / parts)?, sizes.iter().map(|&s| s as u64).collect()))
 }
 
 /// Bytes `MemAvailable` must keep after a load (design decision 5).

@@ -111,11 +111,12 @@ pub struct HybridWeights {
 /// Copies every buffer of `plan` into GPU memory, then reads samples back and compares them with
 /// the checkpoint (`load_plan::verify`). `admission` must cover `plan.bytes` plus `overhead`; it is
 /// confirmed against `MemAvailable` before the first allocation.
-pub fn load_hybrid(stream: &Arc<CudaStream>, ck: &Checkpoint, plan: &crate::load_plan::LoadPlan, admission: &Admission, overhead: u64) -> Result<HybridWeights> {
+/// `staging` is the host staging size (`LoadPlan::staging_bytes`), which `overhead` must include.
+pub fn load_hybrid(stream: &Arc<CudaStream>, ck: &Checkpoint, plan: &crate::load_plan::LoadPlan, admission: &Admission, overhead: u64, staging: u64) -> Result<HybridWeights> {
     admission.confirm(plan.bytes, overhead, mem_available)?;
     let mut gpu = Gpu(stream.clone());
     let t0 = Instant::now();
-    let buffers = crate::load_plan::load(&mut gpu, ck, plan, STAGING_BYTES as usize)?;
+    let buffers = crate::load_plan::load(&mut gpu, ck, plan, usize::try_from(staging)?)?;
     stream.synchronize()?;
     let load_secs = t0.elapsed().as_secs_f64();
     let mem_available_after = mem_available();
@@ -139,15 +140,10 @@ pub struct GatherTiming {
 /// Times reading `tokens` x `heads` PLE rows (one per n-gram head per token) into pinned memory and
 /// copying them to the GPU.
 pub fn time_ple_gather(ctx: &Arc<cudarc::driver::CudaContext>, stream: &Arc<CudaStream>, ck: &Checkpoint, table: &crate::load_plan::PleTable,
-    heads: usize, tokens: usize, seed: u64) -> Result<GatherTiming> {
-    // Each token reads one row per head, from that head's own range of the table: spread rows
-    // uniformly over the whole table (a 64-bit LCG), which is what distinct n-grams do.
-    let mut x = seed;
-    let rows: Vec<u64> = (0..tokens * heads).map(|_| {
-        x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-        (x >> 11) % table.rows()
-    }).collect();
-    let bytes = rows.len() * table.bytes_per_row();
+    tokens: usize, seed: u64) -> Result<GatherTiming> {
+    // Each token reads one row per head, from that head's own range of the table.
+    let rows = table.sample_rows(tokens, seed)?;
+    let bytes = usize::try_from(table.gather_size(tokens)?.1)?;
     let mut pinned = unsafe { ctx.alloc_pinned::<u8>(bytes)? };
     let mut dst = unsafe { stream.alloc::<u8>(bytes)? };
     let t0 = Instant::now();

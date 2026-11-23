@@ -202,3 +202,92 @@ fn a_negative_expert_scale_fails_the_load_naming_the_buffer() {
     let err = format!("{:#}", load(&mut Host, &ck2, &p, 1 << 20).unwrap_err());
     assert!(err.contains("copying layers.0.mlp.experts.gate_up.scale") && err.contains("is negative"), "{err}");
 }
+
+#[test]
+fn a_buffer_under_the_whole_threshold_is_read_back_whole() {
+    // With a 1 MiB whole threshold and 1 KiB edges, the 16 KiB embedding is one stored tensor in a
+    // small buffer: it is read whole, so a byte flipped in its middle fails verification.
+    let (s, ck) = tiny();
+    let p = plan(&ck, &s, PleMode::Resident).unwrap();
+    let sm = samples_with(&p, &ck, 1 << 20, 1024);
+    let bi = p.buffers.iter().position(|b| b.name == "embed_tokens.weight").unwrap();
+    assert_eq!(sm.iter().filter(|x| x.0 == bi).map(|x| (x.1, x.2, x.3)).collect::<Vec<_>>(), vec![(0, 0, 16 * 1024)]);
+    let mut bufs = load(&mut Host, &ck, &p, 1 << 20).unwrap();
+    bufs[bi][8 * 1024] ^= 1;
+    let err = format!("{:#}", verify_samples(&mut Host, &ck, &p, &bufs, &sm).unwrap_err());
+    assert!(err.contains("embed_tokens.weight piece 0 differs from the checkpoint at byte 8192"), "{err}");
+}
+
+/// `Host`, counting the allocations and writes made through it.
+#[derive(Default)]
+struct Counting {
+    allocs: usize,
+    writes: usize,
+}
+
+impl Device for Counting {
+    type Buf = Vec<u8>;
+    fn alloc(&mut self, bytes: usize) -> Result<Vec<u8>> {
+        self.allocs += 1;
+        Host.alloc(bytes)
+    }
+    fn write(&mut self, buf: &mut Vec<u8>, off: usize, src: &[u8]) -> Result<()> {
+        self.writes += 1;
+        Host.write(buf, off, src)
+    }
+    fn read(&mut self, buf: &Vec<u8>, off: usize, dst: &mut [u8]) -> Result<()> {
+        Host.read(buf, off, dst)
+    }
+}
+
+#[test]
+fn staging_is_sized_from_the_largest_packed_piece() {
+    // An expert's packed gate|up block (64 x 64 FP4, 2 KiB) is produced whole, so a 1 KiB base
+    // staging buffer grows to 2 KiB and then copies the same bytes; a base above it is kept.
+    let (s, ck) = tiny();
+    let p = plan(&ck, &s, PleMode::Resident).unwrap();
+    assert_eq!(p.staging_bytes(&ck, 1024), 2048);
+    assert_eq!(p.staging_bytes(&ck, 1 << 20), 1 << 20);
+    assert_eq!(load(&mut Host, &ck, &p, 2048).unwrap(), load(&mut Host, &ck, &p, 1 << 20).unwrap());
+}
+
+#[test]
+fn a_staging_buffer_too_small_or_empty_fails_before_any_allocation() {
+    let (s, ck) = tiny();
+    let p = plan(&ck, &s, PleMode::Resident).unwrap();
+    for (staging, want) in [(0, "the staging buffer must hold at least one byte"), (1024, "a packed or scale piece of 2048 bytes does not fit the 1024-byte staging buffer")] {
+        let mut dev = Counting::default();
+        let err = format!("{:#}", load(&mut dev, &ck, &p, staging).unwrap_err());
+        assert!(err.contains(want), "{err}");
+        assert_eq!((dev.allocs, dev.writes), (0, 0), "staging {staging}");
+    }
+}
+
+#[test]
+fn timed_ple_rows_take_one_row_from_each_heads_own_range() {
+    // The tiny table's heads hold 11, 13, 17 and 19 rows (rows 0..60 of a 60-row table).
+    let (s, ck) = tiny();
+    let p = plan(&ck, &s, PleMode::Disk).unwrap();
+    let t = &p.ple_table;
+    assert_eq!(t.heads, vec![(0, 11), (11, 13), (24, 17), (41, 19)]);
+    for seed in [1u64, 0x5eed, 0xfeed] {
+        let rows = t.sample_rows(500, seed).unwrap();
+        assert_eq!(rows.len(), 500 * 4);
+        for (i, r) in rows.iter().enumerate() {
+            let (first, n) = t.heads[i % 4];
+            assert!((first..first + n).contains(r), "seed {seed:#x}: token {} head {} drew row {r}", i / 4, i % 4);
+        }
+        // Over 500 tokens every row of the smallest head comes up.
+        let mut seen: Vec<u64> = rows.iter().step_by(4).copied().collect();
+        seen.sort_unstable();
+        seen.dedup();
+        assert_eq!(seen, (0..11).collect::<Vec<_>>(), "seed {seed:#x}");
+        let mut out = vec![0u8; t.gather_size(500).unwrap().1 as usize];
+        t.gather(&ck, &rows, &mut out).unwrap();
+    }
+    assert_eq!(t.gather_size(3).unwrap(), (12, 12 * 9));
+    let err = format!("{:#}", t.gather_size(0).unwrap_err());
+    assert!(err.contains("at least one token"), "{err}");
+    let err = format!("{:#}", t.gather_size(usize::MAX / 2).unwrap_err());
+    assert!(err.contains("overflow"), "{err}");
+}

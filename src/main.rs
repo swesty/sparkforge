@@ -78,9 +78,9 @@ enum Cmd {
         /// Where the PLE n-gram table lives: read from the checkpoint per token, or copied whole.
         #[arg(long, value_enum, default_value = "disk")]
         ple: PleArg,
-        /// Tokens of PLE rows to read in the disk-mode timing.
-        #[arg(long, default_value_t = 4096)]
-        gather_tokens: usize,
+        /// Tokens of PLE rows to read in the disk-mode timing (1 to 1048576).
+        #[arg(long, default_value_t = 4096, value_parser = clap::value_parser!(u32).range(1..=1 << 20))]
+        gather_tokens: u32,
     },
     /// Run every generated kernel on the GPU against a CPU reference (needs --features cuda on a Spark).
     #[cfg(feature = "cuda")]
@@ -249,13 +249,16 @@ fn main() -> Result<()> {
             use sparkforge::{device_weights, load_plan, weights};
             let t0 = std::time::Instant::now();
             let (spec, ck) = open_checkpoint(&dir)?;
-            let h = spec.hybrid.as_ref().ok_or_else(|| anyhow::anyhow!("load-weights loads hybrid checkpoints; a dense BF16 one loads with verify-weights"))?;
+            anyhow::ensure!(spec.hybrid.is_some(), "load-weights loads hybrid checkpoints; a dense BF16 one loads with verify-weights");
             let mode = match ple { PleArg::Disk => load_plan::PleMode::Disk, PleArg::Resident => load_plan::PleMode::Resident };
             let lp = load_plan::plan(&ck, &spec, mode)?;
             println!("{}: {} tensors checked and planned into {} GPU buffers in {:.2} s", spec.arch, lp.check.tensors, lp.buffers.len(), t0.elapsed().as_secs_f64());
-            let gather_bytes = if mode == load_plan::PleMode::Disk { (gather_tokens * h.ple.heads() as usize * lp.ple_table.bytes_per_row()) as u64 } else { 0 };
+            let gather_tokens = gather_tokens as usize;
+            let gather_bytes = if mode == load_plan::PleMode::Disk { lp.ple_table.gather_size(gather_tokens)?.1 } else { 0 };
+            let staging = lp.staging_bytes(&ck, weights::STAGING_BYTES);
             // Gathered rows are held twice: pinned on the host and in a device buffer.
-            let overhead = weights::STAGING_BYTES + device_weights::HYBRID_SCRATCH_BYTES + 2 * gather_bytes;
+            let overhead = gather_bytes.checked_mul(2).and_then(|g| g.checked_add(staging + device_weights::HYBRID_SCRATCH_BYTES))
+                .ok_or_else(|| anyhow::anyhow!("the load's host overhead overflows a byte count"))?;
             let avail0 = weights::mem_available();
             // Admission before any CUDA call, held until every allocation of this run is made.
             let admission = weights::admit(&weights::admission_lock()?, lp.bytes, overhead, weights::mem_available, weights::ADMISSION_WAIT)?;
@@ -263,7 +266,7 @@ fn main() -> Result<()> {
             let (maj, min) = ctx.compute_capability()?;
             anyhow::ensure!((maj, min) == (12, 1), "expected GB10 (cc 12.1), found {maj}.{min}");
             let stream = ctx.default_stream();
-            let w = device_weights::load_hybrid(&stream, &ck, &lp, &admission, overhead)?;
+            let w = device_weights::load_hybrid(&stream, &ck, &lp, &admission, overhead, staging)?;
             let gb = lp.bytes as f64 / 1e9;
             println!("PLE table: {}", match mode {
                 load_plan::PleMode::Disk => format!("on disk ({:.2} GB in {} shards of {} rows, {} bytes per row)", lp.on_disk_bytes as f64 / 1e9, lp.ple_table.shards.len(), lp.ple_table.rows_per_shard, lp.ple_table.bytes_per_row()),
@@ -275,7 +278,7 @@ fn main() -> Result<()> {
             println!("read back {} pieces of {} buffers ({:.2} MB) in {:.2} s: all match the checkpoint", w.verified.pieces, w.verified.buffers, w.verified.bytes as f64 / 1e6, w.verify_secs);
             if mode == load_plan::PleMode::Disk {
                 for (run, seed) in [(1, 0x5eedu64), (2, 0x5eed), (3, 0xfeed)] {
-                    let g = device_weights::time_ple_gather(&ctx, &stream, &ck, &lp.ple_table, h.ple.heads() as usize, gather_tokens, seed)?;
+                    let g = device_weights::time_ple_gather(&ctx, &stream, &ck, &lp.ple_table, gather_tokens, seed)?;
                     println!("PLE gather run {run} (seed {seed:#x}): {} tokens x {} rows ({:.2} MB) read into pinned memory in {:.1} ms ({:.1} us/token), copied to the GPU in {:.2} ms",
                         g.tokens, g.rows / g.tokens, g.bytes as f64 / 1e6, g.gather_secs * 1e3, g.gather_secs * 1e6 / g.tokens as f64, g.copy_secs * 1e3);
                 }
