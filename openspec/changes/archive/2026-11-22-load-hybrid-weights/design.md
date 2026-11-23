@@ -31,7 +31,7 @@ The measured load and gather times are recorded in the tasks. With 16 sequential
 `load_plan::load` and `load_plan::verify` take a `Device` (alloc, write, read). `device_weights::Gpu` implements it with cudarc, and the tests implement it with host vectors. Every rule therefore runs in CI without a GPU: grouping, byte counts, staging in parts, parallel fill, read-back sampling, and error naming.
 
 - **Fill:** pieces that fit the 64 MiB staging buffer are produced on 16 threads (`pread` plus repack), then copied in one write. Larger tensors are copied in staging-sized parts.
-- **Admission:** taken before the CUDA context, as for dense loads, covering the copied bytes plus staging, fill and read-back scratch (256 MiB), and the gather buffers.
+- **Admission:** taken before the CUDA context, as for dense loads, covering the copied bytes plus staging, fill and read-back scratch (computed from the plan's largest built piece and largest read-back sample), and the gather buffers.
 
 ## Decision 5: read-back compares the GPU's bytes with the checkpoint
 

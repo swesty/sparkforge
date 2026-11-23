@@ -92,10 +92,6 @@ impl crate::load_plan::Device for Gpu {
     }
 }
 
-/// Host scratch a hybrid load needs beyond the staging buffer: the fill threads' stacked expert
-/// parts (16 threads x about 3.3 MB in the reference) and the read-back comparison buffers (at
-/// most three of `VERIFY_EDGE_BYTES` or one expert piece). Rounded up generously.
-pub const HYBRID_SCRATCH_BYTES: u64 = 256 << 20;
 
 /// A hybrid checkpoint resident in GPU memory.
 pub struct HybridWeights {

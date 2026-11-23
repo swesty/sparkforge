@@ -280,13 +280,17 @@ pub fn fill(ck: &Checkpoint, piece: &Piece, off: u64, out: &mut [u8]) -> Result<
     }
 }
 
-/// The parts' bytes back to back: their rows stacked in order.
+/// The parts' bytes back to back: their rows stacked in order, in one allocation of exactly their
+/// length (what `host_scratch_bytes` counts per piece).
 fn stacked(ck: &Checkpoint, parts: &[String]) -> Result<Vec<u8>> {
-    let mut out = vec![];
-    let mut buf = vec![];
+    let total = parts.iter().map(|p| ck.tensors[p].len()).sum::<u64>();
+    let mut out = vec![0u8; usize::try_from(total)?];
+    let mut at = 0;
     for p in parts {
-        ck.read_into(&ck.tensors[p], &mut buf)?;
-        out.extend_from_slice(&buf);
+        let t = &ck.tensors[p];
+        let n = usize::try_from(t.len())?;
+        ck.read_range(t, 0, &mut out[at..at + n])?;
+        at += n;
     }
     Ok(out)
 }
@@ -361,20 +365,63 @@ fn fill_buffer<D: Device>(dev: &mut D, ck: &Checkpoint, b: &Buffer, dst: &mut D:
 }
 
 fn fill_parallel(ck: &Checkpoint, slots: Vec<(&Piece, &mut [u8])>) -> Result<()> {
-    if slots.len() == 1 {
-        let (p, out) = slots.into_iter().next().expect("one slot");
-        return fill(ck, p, 0, out);
-    }
-    let per = slots.len().div_ceil(FILL_THREADS);
-    let mut chunks: Vec<Vec<(&Piece, &mut [u8])>> = vec![];
-    let mut it = slots.into_iter().peekable();
-    while it.peek().is_some() {
-        chunks.push(it.by_ref().take(per).collect());
-    }
+    run_parallel(slots, FILL_THREADS, |(p, out)| fill(ck, p, 0, out), |_| true)
+}
+
+/// Runs `work` on every item, on the calling thread and up to `threads - 1` helpers drawing from
+/// one queue, so at most `threads` items are in progress at once. Helper `i` is started only if
+/// `may_spawn(i)`; a helper the OS refuses to start (or `may_spawn` declines) just leaves its
+/// share to the threads that did start. Returns the first error, after every thread has stopped.
+fn run_parallel<T: Send>(items: Vec<T>, threads: usize, work: impl Fn(T) -> Result<()> + Sync, may_spawn: impl Fn(usize) -> bool) -> Result<()> {
+    let helpers = threads.min(items.len()).saturating_sub(1);
+    let queue = std::sync::Mutex::new(items.into_iter());
+    let failed = std::sync::atomic::AtomicBool::new(false);
+    let run = || -> Result<()> {
+        loop {
+            if failed.load(std::sync::atomic::Ordering::Relaxed) {
+                return Ok(());
+            }
+            let Some(item) = queue.lock().map_err(|_| anyhow::anyhow!("a fill thread panicked"))?.next() else { return Ok(()) };
+            if let Err(e) = work(item) {
+                failed.store(true, std::sync::atomic::Ordering::Relaxed);
+                return Err(e);
+            }
+        }
+    };
     std::thread::scope(|sc| {
-        let handles: Vec<_> = chunks.into_iter().map(|c| sc.spawn(move || c.into_iter().try_for_each(|(p, out)| fill(ck, p, 0, out)))).collect();
-        handles.into_iter().try_for_each(|h| h.join().map_err(|_| anyhow::anyhow!("a fill thread panicked"))?)
+        let mut handles = vec![];
+        for i in 1..=helpers {
+            if !may_spawn(i) {
+                break;
+            }
+            match std::thread::Builder::new().name(format!("fill-{i}")).spawn_scoped(sc, &run) {
+                Ok(h) => handles.push(h),
+                Err(_) => break,
+            }
+        }
+        let mut first = run().err();
+        for h in handles {
+            let r = h.join().map_err(|_| anyhow::anyhow!("a fill thread panicked")).and_then(|r| r);
+            if first.is_none() {
+                first = r.err();
+            }
+        }
+        first.map_or(Ok(()), Err)
     })
+}
+
+/// Host bytes a load and its read-back of `samples` hold at their peak, besides the copied weights
+/// and the gather: the larger of the copy phase (the `staging` buffer plus one stacked checkpoint
+/// copy of a packed or scale piece per fill thread) and the read-back phase (the GPU bytes and the
+/// checkpoint bytes of the largest sample, plus the unpacked rows for a packed one).
+pub fn host_scratch_bytes(plan: &LoadPlan, ck: &Checkpoint, staging: u64, samples: &[(usize, usize, u64, u64)]) -> u64 {
+    let largest_built = plan.staging_bytes(ck, 0);
+    let copy = staging + FILL_THREADS as u64 * largest_built;
+    let read_back = samples.iter().map(|&(bi, pi, _, len)| match plan.buffers[bi].pieces[pi] {
+        Piece::PackedFp4 { .. } => 3 * len,
+        _ => 2 * len,
+    }).max().unwrap_or(0);
+    copy.max(read_back)
 }
 
 /// Buffers up to this size are read back whole; larger ones by their first and last piece, and a
@@ -434,17 +481,18 @@ pub fn verify<D: Device>(dev: &mut D, ck: &Checkpoint, plan: &LoadPlan, bufs: &[
 pub fn verify_samples<D: Device>(dev: &mut D, ck: &Checkpoint, plan: &LoadPlan, bufs: &[D::Buf], samples: &[(usize, usize, u64, u64)]) -> Result<Verified> {
     let mut v = Verified::default();
     let mut last_buffer = None;
-    let mut got = vec![];
-    let mut want = vec![];
     for &(bi, pi, off, len) in samples {
         let b = &plan.buffers[bi];
         let p = &b.pieces[pi];
-        got.resize(len as usize, 0);
+        // Buffers of exactly this sample's length, freed before the next (`host_scratch_bytes`).
+        let mut got = vec![0u8; usize::try_from(len)?];
         dev.read(&bufs[bi], (b.offsets[pi] + off) as usize, &mut got)?;
+        let want;
         match p {
             Piece::Tensor(_) | Piece::Scales { .. } => {
-                want.resize(len as usize, 0);
-                fill(ck, p, off, &mut want)?;
+                let mut w = vec![0u8; got.len()];
+                fill(ck, p, off, &mut w)?;
+                want = w;
             }
             Piece::PackedFp4 { parts, n, k } => {
                 // Compared in the checkpoint's own layout, so a repack error shows here too.
@@ -465,4 +513,41 @@ pub fn verify_samples<D: Device>(dev: &mut D, ck: &Checkpoint, plan: &LoadPlan, 
         }
     }
     Ok(v)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::run_parallel;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
+
+    #[test]
+    fn work_finishes_when_helper_threads_cannot_start() {
+        // No helper, one helper then a refusal, and every helper: each item runs exactly once.
+        for allowed in [0, 1, 15] {
+            let done = Mutex::new(vec![0u32; 200]);
+            run_parallel((0..200).collect(), 16, |i: usize| {
+                done.lock().unwrap()[i] += 1;
+                Ok(())
+            }, |h| h <= allowed).unwrap();
+            assert!(done.into_inner().unwrap().iter().all(|&n| n == 1), "{allowed} helpers allowed");
+        }
+    }
+
+    #[test]
+    fn at_most_threads_items_run_at_once_and_the_first_error_is_returned() {
+        let (now, peak) = (AtomicUsize::new(0), AtomicUsize::new(0));
+        run_parallel((0..64).collect(), 4, |_: usize| {
+            peak.fetch_max(now.fetch_add(1, Ordering::SeqCst) + 1, Ordering::SeqCst);
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            now.fetch_sub(1, Ordering::SeqCst);
+            Ok(())
+        }, |_| true).unwrap();
+        assert!((1..=4).contains(&peak.load(Ordering::SeqCst)), "peak {}", peak.load(Ordering::SeqCst));
+        let err = run_parallel((0..64).collect(), 4, |i: usize| {
+            anyhow::ensure!(i != 7, "item {i} failed");
+            Ok(())
+        }, |_| true).unwrap_err();
+        assert_eq!(err.to_string(), "item 7 failed");
+    }
 }

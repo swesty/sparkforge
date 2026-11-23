@@ -256,9 +256,12 @@ fn main() -> Result<()> {
             let gather_tokens = gather_tokens as usize;
             let gather_bytes = if mode == load_plan::PleMode::Disk { lp.ple_table.gather_size(gather_tokens)?.1 } else { 0 };
             let staging = lp.staging_bytes(&ck, weights::STAGING_BYTES);
+            let scratch = load_plan::host_scratch_bytes(&lp, &ck, staging, &load_plan::samples(&lp, &ck));
             // Gathered rows are held twice: pinned on the host and in a device buffer.
-            let overhead = gather_bytes.checked_mul(2).and_then(|g| g.checked_add(staging + device_weights::HYBRID_SCRATCH_BYTES))
+            let overhead = gather_bytes.checked_mul(2).and_then(|g| g.checked_add(scratch))
                 .ok_or_else(|| anyhow::anyhow!("the load's host overhead overflows a byte count"))?;
+            println!("admission: {:.2} GiB of weights, {:.1} MiB of host scratch (staging {:.1} MiB), {:.1} MiB of gather buffers",
+                gib(lp.bytes), scratch as f64 / (1u64 << 20) as f64, staging as f64 / (1u64 << 20) as f64, 2.0 * gather_bytes as f64 / (1u64 << 20) as f64);
             let avail0 = weights::mem_available();
             // Admission before any CUDA call, held until every allocation of this run is made.
             let admission = weights::admit(&weights::admission_lock()?, lp.bytes, overhead, weights::mem_available, weights::ADMISSION_WAIT)?;

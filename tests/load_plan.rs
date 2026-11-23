@@ -3,7 +3,7 @@
 //! the read-back check, and PLE rows read from disk.
 use anyhow::Result;
 use sparkforge::config::ModelSpec;
-use sparkforge::load_plan::{load, plan, samples_with, verify, verify_samples, Device, LoadPlan, PleMode};
+use sparkforge::load_plan::{host_scratch_bytes, load, plan, samples, samples_with, verify, verify_samples, Device, LoadPlan, PleMode, FILL_THREADS};
 use sparkforge::repack::{e4m3_to_s0e5m3, unpack_fp4};
 use sparkforge::weights::{resolve_checkpoint_dir, spec_from_checkpoint, Checkpoint};
 
@@ -290,4 +290,58 @@ fn timed_ple_rows_take_one_row_from_each_heads_own_range() {
     assert!(err.contains("at least one token"), "{err}");
     let err = format!("{:#}", t.gather_size(usize::MAX / 2).unwrap_err());
     assert!(err.contains("overflow"), "{err}");
+}
+
+#[test]
+fn admission_scratch_covers_the_copy_and_read_back_peaks() {
+    let (s, ck) = tiny();
+    let p = plan(&ck, &s, PleMode::Resident).unwrap();
+    let sm = samples(&p, &ck);
+    // Read-back phase, worked out here from the samples: two copies of a stored sample, three of
+    // a packed one (the GPU bytes, the checkpoint bytes, the unpacked rows).
+    let read_back = sm.iter().map(|&(bi, pi, _, len)| match p.buffers[bi].pieces[pi] {
+        sparkforge::load_plan::Piece::PackedFp4 { .. } => 3 * len,
+        _ => 2 * len,
+    }).max().unwrap();
+    assert_eq!(read_back, 2 * 32 * 1024, "the largest sample is a 32 KiB stored tensor");
+    assert_eq!(host_scratch_bytes(&p, &ck, 0, &sm), read_back.max(FILL_THREADS as u64 * 2048));
+    // Copy phase: 1 MiB staging plus one 2 KiB packed block per fill thread.
+    assert_eq!(host_scratch_bytes(&p, &ck, 1 << 20, &sm), (1 << 20) + FILL_THREADS as u64 * 2048);
+    // Read-back phase: a 256 MiB packed sample holds the GPU bytes, the checkpoint bytes and the
+    // unpacked rows at once, so it reserves 768 MiB.
+    let gu = p.buffers.iter().position(|b| b.name == "layers.0.mlp.experts.gate_up.weight").unwrap();
+    assert_eq!(host_scratch_bytes(&p, &ck, 0, &[(gu, 0, 0, 256 << 20)]), 768 << 20);
+    // A stored-tensor sample holds two copies.
+    let emb = p.buffers.iter().position(|b| b.name == "embed_tokens.weight").unwrap();
+    assert_eq!(host_scratch_bytes(&p, &ck, 0, &[(emb, 0, 0, 256 << 20)]), 512 << 20);
+}
+
+#[test]
+fn ple_metadata_rewritten_in_place_after_planning_fails_the_load_and_the_read_back() {
+    // The plan captured head sizes [11, 13, 17, 19]; swapping the first two (and the second
+    // offset) in place must not produce resident metadata that disagrees with the gather.
+    let rewrite = |ck: &Checkpoint| {
+        use std::io::{Seek, SeekFrom, Write};
+        let emb = "model.language_model.layers.1.ple.ple_embedding";
+        for (leaf, vals) in [("ngram_heads_vocab_sizes", [13i64, 11, 17, 19]), ("ngram_heads_offsets", [0i64, 13, 24, 41])] {
+            let t = &ck.tensors[&format!("{emb}.{leaf}")];
+            let mut f = std::fs::OpenOptions::new().write(true).open(&ck.shards[t.shard].path).unwrap();
+            f.seek(SeekFrom::Start(t.start)).unwrap();
+            f.write_all(&vals.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>()).unwrap();
+        }
+    };
+    let (s, ck) = tiny();
+    let p = plan(&ck, &s, PleMode::Disk).unwrap();
+    rewrite(&ck);
+    let err = format!("{:#}", load(&mut Host, &ck, &p, 1 << 20).unwrap_err());
+    assert!(err.contains("was modified since it was opened"), "{err}");
+
+    let (s, ck) = tiny();
+    let p = plan(&ck, &s, PleMode::Disk).unwrap();
+    let bufs = load(&mut Host, &ck, &p, 1 << 20).unwrap();
+    rewrite(&ck);
+    let err = format!("{:#}", verify(&mut Host, &ck, &p, &bufs).unwrap_err());
+    assert!(err.contains("was modified since it was opened"), "{err}");
+    let err = format!("{:#}", p.ple_table.gather(&ck, &[0], &mut [0u8; 9]).unwrap_err());
+    assert!(err.contains("was modified since it was opened"), "{err}");
 }
