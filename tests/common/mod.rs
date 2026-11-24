@@ -7,6 +7,7 @@
 #![allow(dead_code)]
 use serde_json::{json, Value};
 use sparkforge::config::{LayerKind, ModelSpec};
+use std::path::PathBuf;
 
 pub const CFG: &str = "configs/qwen3.8-flash-next-nvfp4.json";
 
@@ -178,3 +179,69 @@ pub fn tiny_config() -> Value {
 /// already a multiple of 4, in 4 shards of 15 rows.
 pub const TINY_VOCAB_SIZES: [i64; 4] = [11, 13, 17, 19];
 pub const TINY_TABLE_ROWS: usize = 15;
+
+/// Creates `path` as a new directory only this user can enter. Non-recursive `mkdir` fails with
+/// `AlreadyExists` on any existing entry, including a directory or symlink another local user
+/// planted, so a fixture can never be written through someone else's path.
+pub fn fresh_private_dir(path: &std::path::Path) -> std::io::Result<()> {
+    let mut b = std::fs::DirBuilder::new();
+    #[cfg(unix)]
+    std::os::unix::fs::DirBuilderExt::mode(&mut b, 0o700);
+    b.create(path)
+}
+
+/// A fresh private directory per call. The name is unpredictable (time and a counter), and a
+/// collision with any existing entry picks a new name instead of reusing it.
+pub fn dir(name: &str) -> PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static N: AtomicU64 = AtomicU64::new(0);
+    loop {
+        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let d = std::env::temp_dir().join(format!(
+            "sparkforge-weights-{}-{nanos}-{}-{name}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
+        match fresh_private_dir(&d) {
+            Ok(()) => return d,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => panic!("creating {}: {e}", d.display()),
+        }
+    }
+}
+
+/// Writes a single-file hybrid checkpoint with `config` and the tensors `ts`. Tensor bytes are a
+/// pattern, except the PLE table sizes and offsets, which hold `vocab_sizes` and their running sum.
+pub fn write_hybrid(name: &str, config: &serde_json::Value, ts: &[Tensor], vocab_sizes: &[i64]) -> PathBuf {
+    let d = dir(name);
+    std::fs::write(d.join("config.json"), config.to_string()).unwrap();
+    let offsets: Vec<i64> = vocab_sizes.iter().scan(0i64, |acc, &s| { let o = *acc; *acc = acc.wrapping_add(s); Some(o) }).collect();
+    let mut header = serde_json::Map::new();
+    let mut data: Vec<u8> = vec![];
+    for (n, dtype, shape) in ts {
+        let elem = match *dtype { "I64" => 8, "F32" => 4, "F8_E4M3" | "U8" => 1, _ => 2 };
+        let bytes = shape.iter().product::<usize>() * elem;
+        let b = data.len();
+        if n.ends_with("ngram_heads_vocab_sizes") || n.ends_with("ngram_heads_offsets") {
+            let vals = if n.ends_with("sizes") { vocab_sizes } else { &offsets[..] };
+            let mut raw: Vec<u8> = vals.iter().flat_map(|x| x.to_le_bytes()).collect();
+            raw.resize(bytes, 0);
+            data.extend(raw);
+        } else {
+            // Bytes that differ between tensors (from the running offset). E4M3 values stay
+            // finite and not negative (below 0x7f), as NVFP4 scales must be to load.
+            let modulus = if *dtype == "F8_E4M3" { 127 } else { 251 };
+            data.extend((0..bytes).map(|i| ((b + i) % modulus) as u8));
+        }
+        header.insert(n.clone(), serde_json::json!({"dtype": dtype, "shape": shape, "data_offsets": [b, b + bytes]}));
+    }
+    let mut h = serde_json::to_vec(&header).unwrap();
+    while h.len() % 8 != 0 {
+        h.push(b' ');
+    }
+    let mut out = (h.len() as u64).to_le_bytes().to_vec();
+    out.extend(h);
+    out.extend(data);
+    std::fs::write(d.join("model.safetensors"), out).unwrap();
+    d
+}

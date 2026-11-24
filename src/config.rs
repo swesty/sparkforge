@@ -581,6 +581,34 @@ fn check_table_shards(t: &crate::modules::ModuleTable, table: &str, parts: Optio
     Ok(())
 }
 
+/// The PLE table's own path holds only its shared global scale (`weight_scale_2`, NVFP4), never
+/// required there: any other tensor at the root (for example a `weight`) shares the scalar's
+/// module, so module checks alone would accept it unpriced (codex-review fp:347106d738b2 on #18).
+fn check_table_root(names: &[&str], table: &str) -> Result<()> {
+    let mut extra: Vec<&str> = names.iter().copied()
+        .filter(|n| n.rsplit_once('.').is_some_and(|(m, leaf)| crate::modules::canonical(m) == table && leaf != "weight_scale_2"))
+        .collect();
+    extra.sort_unstable();
+    ensure!(extra.is_empty(), "the PLE table's own path {table} may hold only its shared weight_scale_2, but the checkpoint also has {}",
+        extra.join(", "));
+    Ok(())
+}
+
+/// Every layer's routed experts are numbered `0..num_experts`. The live members are counted
+/// before anything is built per declared expert, so a declared count far beyond the checkpoint's
+/// fails with a bounded error instead of allocating entries for every declared expert
+/// (codex-review fp:d0f47806a572 on #18). Extra members are refused later, by name.
+fn check_expert_counts(t: &crate::modules::ModuleTable, h: &Hybrid, n: u32) -> Result<()> {
+    let groups = (0..h.schedule.len()).map(|i| format!("layers.{i}.mlp.experts")).chain((0..h.mtp_layers).map(|i| format!("mtp.layers.{i}.mlp.experts")));
+    for g in groups {
+        let have = t.children(&g).into_iter()
+            .filter(|c| c.parse::<u32>().is_ok_and(|x| x < n && x.to_string() == *c))
+            .count() as u64;
+        ensure!(have == n as u64, "config.json declares {n} routed experts per layer, but the checkpoint holds {have} of them under {g} ({} missing)", n as u64 - have);
+    }
+    Ok(())
+}
+
 impl ModelSpec {
     pub fn from_json(text: &str, override_fmt: Option<WeightFormat>) -> Result<Self> {
         let (body, quant_conflict) = text_config(serde_json::from_str(text).context("parsing config.json")?)?;
@@ -712,7 +740,8 @@ impl ModelSpec {
     /// old ones and rows checked in another checkpoint are gone; this checkpoint's own tensor check
     /// sets them again.
     fn resolve_onto<'a>(&mut self, names: impl IntoIterator<Item = &'a str>) -> Result<()> {
-        let table = crate::modules::ModuleTable::from_tensor_names(names);
+        let names: Vec<&str> = names.into_iter().collect();
+        let table = crate::modules::ModuleTable::from_tensor_names(names.iter().copied());
         let r = crate::modules::resolve(&self.formats, table)?;
         let mut ple = None;
         if let Some(h) = &self.hybrid {
@@ -727,6 +756,10 @@ impl ModelSpec {
             // One PLE module and one table, so one table is priced (codex-review of #17).
             let p = crate::inventory::ple_paths(&r.table, h)?;
             check_table_shards(&r.table, &p.table(), h.ple.split_parts)?;
+            check_table_root(&names, &p.table())?;
+            if let Some(e) = &self.moe {
+                check_expert_counts(&r.table, h, e.num_experts)?;
+            }
             let mut groups: Vec<String> = (0..h.schedule.len()).map(|i| format!("layers.{i}.mlp.experts")).collect();
             groups.extend((0..h.mtp_layers).map(|i| format!("mtp.layers.{i}.mlp.experts")));
             groups.push(p.table());

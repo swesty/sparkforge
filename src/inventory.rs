@@ -150,8 +150,9 @@ pub fn hybrid(m: &ModelSpec, f: &Formats, layout: &Layout) -> Result<Vec<Want>> 
     // MTP draft layers: one sparse-attention layer with its own experts, the input projections and
     // three mixers. Their norms are BF16 in the reference checkpoint (F32 in the main model).
     if h.mtp_layers > 0 {
+        // Each input projection carries the tensors of its own format (codex-review fp:25aaaee34a54 on #18).
         for fc in ["fc_embedding", "fc_hidden"] {
-            inv.tensor(format!("mtp.{fc}.weight"), "BF16", vec![hd, hd], "mtp");
+            inv.projection(&format!("mtp.{fc}"), m.hidden, m.hidden, f.mtp_shared(fc), "mtp")?;
         }
         inv.tensor("mtp.pre_fc_norm_embedding.weight".into(), "BF16", vec![hd], "mtp");
         inv.tensor("mtp.pre_fc_norm_hidden.weight".into(), "BF16", vec![res], "mtp");

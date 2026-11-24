@@ -13,6 +13,10 @@ struct Cli {
 #[derive(Clone, Copy, ValueEnum)]
 enum Fmt { Auto, Bf16, W4a16, Nvfp4 }
 
+#[cfg(feature = "cuda")]
+#[derive(Clone, Copy, ValueEnum)]
+enum PleArg { Disk, Resident }
+
 /// Spec (resolved onto the checkpoint's modules) and opened checkpoint for a checkpoint directory
 /// (config.json beside the weights).
 fn open_checkpoint(dir: &std::path::Path) -> Result<(ModelSpec, sparkforge::weights::Checkpoint)> {
@@ -65,6 +69,18 @@ enum Cmd {
         cuda_include: String,
         #[arg(long, default_value_t = 0x5eed)]
         seed: u64,
+    },
+    /// Copy a hybrid checkpoint into GPU memory, experts repacked for the decode GEMV, then read
+    /// samples back and compare them with the checkpoint (needs --features cuda on a Spark).
+    #[cfg(feature = "cuda")]
+    LoadWeights {
+        dir: PathBuf,
+        /// Where the PLE n-gram table lives: read from the checkpoint per token, or copied whole.
+        #[arg(long, value_enum, default_value = "disk")]
+        ple: PleArg,
+        /// Tokens of PLE rows to read in the disk-mode timing (1 to 1048576).
+        #[arg(long, default_value_t = 4096, value_parser = clap::value_parser!(u32).range(1..=1 << 20))]
+        gather_tokens: u32,
     },
     /// Run every generated kernel on the GPU against a CPU reference (needs --features cuda on a Spark).
     #[cfg(feature = "cuda")]
@@ -227,6 +243,51 @@ fn main() -> Result<()> {
                     r.us.map_or("-".into(), |t| format!("{t:.1}")), r.gbs.map_or("-".into(), |g| format!("{g:.0}")));
             }
             anyhow::ensure!(fails == 0, "{fails} check(s) above tolerance {:.4}", verify::TOL);
+        }
+        #[cfg(feature = "cuda")]
+        Cmd::LoadWeights { dir, ple, gather_tokens } => {
+            use sparkforge::{device_weights, load_plan, weights};
+            let t0 = std::time::Instant::now();
+            let (spec, ck) = open_checkpoint(&dir)?;
+            anyhow::ensure!(spec.hybrid.is_some(), "load-weights loads hybrid checkpoints; a dense BF16 one loads with verify-weights");
+            let mode = match ple { PleArg::Disk => load_plan::PleMode::Disk, PleArg::Resident => load_plan::PleMode::Resident };
+            let lp = load_plan::plan(&ck, &spec, mode)?;
+            println!("{}: {} tensors checked and planned into {} GPU buffers in {:.2} s", spec.arch, lp.check.tensors, lp.buffers.len(), t0.elapsed().as_secs_f64());
+            let gather_tokens = gather_tokens as usize;
+            let gather_bytes = if mode == load_plan::PleMode::Disk { lp.ple_table.gather_size(gather_tokens)?.1 } else { 0 };
+            let staging = lp.staging_bytes(&ck, weights::STAGING_BYTES);
+            let scratch = load_plan::host_scratch_bytes(&lp, &ck, staging, &load_plan::samples(&lp, &ck));
+            // Gathered rows are held twice: pinned on the host and in a device buffer.
+            let overhead = gather_bytes.checked_mul(2).and_then(|g| g.checked_add(scratch))
+                .ok_or_else(|| anyhow::anyhow!("the load's host overhead overflows a byte count"))?;
+            println!("admission: {:.2} GiB of weights, {:.1} MiB of host scratch (staging {:.1} MiB), {:.1} MiB of gather buffers",
+                gib(lp.bytes), scratch as f64 / (1u64 << 20) as f64, staging as f64 / (1u64 << 20) as f64, 2.0 * gather_bytes as f64 / (1u64 << 20) as f64);
+            let avail0 = weights::mem_available();
+            // Admission before any CUDA call, held until every allocation of this run is made.
+            let admission = weights::admit(&weights::admission_lock()?, lp.bytes, overhead, weights::mem_available, weights::ADMISSION_WAIT)?;
+            let ctx = cudarc::driver::CudaContext::new(0).map_err(|e| anyhow::anyhow!("opening GPU 0: {e}"))?;
+            let (maj, min) = ctx.compute_capability()?;
+            anyhow::ensure!((maj, min) == (12, 1), "expected GB10 (cc 12.1), found {maj}.{min}");
+            let stream = ctx.default_stream();
+            let w = device_weights::load_hybrid(&stream, &ck, &lp, &admission, overhead, staging)?;
+            let gb = lp.bytes as f64 / 1e9;
+            println!("PLE table: {}", match mode {
+                load_plan::PleMode::Disk => format!("on disk ({:.2} GB in {} shards of {} rows, {} bytes per row)", lp.on_disk_bytes as f64 / 1e9, lp.ple_table.shards.len(), lp.ple_table.rows_per_shard, lp.ple_table.bytes_per_row()),
+                load_plan::PleMode::Resident => "resident".into(),
+            });
+            println!("copied {:.2} GB ({:.2} GiB) into GPU memory in {:.2} s ({:.2} GB/s)", gb, gib(lp.bytes), w.load_secs, gb / w.load_secs);
+            println!("MemAvailable: {} before, {} with the weights resident",
+                avail0.map_or("unknown".into(), |a| format!("{:.1} GiB", gib(a))), w.mem_available_after.map_or("unknown".into(), |a| format!("{:.1} GiB", gib(a))));
+            println!("read back {} pieces of {} buffers ({:.2} MB) in {:.2} s: all match the checkpoint", w.verified.pieces, w.verified.buffers, w.verified.bytes as f64 / 1e6, w.verify_secs);
+            if mode == load_plan::PleMode::Disk {
+                for (run, seed) in [(1, 0x5eedu64), (2, 0x5eed), (3, 0xfeed)] {
+                    let g = device_weights::time_ple_gather(&ctx, &stream, &ck, &lp.ple_table, gather_tokens, seed)?;
+                    println!("PLE gather run {run} (seed {seed:#x}): {} tokens x {} rows ({:.2} MB) read into pinned memory in {:.1} ms ({:.1} us/token), copied to the GPU in {:.2} ms",
+                        g.tokens, g.rows / g.tokens, g.bytes as f64 / 1e6, g.gather_secs * 1e3, g.gather_secs * 1e6 / g.tokens as f64, g.copy_secs * 1e3);
+                }
+            }
+            drop(w);
+            drop(admission);
         }
         #[cfg(feature = "cuda")]
         Cmd::Verify { c, cuda_include, bench, seed } => {
