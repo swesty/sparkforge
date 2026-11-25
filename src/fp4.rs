@@ -53,8 +53,8 @@ pub struct Operands {
 /// The scale bytes every case carries at fixed positions: zero and the subnormals 2^-9 and 7 x 2^-9.
 pub const EDGE_SCALES: [u8; 3] = [0x00, 0x01, 0x07];
 
-/// The output row of every slot that `Operands::overflow_case` makes exact but overflow-prone.
-pub const OVERFLOW_ROW: usize = 1;
+/// The output rows of every slot that `Operands::overflow_case` makes overflow-prone.
+pub const OVERFLOW_ROWS: [usize; 2] = [1, 2];
 
 /// The BF16 bits of the largest finite BF16 (about 3.39e38).
 pub const BF16_MAX: u16 = 0x7f7f;
@@ -99,18 +99,35 @@ impl Operands {
         Operands { n, k, experts, codes, scales, gscale }
     }
 
-    /// A case where scaling an E2M1 value only after the activation multiply overflows f32: a copy of
-    /// these operands whose row `OVERFLOW_ROW` of every copy has code +6 at K 0 with scale byte 0x01
-    /// (2^-9), and BF16 activations that are `BF16_MAX` at each slot's K 0 and zero elsewhere. That
-    /// row's exact result, 6 x 2^-9 x 3.39e38 (about 4e36) times its global scale, fits in BF16;
-    /// 6 x 3.39e38 does not fit in f32. Other rows may overflow legitimately, so compare only that row.
+    /// Cases where applying a scale only after the activation multiply overflows f32: a copy of these
+    /// operands with BF16 activations that are `BF16_MAX` (about 3.39e38) at each slot's K 0 and
+    /// zero elsewhere, in which, for every copy,
+    /// - row 1 has code +6 at K 0 with block scale byte 0x01 (2^-9): its output is about 4e36 times
+    ///   its global scale, but 6 x 3.39e38 does not fit in f32;
+    /// - row 2 has code +6 at K 0 with block scale 1.0 (0x38), and the global scale of its segment is
+    ///   1/8: its output is about 2.54e38, which fits in BF16, but the block-scaled sum does not fit
+    ///   in f32.
+    ///
+    /// Other rows may overflow legitimately, so compare only `OVERFLOW_ROWS`.
     pub fn overflow_case(&self, g: &Fp4Gemv, slots: usize) -> (Operands, Vec<u16>) {
         let mut o = self.clone();
         let (kh, ks) = (self.k / 2, self.k / 16);
+        let col = segment_col(&g.segments, OVERFLOW_ROWS[1] as u32) as usize;
+        assert_eq!(col, segment_col(&g.segments, OVERFLOW_ROWS[0] as u32) as usize, "both rows share a segment");
         for e in 0..self.experts {
-            o.scales[(e * self.n + OVERFLOW_ROW) * ks] = 0x01;
-            let c = &mut o.codes[(e * self.n + OVERFLOW_ROW) * kh];
-            *c = (*c & 0xf0) | 0x07;
+            for (row, scale) in OVERFLOW_ROWS.into_iter().zip([0x01u8, 0x38]) {
+                o.scales[(e * self.n + row) * ks] = scale;
+                let c = &mut o.codes[(e * self.n + row) * kh];
+                *c = (*c & 0xf0) | 0x07;
+            }
+        }
+        // The global scale of the rows' segment: one per copy when grouped, else one in all.
+        if g.gscale_stride > 0 {
+            for e in 0..self.experts {
+                o.gscale[e * g.gscale_stride as usize + col] = 0.125;
+            }
+        } else {
+            o.gscale[col] = 0.125;
         }
         let xs = g.x_stride as usize;
         let mut x = vec![0u16; (slots - 1) * xs + self.k];

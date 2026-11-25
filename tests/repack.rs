@@ -127,6 +127,10 @@ fn emulate(g: &Fp4Gemv, n: usize, k: usize, w: &[u8], sf: &[u8], gscale: &[f32],
         let e = if g.experts > 0 { ids[slot] as usize } else { 0 };
         let (w, sf) = (&w[e * n * k / 2..][..n * k / 2], &sf[e * n * k / 16..][..n * k / 16]);
         let xv = &x[slot * g.x_stride as usize..][..k];
+        let gs_of = |r: usize| {
+            let col = segment_col(&g.segments, r as u32) as usize;
+            if g.gscale_stride > 0 { gscale[e * g.gscale_stride as usize + col] } else { gscale[col] }
+        };
         for split in 0..s {
             let kt0 = split * g.kt_per_split as usize;
             for nt in 0..tiles {
@@ -139,8 +143,9 @@ fn emulate(g: &Fp4Gemv, n: usize, k: usize, w: &[u8], sf: &[u8], gscale: &[f32],
                                 let byte = w[at + 4 * j + b];
                                 let (p, kh) = lane_elem(lane, j, b);
                                 let kk = kt * 16 + 2 * kh;
-                                // The kernel scales each value in f16 first (exact, so f32 here).
-                                let s = s0e5m3(sf[kt * n + nt * 64 + lane_row(lane, p)]);
+                                // The kernel applies block scale x global scale to each value first.
+                                let r = nt * 64 + lane_row(lane, p);
+                                let s = s0e5m3(sf[kt * n + r]) * gs_of(r);
                                 let (lo, hi) = (e2m1(byte & 0xf) as f32 * s, e2m1(byte >> 4) as f32 * s);
                                 acc[p] = hi.mul_add(xv[kk + 1], lo.mul_add(xv[kk], acc[p]));
                             }
@@ -158,12 +163,8 @@ fn emulate(g: &Fp4Gemv, n: usize, k: usize, w: &[u8], sf: &[u8], gscale: &[f32],
     }
     let mut y = vec![0f32; slots * n];
     for slot in 0..slots {
-        let e = if g.experts > 0 { ids[slot] as usize } else { 0 };
         for r in 0..n {
-            let sum = (0..s).fold(0f32, |a, q| a + partial[(slot * s + q) * n + r]);
-            let col = segment_col(&g.segments, r as u32) as usize;
-            let gs = if g.gscale_stride > 0 { gscale[e * g.gscale_stride as usize + col] } else { gscale[col] };
-            y[slot * n + r] = bf16(sum * gs);
+            y[slot * n + r] = bf16((0..s).fold(0f32, |a, q| a + partial[(slot * s + q) * n + r]));
         }
     }
     y
@@ -305,8 +306,9 @@ fn reference_decoders_cover_the_edge_scales() {
 
 #[test]
 fn a_bf16_max_activation_times_a_small_scale_stays_finite() {
-    use sparkforge::fp4::{OVERFLOW_ROW, BF16_MAX};
-    // Dense (S 2) and grouped down (2 slots, one x per slot): row 1 is code +6 x 2^-9 x 3.39e38.
+    use sparkforge::fp4::{OVERFLOW_ROWS, BF16_MAX};
+    // Dense (S 2) and grouped down (2 slots, one x per slot): row 1 is code +6 x 2^-9 x 3.39e38, and
+    // row 2 is code +6 x 1 x 3.39e38 under a global scale of 1/8.
     let segs = vec![Segment { end: 128, col: 0 }];
     let dense = gemv(2, 4, 1, 0, segs.clone(), 0, 0);
     let grouped = gemv(1, 4, 2, 3, vec![Segment { end: 128, col: 2 }], 3, 64);
@@ -319,9 +321,12 @@ fn a_bf16_max_activation_times_a_small_scale_stays_finite() {
         assert!(6.0 * xf[0] == f32::INFINITY, "the unscaled product overflows f32");
         let r = big.reference(g, &ids, &xf.iter().map(|&v| v as f64).collect::<Vec<_>>()).unwrap();
         let y = emulate(g, 128, 64, &w, &sf, &big.gscale, &ids, &xf);
+        assert!((r[OVERFLOW_ROWS[1]] - 6.0 * xf[0] as f64 / 8.0).abs() < 1e30, "row 2 is 2.54e38, under the BF16 maximum");
         for slot in 0..g.slots as usize {
-            let (got, want) = (y[slot * 128 + OVERFLOW_ROW] as f64, r[slot * 128 + OVERFLOW_ROW]);
-            assert!(got.is_finite() && (got - want).abs() <= want.abs() / 64.0, "slot {slot}: {got} vs {want}");
+            for row in OVERFLOW_ROWS {
+                let (got, want) = (y[slot * 128 + row] as f64, r[slot * 128 + row]);
+                assert!(got.is_finite() && (got - want).abs() <= want.abs() / 64.0, "slot {slot} row {row}: {got} vs {want}");
+            }
         }
     }
 }

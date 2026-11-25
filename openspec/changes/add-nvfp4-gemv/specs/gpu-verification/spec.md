@@ -70,6 +70,10 @@ Each NVFP4 GEMV check SHALL include scale bytes 0x00, 0x01 and 0x07 and a distin
 - **WHEN** one row has code +6 with scale byte 0x01 at the only K position whose activation is nonzero, the largest finite BF16
 - **THEN** that row's output is finite and within 1/64 of the reference, about 4e36 times its global scale
 
+#### Scenario: Activation at the BF16 limit under a small global scale
+- **WHEN** a row has code +6 with block scale 1.0 and global scale 1/8 at the only K position whose activation is nonzero, the largest finite BF16
+- **THEN** that row's output is finite and within 1/64 of the reference, about 2.54e38
+
 ### Requirement: Split-K NVFP4 GEMVs are checked for bitwise replay
 
 A split-K NVFP4 GEMV SHALL run on 4 activation vectors in turn, each checked against its own reference, on one workspace whose counters are never cleared. After 63 more launches, the first vector SHALL run again over a NaN-sentinel output, and the check SHALL fail unless that output is bitwise identical to its first.

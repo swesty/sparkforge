@@ -61,7 +61,8 @@ The kernel converts each weight byte with `cvt.rn.f16x2.e2m1x2` to an f16 pair, 
 
 Each lane needs 4 S0E5M3 bytes per K tile, one per row: `SF[kt*N + nt*64 + base_n + 16p]`.
 - **The read:** lane L loads one 4-byte word of the tile's 64 contiguous scale bytes, word `L % 16`. Its row slot p takes byte `base_n % 4` of lane `base_n / 4 + 4p`'s word, by `__shfl_sync`. That is one load and 4 shuffles instead of 4 single-byte loads.
-- **The decode:** the byte shifted left by 7 is the scale's f16 bits. Each decoded E2M1 pair is multiplied by it in f16 (`mul.rn.f16x2`) before the activation multiply. The product is exact: its magnitude runs from 2^-10 to 6 x 448 = 2688, with at most 6 significant bits. Scaling after the activation multiply instead (the first version) overflowed f32 for an activation near the BF16 limit times a small scale (codex-review of #20). The change cost no measurable time.
+- **The decode:** the byte shifted left by 7 is the scale's f16 bits, decoded to f32 and multiplied by the row slot's global scale (decision 4), once per K tile and row slot. Each decoded E2M1 value is multiplied by that product before the activation multiply, so the f32 accumulator holds the row's output itself. It overflows only when a single term of the output does.
+- **Why not after the sum:** the first version applied the block scale after the tile's dot product and the global scale after the K sum. An activation near the BF16 limit then overflowed f32 before a small block scale (2^-9) or global scale (1/8) could bring the result back into range (codex-review of #20, cycles 2 and 3).
 
 The decode is exact for every byte the repack emits:
 - normal E4M3 values;
@@ -72,7 +73,9 @@ So the ticket's "reject subnormal or zero scale bytes" is unnecessary; SHA-791 a
 
 ### 4. Global scales by constexpr row segment
 
-**Per-row scale.** Each output row is multiplied by `gscale[slot_base + SEG_COL[seg(row)]]`, where `seg(row)` compares the row with constexpr segment ends.
+**Per-row scale.** Each lane loads `gscale[slot_base + SEG_COL[seg(row)]]` for its 4 row slots once, before the K loop, where `seg(row)` compares the row with constexpr segment ends. The scale is folded into each K tile's block scale (decision 3), not applied to the finished sum.
+- **One scale per tile when possible:** when every segment end is a multiple of 64 (constexpr `TILE_SEGMENTS`, true for every current model), a warp's tile lies in one segment, and the 4 row slots share one loaded value. With 4 distinct values, Flash Next's gate/up took 68 registers, which fits 3 blocks of 256 threads per SM, so its 150 blocks ran in two waves on 48 SMs and read 198 GB/s. With one value it takes 55 registers and reads 220-221 GB/s.
+- **Register caps rejected:** `__launch_bounds__(256, 4)` restored gate/up but gave every entry 64 registers, which cost Flash Next down 2% (204-206 GB/s). `(256, 5)` spilled up to 168 bytes and cost qkv about 10%.
 - **Dense:** `slot_base` is 0, and the segments are the stacked tensors:
   - `qkv_proj`: q, k, v;
   - `gate_up_proj`, `shared_gate_up`: gate, up;
@@ -97,7 +100,7 @@ The planner derives segment ends from the model's own dimensions. Every boundary
 
 Writer side: every lane fences its own stores, and the warp barrier orders those stores before lane 0's fence. Because fences are cumulative, lane 0's fence then covers them before the device-scope atomic.
 
-The warp that sees `S - 1` is last. It calls `__syncwarp()`, so every lane is ordered after lane 0's post-atomic fence, and then `__threadfence()`. It reads the S partials with `__ldcg` (through L2, never a stale L1 line) in split order 0..S-1, applies the global scale, writes BF16, and stores 0 to the counter.
+The warp that sees `S - 1` is last. It calls `__syncwarp()`, so every lane is ordered after lane 0's post-atomic fence, and then `__threadfence()`. It reads the S partials with `__ldcg` (through L2, never a stale L1 line) in split order 0..S-1 (the partials already carry the global scale), writes BF16, and stores 0 to the counter.
 
 The first version did not fence lane 0 after the barrier, and its readers relied on the shuffle alone for ordering (codex-review of #20).
 

@@ -218,6 +218,29 @@ fn a_tied_dense_head_takes_the_resolved_embedding_format() {
     assert!((head(&p) / head(&bf16) - 1.03125 / 2.0).abs() < 1e-9, "the head GEMV reads MXFP8 bytes");
 }
 
+#[test]
+fn a_tile_reads_one_global_scale_only_when_segments_end_on_tile_boundaries() {
+    // A kernel's namespace text, from `namespace <entry>_ns {` to its closing brace.
+    let ns = |src: &str, e: &str| {
+        let at = src.find(&format!("namespace {e}_ns {{")).unwrap();
+        src[at..at + src[at..].find("\n}").unwrap()].to_string()
+    };
+    let src = |p: &plan::Plan| codegen::generate(p).files.into_iter().find(|(n, _)| n == "model.cu").unwrap().1;
+    // Qwen3-30B-A3B: q/k/v end at 4096 and 4608, gate/up at 768, all multiples of 64.
+    let q = src(&qwen3_nvfp4());
+    for e in ["gemv_qkv_proj", "gemv_o_proj", "gemv_expert_gate_up", "gemv_expert_down"] {
+        assert!(ns(&q, e).contains("constexpr bool TILE_SEGMENTS = true;"), "{e}");
+    }
+    // Expert width 800: gate/up N = 1600 tiles, but its gate rows end at 800, inside tile 12, so
+    // each row slot reads its own global scale.
+    let mut v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string("configs/qwen3-30b-a3b.json").unwrap()).unwrap();
+    v["moe_intermediate_size"] = 800.into();
+    let s = ModelSpec::from_json(&v.to_string(), Some(sparkforge::config::WeightFormat::Nvfp4)).unwrap();
+    let w = src(&plan::build(&s, &GB10, &plan::PlanOpts { prefill_tokens: 2048, ctx: 32768 }));
+    assert!(ns(&w, "gemv_expert_gate_up").contains("constexpr bool TILE_SEGMENTS = false;"));
+    assert!(ns(&w, "gemv_expert_down").contains("constexpr bool TILE_SEGMENTS = true;"));
+}
+
 fn qwen3_nvfp4() -> plan::Plan {
     let s = ModelSpec::from_json(&std::fs::read_to_string("configs/qwen3-30b-a3b.json").unwrap(),
         Some(sparkforge::config::WeightFormat::Nvfp4)).unwrap();

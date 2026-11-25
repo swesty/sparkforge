@@ -273,13 +273,8 @@ __device__ __forceinline__ void e2m1x8_to_f16x2(unsigned w, unsigned& h0, unsign
       : "=r"(h0), "=r"(h1), "=r"(h2), "=r"(h3) : "r"(w));
 }
 __device__ __forceinline__ float2 f16x2_to_f32x2(unsigned h) { return __half22float2(*reinterpret_cast<const __half2*>(&h)); }
-// f16x2 product of two packed pairs (one HMUL2). A S0E5M3 scale byte is the f16 with bits byte << 7
-// (exact for every byte the weight loader writes).
-__device__ __forceinline__ unsigned hmul2_bits(unsigned a, unsigned b) {
-  unsigned r;
-  asm("mul.rn.f16x2 %0, %1, %2;" : "=r"(r) : "r"(a), "r"(b));
-  return r;
-}
+// S0E5M3 scale byte -> the f16 with bits byte << 7 (exact for every byte the weight loader writes).
+__device__ __forceinline__ float s0e5m3_to_f32(unsigned b) { return __half2float(__ushort_as_half((unsigned short)(b << 7))); }
 __device__ __forceinline__ void bf16x4_to_f32(uint2 v, float* f) {
   f[0] = __uint_as_float(v.x << 16); f[1] = __uint_as_float(v.x & 0xffff0000u);
   f[2] = __uint_as_float(v.y << 16); f[3] = __uint_as_float(v.y & 0xffff0000u);
@@ -294,13 +289,15 @@ constexpr bool GROUPED = @GROUPED@, TAIL = SPLITS * KT_PER_SPLIT != K_TILES;
 constexpr size_t W_EXPERT = (size_t)N * K / 32;   // 16-byte vectors per expert
 constexpr size_t SF_EXPERT = (size_t)N * K / 16;  // scale bytes per expert
 constexpr int GS_STRIDE = @GS_STRIDE@, X_STRIDE = @X_STRIDE@;
+// Every segment boundary is a multiple of 64, so each warp's 64-row tile has one global scale.
+constexpr bool TILE_SEGMENTS = @TILE_SEGMENTS@;
 static_assert(N % 64 == 0 && K % 16 == 0, "NVFP4 GEMV tiles are 64 N x 16 K");
 static_assert((SPLITS - 1) * KT_PER_SPLIT < K_TILES && SPLITS * KT_PER_SPLIT >= K_TILES, "every split holds K tiles");
 static_assert(X_STRIDE % 4 == 0, "activation rows must allow 8-byte loads");
 // Global-scale column of output row `row` (the checkpoint tensor stacked at that row).
 __device__ __forceinline__ int seg_col(int @ROW@) { return @SEG@; }
 }
-// NVFP4 x BF16 decode GEMV (W4A16), y[slot][N] = gscale(row) * sum_k e2m1 * scale * x[k].
+// NVFP4 x BF16 decode GEMV (W4A16), y[slot][N] = sum_k (e2m1 * scale * gscale(row)) * x[k].
 // Weights: the weight loader's tile layout (16 K x 64 N tiles of 512 bytes, `repack::pack_fp4`);
 // scales: (K/16, N) S0E5M3. One warp per 64-row N tile, K split over grid.y, slots over grid.z.
 // Lane L loads 16-byte vector L of each tile: rows base + {0,16,32,48}, base = (L/16)*8 + (L%16)/2,
@@ -321,6 +318,14 @@ extern "C" __global__ void __launch_bounds__(256)
   const int sbase = (lane >> 4) * 8 + ((lane & 15) >> 1);
   // x[kt*16 + 8h + 4(L%2) ..][..4] as 8-byte vector kt*4 + 2h + L%2.
   const uint2* xr = reinterpret_cast<const uint2*>(x + (size_t)slot * X_STRIDE) + (lane & 1);
+  // Row slot p's global scale: lane L holds rows nt*64 + L/2 + 16p (odd and even lanes alike).
+  const float* gs = gscale + (size_t)e * GS_STRIDE;
+  const int row0 = nt * 64 + (lane >> 1);
+  // With TILE_SEGMENTS one value (one register) serves all 4; Flash Next's gate/up took 68 registers
+  // with 4 distinct values and fit only 3 blocks per SM, so its 150 blocks ran in two waves.
+  float gp[4];
+#pragma unroll
+  for (int p = 0; p < 4; ++p) gp[p] = __ldg(gs + seg_col(TILE_SEGMENTS ? nt * 64 : row0 + 16 * p));
   float acc[4] = {0.f, 0.f, 0.f, 0.f};
   const int kt0 = split * KT_PER_SPLIT;
   // Software-pipelined in groups of U K tiles: every load of the group (U 16-byte weight vectors, their
@@ -352,16 +357,15 @@ extern "C" __global__ void __launch_bounds__(256)
       bf16x4_to_f32(xa[u][0], a[0]);
       bf16x4_to_f32(xa[u][1], a[1]);
       const unsigned wj[4] = {wv[u].x, wv[u].y, wv[u].z, wv[u].w};
-      // Row slot p's block scale as an f16x2 pair (S0E5M3 byte << 7 in both halves). Each E2M1 value is scaled in f16 before the
-      // activation multiply: the product is exact (|v| from 2^-10 to 6 x 448 = 2688, at most 6
-      // significant bits), and an activation near the BF16 limit cannot overflow f32 before a
-      // small scale applies.
-      unsigned s2[4];
+      // Row slot p's block scale times its global scale, applied to each E2M1 value before the
+      // activation multiply. The f32 accumulator then holds the row's output itself, so an
+      // activation near the BF16 limit overflows only when a single term of the output does, not
+      // before a small block or global scale applies.
+      float sg[4];
 #pragma unroll
       for (int p = 0; p < 4; ++p) {
         const unsigned word = __shfl_sync(0xffffffffu, sc[u], (sbase >> 2) + 4 * p);
-        const unsigned h = ((word >> (8 * (sbase & 3))) & 0xffu) << 7;
-        s2[p] = h | (h << 16);
+        sg[p] = s0e5m3_to_f32((word >> (8 * (sbase & 3))) & 0xffu) * gp[p];
       }
 #pragma unroll
       for (int j = 0; j < 4; ++j) {
@@ -371,21 +375,19 @@ extern "C" __global__ void __launch_bounds__(256)
         for (int b = 0; b < 4; ++b) {
           // Byte b of u32 j: row slot 2(j&1) + b/2, K values 4(L%2) + 2(j/2) + 8(b&1) + {0, 1}.
           const int p = 2 * (j & 1) + (b >> 1), c = 2 * (j >> 1);
-          const float2 f = f16x2_to_f32x2(hmul2_bits(h[b], s2[p]));
-          acc[p] = fmaf(f.y, a[b & 1][c + 1], fmaf(f.x, a[b & 1][c], acc[p]));
+          const float2 f = f16x2_to_f32x2(h[b]);
+          acc[p] = fmaf(f.y * sg[p], a[b & 1][c + 1], fmaf(f.x * sg[p], a[b & 1][c], acc[p]));
         }
       }
     }
   }
 #pragma unroll
   for (int p = 0; p < 4; ++p) acc[p] += __shfl_xor_sync(0xffffffffu, acc[p], 1);
-  const float* gs = gscale + (size_t)e * GS_STRIDE;
-  const int row0 = nt * 64 + (lane >> 1);  // an even lane's row slot p is row0 + 16p
   bf16* yr = y + (size_t)slot * N;
   if (SPLITS == 1) {
     if (!(lane & 1)) {
 #pragma unroll
-      for (int p = 0; p < 4; ++p) { const int r = row0 + 16 * p; yr[r] = __float2bfloat16(acc[p] * __ldg(gs + seg_col(r))); }
+      for (int p = 0; p < 4; ++p) { const int r = row0 + 16 * p; yr[r] = __float2bfloat16(acc[p]); }
     }
     return;
   }
@@ -419,7 +421,7 @@ extern "C" __global__ void __launch_bounds__(256)
     float sum = 0.f;
 #pragma unroll
     for (int q = 0; q < SPLITS; ++q) sum += __ldcg(part + (size_t)q * N + r);
-    yr[r] = __float2bfloat16(sum * __ldg(gs + seg_col(r)));
+    yr[r] = __float2bfloat16(sum);
   }
   if (lane == 0) *cnt = 0u;
 }
@@ -444,7 +446,8 @@ fn fp4_source(entry: &str, g: &crate::plan::GemvPlan, f: &crate::plan::Fp4Gemv) 
     fill(GEMV_FP4, &[("NS", format!("{entry}_ns")), ("ENTRY", entry.into()), ("N", g.n.to_string()), ("K", g.k.to_string()),
         ("SPLITS", f.splits.to_string()), ("KTPS", f.kt_per_split.to_string()), ("GROUPED", (f.experts > 0).to_string()),
         ("GS_STRIDE", f.gscale_stride.to_string()), ("X_STRIDE", f.x_stride.to_string()), ("ROW", row.into()), ("SEG", seg),
-        ("UNROLL", FP4_UNROLL.min(f.kt_per_split).to_string())])
+        ("UNROLL", FP4_UNROLL.min(f.kt_per_split).to_string()),
+        ("TILE_SEGMENTS", f.segments.iter().all(|s| s.end % crate::plan::FP4_TILE_N == 0).to_string())])
 }
 
 fn fp4_entry(entry: String, f: &crate::plan::Fp4Gemv) -> KernelEntry {
