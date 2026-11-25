@@ -121,7 +121,8 @@ no CUDA graph.
 
   Expert GEMVs are timed so that no expert is reread within 3x the L2; random expert draws from one table read
   up to 10% faster from L2 reuse. With 20 or 40 experts per launch the gate/up GEMV reads 228-234 GB/s, so about
-  3% of the 10-expert time is per-launch cost. The Llama 3.1 8B BF16 `gemv_lm_head` measured 242-246 GB/s.
+  3% of the 10-expert time is per-launch cost: the GPU-side drain and ramp at each kernel boundary, which a
+  CUDA graph does not remove (220-223 GB/s captured) and PDL should overlap. The Llama 3.1 8B BF16 `gemv_lm_head` measured 242-246 GB/s.
   Qwen3-30B-A3B in NVFP4 sums to 40.0 tok/s (ceiling 43.5), with its BF16 `lm_head` 2.6 ms of the 25 ms.
 
 ## Not supported yet (rejected or flagged, never silently wrong)

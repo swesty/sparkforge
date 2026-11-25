@@ -61,7 +61,7 @@ The kernel converts each weight byte with `cvt.rn.f16x2.e2m1x2` to an f16 pair, 
 
 Each lane needs 4 S0E5M3 bytes per K tile, one per row: `SF[kt*N + nt*64 + base_n + 16p]`.
 - **The read:** lane L loads one 4-byte word of the tile's 64 contiguous scale bytes, word `L % 16`. Its row slot p takes byte `base_n % 4` of lane `base_n / 4 + 4p`'s word, by `__shfl_sync`. That is one load and 4 shuffles instead of 4 single-byte loads.
-- **The decode:** `__half2float(__ushort_as_half(byte << 7))`, multiplied into the tile's partial dot before it is added to the row accumulator.
+- **The decode:** the byte shifted left by 7 is the scale's f16 bits. Each decoded E2M1 pair is multiplied by it in f16 (`mul.rn.f16x2`) before the activation multiply. The product is exact: its magnitude runs from 2^-10 to 6 x 448 = 2688, with at most 6 significant bits. Scaling after the activation multiply instead (the first version) overflowed f32 for an activation near the BF16 limit times a small scale (codex-review of #20). The change cost no measurable time.
 
 The decode is exact for every byte the repack emits:
 - normal E4M3 values;
@@ -148,7 +148,8 @@ Little's law sizes it. At 20 warps per SM, 4 loads in flight per lane is 40 KB p
   - **Explicit pipelining (decision 7):** gate/up rose from 211-212 to 221-222 GB/s.
   - **One scale word plus shuffles (decision 3):** gate/up reached 222-223 GB/s, down rose from 201-207 to 210, and Qwen3 gate/up reached 232.
   - **Rejected:** double buffering (217-218 GB/s), unroll 2 (215), 6 (203-220) and 8 (222, with Qwen3 `o_proj` down to 199).
-  - **More experts per launch:** at 20 and 40 experts the same kernel reads 228 and 227-234 GB/s. Its streaming rate is above 225 GB/s. At 10 experts (18.4 MB), a fixed per-launch cost of about 3% remains, measured as isolated back-to-back launches without PDL or a CUDA graph (both M5).
+  - **More experts per launch:** at 20 and 40 experts the same kernel reads 228 and 227-234 GB/s. Its streaming rate is above 225 GB/s. At 10 experts (18.4 MB), a fixed per-launch cost of about 3% remains.
+  - **Where the per-launch cost is (cycle 2):** in nsys, the median gate/up kernel lasts 81.3 µs (227 GB/s), with a 2.1 µs median gap between back-to-back launches. Timing the same 64 launches captured in one CUDA graph gave 220-223 GB/s, against 218-223 for separate launches, so the cost is the GPU-side drain and ramp at each kernel boundary, not CPU launch overhead. Overlapping one kernel's ramp with the previous one's drain needs PDL, which is M5.
 
 ### 8. Planner and codegen integration
 
@@ -177,7 +178,7 @@ Little's law sizes it. At 20 warps per SM, 4 loads in flight per lane is 40 KB p
 
 **Grouped inputs.** The check uses 2 x slots experts, read by ids `(step * s + 3) % copies`, which are distinct, unsorted and not contiguous.
 
-**Timing without L2 reuse.** `fp4::bench_sets` allocates enough banks (copies of the whole expert table) to hold 3 x L2 plus one launch. Launch i uses bank `i % banks` and the next `slots` ids of that bank's shuffled order. An expert copy recurs only after 3 x L2 bytes of other experts.
+**Timing without L2 reuse.** `fp4::bench_sets` cuts each bank's (copy's) shuffled expert order into `experts / slots` whole batches, so no batch wraps into the next. Launch i reads batch `(i / banks) % batches` of bank `i % banks`. An expert copy recurs after `banks * batches - 1` other launches, and `bench_banks` picks the fewest banks for which those launches read at least 3 x L2 bytes. Sizing banks by table capacity alone (the first version) let a 10-expert, 6-slot table reread 2 experts on consecutive launches.
 - **Why random draws were wrong:** independent random draws from one table let launches reuse experts that L2 still holds, in proportion to how much of the table L2 covers.
 - **Measured on Flash Next gate/up:** before the fix, it read 219 GB/s from all 512 experts, 245 from 128 and 342 from 32. With the fix, it reads 211-212 GB/s.
 - **Memory:** Flash Next needs one bank (0.94 GB for `expert_gate_up`).

@@ -273,8 +273,13 @@ __device__ __forceinline__ void e2m1x8_to_f16x2(unsigned w, unsigned& h0, unsign
       : "=r"(h0), "=r"(h1), "=r"(h2), "=r"(h3) : "r"(w));
 }
 __device__ __forceinline__ float2 f16x2_to_f32x2(unsigned h) { return __half22float2(*reinterpret_cast<const __half2*>(&h)); }
-// S0E5M3 scale byte -> the f16 with bits byte << 7 (exact for every byte the weight loader writes).
-__device__ __forceinline__ float s0e5m3_to_f32(unsigned b) { return __half2float(__ushort_as_half((unsigned short)(b << 7))); }
+// f16x2 product of two packed pairs (one HMUL2). A S0E5M3 scale byte is the f16 with bits byte << 7
+// (exact for every byte the weight loader writes).
+__device__ __forceinline__ unsigned hmul2_bits(unsigned a, unsigned b) {
+  unsigned r;
+  asm("mul.rn.f16x2 %0, %1, %2;" : "=r"(r) : "r"(a), "r"(b));
+  return r;
+}
 __device__ __forceinline__ void bf16x4_to_f32(uint2 v, float* f) {
   f[0] = __uint_as_float(v.x << 16); f[1] = __uint_as_float(v.x & 0xffff0000u);
   f[2] = __uint_as_float(v.y << 16); f[3] = __uint_as_float(v.y & 0xffff0000u);
@@ -347,7 +352,17 @@ extern "C" __global__ void __launch_bounds__(256)
       bf16x4_to_f32(xa[u][0], a[0]);
       bf16x4_to_f32(xa[u][1], a[1]);
       const unsigned wj[4] = {wv[u].x, wv[u].y, wv[u].z, wv[u].w};
-      float dot[4] = {0.f, 0.f, 0.f, 0.f};
+      // Row slot p's block scale as an f16x2 pair (S0E5M3 byte << 7 in both halves). Each E2M1 value is scaled in f16 before the
+      // activation multiply: the product is exact (|v| from 2^-10 to 6 x 448 = 2688, at most 6
+      // significant bits), and an activation near the BF16 limit cannot overflow f32 before a
+      // small scale applies.
+      unsigned s2[4];
+#pragma unroll
+      for (int p = 0; p < 4; ++p) {
+        const unsigned word = __shfl_sync(0xffffffffu, sc[u], (sbase >> 2) + 4 * p);
+        const unsigned h = ((word >> (8 * (sbase & 3))) & 0xffu) << 7;
+        s2[p] = h | (h << 16);
+      }
 #pragma unroll
       for (int j = 0; j < 4; ++j) {
         unsigned h[4];
@@ -355,15 +370,10 @@ extern "C" __global__ void __launch_bounds__(256)
 #pragma unroll
         for (int b = 0; b < 4; ++b) {
           // Byte b of u32 j: row slot 2(j&1) + b/2, K values 4(L%2) + 2(j/2) + 8(b&1) + {0, 1}.
-          const float2 f = f16x2_to_f32x2(h[b]);
           const int p = 2 * (j & 1) + (b >> 1), c = 2 * (j >> 1);
-          dot[p] = fmaf(f.y, a[b & 1][c + 1], fmaf(f.x, a[b & 1][c], dot[p]));
+          const float2 f = f16x2_to_f32x2(hmul2_bits(h[b], s2[p]));
+          acc[p] = fmaf(f.y, a[b & 1][c + 1], fmaf(f.x, a[b & 1][c], acc[p]));
         }
-      }
-#pragma unroll
-      for (int p = 0; p < 4; ++p) {
-        const unsigned word = __shfl_sync(0xffffffffu, sc[u], (sbase >> 2) + 4 * p);
-        acc[p] = fmaf(dot[p], s0e5m3_to_f32((word >> (8 * (sbase & 3))) & 0xffu), acc[p]);
       }
     }
   }

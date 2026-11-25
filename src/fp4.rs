@@ -39,6 +39,7 @@ pub fn segment_col(segments: &[Segment], row: u32) -> u32 {
 
 /// Random NVFP4 operands of one GEMV in checkpoint format, for `experts` copies (1 for a dense
 /// GEMV): `[E][n][k/2]` code bytes, `[E][n][k/16]` E4M3 scales and the global scale table.
+#[derive(Clone)]
 pub struct Operands {
     pub n: usize,
     pub k: usize,
@@ -51,6 +52,12 @@ pub struct Operands {
 
 /// The scale bytes every case carries at fixed positions: zero and the subnormals 2^-9 and 7 x 2^-9.
 pub const EDGE_SCALES: [u8; 3] = [0x00, 0x01, 0x07];
+
+/// The output row of every slot that `Operands::overflow_case` makes exact but overflow-prone.
+pub const OVERFLOW_ROW: usize = 1;
+
+/// The BF16 bits of the largest finite BF16 (about 3.39e38).
+pub const BF16_MAX: u16 = 0x7f7f;
 
 /// xorshift64 (the generator `verify` uses for its BF16 inputs).
 pub struct Rng(pub u64);
@@ -90,6 +97,27 @@ impl Operands {
         let copies = if g.gscale_stride > 0 { experts } else { 1 };
         let gscale = (0..copies).flat_map(|e| (0..cols).map(move |c| 0.75 * (c + 1) as f32 * (1.0 + (e % 7) as f32 / 16.0))).collect();
         Operands { n, k, experts, codes, scales, gscale }
+    }
+
+    /// A case where scaling an E2M1 value only after the activation multiply overflows f32: a copy of
+    /// these operands whose row `OVERFLOW_ROW` of every copy has code +6 at K 0 with scale byte 0x01
+    /// (2^-9), and BF16 activations that are `BF16_MAX` at each slot's K 0 and zero elsewhere. That
+    /// row's exact result, 6 x 2^-9 x 3.39e38 (about 4e36) times its global scale, fits in BF16;
+    /// 6 x 3.39e38 does not fit in f32. Other rows may overflow legitimately, so compare only that row.
+    pub fn overflow_case(&self, g: &Fp4Gemv, slots: usize) -> (Operands, Vec<u16>) {
+        let mut o = self.clone();
+        let (kh, ks) = (self.k / 2, self.k / 16);
+        for e in 0..self.experts {
+            o.scales[(e * self.n + OVERFLOW_ROW) * ks] = 0x01;
+            let c = &mut o.codes[(e * self.n + OVERFLOW_ROW) * kh];
+            *c = (*c & 0xf0) | 0x07;
+        }
+        let xs = g.x_stride as usize;
+        let mut x = vec![0u16; (slots - 1) * xs + self.k];
+        for s in 0..slots {
+            x[s * xs] = BF16_MAX;
+        }
+        (o, x)
     }
 
     /// The GPU operands: every copy's weights tile-packed and its scales as `(k/16, n)` S0E5M3, in
@@ -144,14 +172,16 @@ impl Operands {
 }
 
 /// Expert sets for timing a grouped GEMV from DRAM: `launches` sets of `slots` distinct ids, each
-/// with the bank it reads (an independent copy of the whole `experts`-entry table). Launch `i` uses
-/// bank `i % banks` and the next `slots` ids of that bank's shuffled order, so a (bank, expert) pair
-/// recurs only after every other pair of its bank has been read: at least 3 x L2 bytes plus one
-/// launch later, given `banks` from `bench_banks`. No launch is then served from L2 a recent one
-/// left behind (random draws from one table are, in proportion to how much of it L2 holds).
+/// with the bank it reads (an independent copy of the whole `experts`-entry table). Each bank's
+/// shuffled order is cut into `experts / slots` whole batches (no batch wraps around the table), and
+/// launch `i` reads batch `(i / banks) % batches` of bank `i % banks`. A (bank, expert) pair then
+/// recurs only after `banks * batches - 1` other launches, which `bench_banks` sizes to read at least
+/// 3 x L2 bytes, so no launch is served from L2 a recent one left behind (random draws from one table
+/// are, in proportion to how much of it L2 holds).
 pub fn bench_sets(experts: usize, slots: usize, bytes_one: usize, l2: usize, launches: usize, rng: &mut Rng) -> (usize, Vec<(usize, Vec<u32>)>) {
     assert!(slots >= 1 && slots <= experts, "{slots} slots of {experts} experts");
     let banks = bench_banks(experts, slots, bytes_one, l2);
+    let batches = experts / slots;
     let orders: Vec<Vec<u32>> = (0..banks).map(|_| {
         let mut o: Vec<u32> = (0..experts as u32).collect();
         for i in (1..o.len()).rev() {
@@ -159,18 +189,17 @@ pub fn bench_sets(experts: usize, slots: usize, bytes_one: usize, l2: usize, lau
         }
         o
     }).collect();
-    let mut cursor = vec![0usize; banks];
     let sets = (0..launches).map(|i| {
-        let b = i % banks;
-        let ids = (0..slots).map(|j| orders[b][(cursor[b] + j) % experts]).collect();
-        cursor[b] = (cursor[b] + slots) % experts;
-        (b, ids)
+        let (b, batch) = (i % banks, (i / banks) % batches);
+        (b, orders[b][batch * slots..(batch + 1) * slots].to_vec())
     }).collect();
     (banks, sets)
 }
 
-/// Copies of an `experts`-entry table (`bytes_one` per expert) needed so that the table copies
-/// together hold 3 x L2 plus one launch of `slots` experts.
+/// Copies of an `experts`-entry table (`bytes_one` per expert) that `bench_sets` rotates through:
+/// enough that the `banks * (experts / slots) - 1` launches between two reads of one expert copy
+/// read at least 3 x L2 bytes.
 pub fn bench_banks(experts: usize, slots: usize, bytes_one: usize, l2: usize) -> usize {
-    (3 * l2 + slots * bytes_one).div_ceil(experts * bytes_one).max(1)
+    let between = (3 * l2).div_ceil(slots * bytes_one);
+    (between + 1).div_ceil(experts / slots).max(1)
 }

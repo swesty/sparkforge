@@ -134,17 +134,16 @@ fn emulate(g: &Fp4Gemv, n: usize, k: usize, w: &[u8], sf: &[u8], gscale: &[f32],
                 for kt in kt0..(kt0 + g.kt_per_split as usize).min(k_tiles) {
                     for (lane, acc) in acc.iter_mut().enumerate() {
                         let at = ((kt * tiles + nt) * 32 + lane) * 16; // one 16-byte load
-                        let mut dot = [0f32; 4];
                         for j in 0..4 {
                             for b in 0..4 {
                                 let byte = w[at + 4 * j + b];
                                 let (p, kh) = lane_elem(lane, j, b);
                                 let kk = kt * 16 + 2 * kh;
-                                dot[p] += e2m1(byte & 0xf) as f32 * xv[kk] + e2m1(byte >> 4) as f32 * xv[kk + 1];
+                                // The kernel scales each value in f16 first (exact, so f32 here).
+                                let s = s0e5m3(sf[kt * n + nt * 64 + lane_row(lane, p)]);
+                                let (lo, hi) = (e2m1(byte & 0xf) as f32 * s, e2m1(byte >> 4) as f32 * s);
+                                acc[p] = hi.mul_add(xv[kk + 1], lo.mul_add(xv[kk], acc[p]));
                             }
-                        }
-                        for p in 0..4 {
-                            acc[p] += dot[p] * s0e5m3(sf[kt * n + nt * 64 + lane_row(lane, p)]);
                         }
                     }
                 }
@@ -219,11 +218,14 @@ fn a_one_expert_routed_down_projection_reads_the_down_scale() {
 fn benchmark_expert_sets_never_reuse_an_expert_within_3x_l2() {
     use sparkforge::fp4::{bench_banks, bench_sets};
     let l2 = 24 << 20;
-    // The reviewer's case: 8 experts of 1.99 MB, 2 slots. One table is 15.9 MB, under 3 x L2.
-    for (experts, slots, bytes) in [(8usize, 2usize, 1_990_656usize), (512, 10, 1_843_200), (128, 8, 1_769_472), (3, 3, 4_000_000)] {
+    // Reviewer cases: 8 experts of 1.99 MB with 2 slots (one table is 15.9 MB, under 3 x L2), and
+    // 10 experts of 18.9 MB with 6 slots (a second batch would wrap into the first). Then Flash
+    // Next, Qwen3-30B-A3B, and a table read whole by every launch.
+    for (experts, slots, bytes, want) in [(8usize, 2usize, 1_990_656usize, 5usize), (10, 6, 18_874_368, 2), (512, 10, 1_843_200, 1),
+        (128, 8, 1_769_472, 1), (3, 3, 4_000_000, 8)] {
         let (banks, sets) = bench_sets(experts, slots, bytes, l2, 300, &mut Rng(23));
         assert_eq!(banks, bench_banks(experts, slots, bytes, l2));
-        assert!(banks * experts * bytes >= 3 * l2 + slots * bytes, "{experts} experts: {banks} banks hold 3 x L2 plus a launch");
+        assert_eq!(banks, want, "{experts} experts, {slots} slots");
         let mut last: std::collections::HashMap<(usize, u32), usize> = Default::default();
         for (i, (b, ids)) in sets.iter().enumerate() {
             let mut d = ids.clone();
@@ -299,4 +301,27 @@ fn reference_decoders_cover_the_edge_scales() {
         assert_eq!(s0e5m3(e4m3_to_s0e5m3(b).unwrap()) as f64, sparkforge::fp4::e4m3(b), "{b:#04x}");
     }
     assert_eq!((0..16).map(e2m1).collect::<Vec<_>>(), [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0]);
+}
+
+#[test]
+fn a_bf16_max_activation_times_a_small_scale_stays_finite() {
+    use sparkforge::fp4::{OVERFLOW_ROW, BF16_MAX};
+    // Dense (S 2) and grouped down (2 slots, one x per slot): row 1 is code +6 x 2^-9 x 3.39e38.
+    let segs = vec![Segment { end: 128, col: 0 }];
+    let dense = gemv(2, 4, 1, 0, segs.clone(), 0, 0);
+    let grouped = gemv(1, 4, 2, 3, vec![Segment { end: 128, col: 2 }], 3, 64);
+    for (g, ids) in [(&dense, vec![]), (&grouped, vec![2u32, 0])] {
+        let ops = Operands::random(g, 128, 64, g.experts.max(1) as usize, &mut Rng(31));
+        let (big, x) = ops.overflow_case(g, g.slots as usize);
+        let (w, sf) = big.packed().unwrap();
+        let xf: Vec<f32> = x.iter().map(|&b| f32::from_bits((b as u32) << 16)).collect();
+        assert_eq!(xf[0], f32::from_bits((BF16_MAX as u32) << 16));
+        assert!(6.0 * xf[0] == f32::INFINITY, "the unscaled product overflows f32");
+        let r = big.reference(g, &ids, &xf.iter().map(|&v| v as f64).collect::<Vec<_>>()).unwrap();
+        let y = emulate(g, 128, 64, &w, &sf, &big.gscale, &ids, &xf);
+        for slot in 0..g.slots as usize {
+            let (got, want) = (y[slot * 128 + OVERFLOW_ROW] as f64, r[slot * 128 + OVERFLOW_ROW]);
+            assert!(got.is_finite() && (got - want).abs() <= want.abs() / 64.0, "slot {slot}: {got} vs {want}");
+        }
+    }
 }

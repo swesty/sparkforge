@@ -333,6 +333,24 @@ impl Ctx<'_> {
                 err = f64::INFINITY;
             }
         }
+        // An activation at the BF16 limit times a small block scale (`Operands::overflow_case`):
+        // row `OVERFLOW_ROW` of each slot must be finite and match the reference.
+        {
+            use crate::fp4::OVERFLOW_ROW;
+            let (big, bx) = ops.overflow_case(fp, slots);
+            let (bw, bsf) = big.packed()?;
+            let br = big.reference(fp, &ids, &bx.iter().map(|&v| bf2f(v) as f64).collect::<Vec<_>>())?;
+            let (dbw, dbsf, dbx) = (s.memcpy_stod(&bw)?, s.memcpy_stod(&bsf)?, s.memcpy_stod(&bx)?);
+            unsafe {
+                s.launch_builder(f).arg(&dbw).arg(&dbsf).arg(&dgs).arg(&did).arg(&dbx).arg(&mut dy).arg(&mut part).arg(&mut cnt)
+                    .launch(cfg(k.grid, k.block, k.dyn_smem))?
+            };
+            let out = to_f32(&s.memcpy_dtov(&dy)?);
+            let at: Vec<usize> = (0..slots).map(|sl| sl * n + OVERFLOW_ROW).collect();
+            let e = max_err(&at.iter().map(|&i| out[i]).collect::<Vec<_>>(), &at.iter().map(|&i| br[i]).collect::<Vec<_>>());
+            case += if e <= 1.0 / 64.0 { ", BF16-max activation finite" } else { ", BF16-MAX ACTIVATION WRONG" };
+            err = err.max(e);
+        }
         let dx = &dxs[0];
         if grouped {
             case += &format!(", experts {ids:?}");

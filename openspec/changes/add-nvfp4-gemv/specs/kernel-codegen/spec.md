@@ -49,7 +49,7 @@ SHALL include the plan, so two hybrid plans never share an output directory.
 
 ### Requirement: The NVFP4 GEMV computes a W4A16 product from the load-time tile layout
 
-An NVFP4 GEMV SHALL read weights in the tile layout of the weight loader (16 K x 64 N tiles of 512 bytes) and per-16 scales as S0E5M3 `(K/16, N)` bytes. Each output row SHALL be the f32 sum over K of E2M1 value times its decoded scale times the BF16 activation, multiplied by the row's global scale and rounded once to BF16. Activations SHALL NOT be quantized and no shared memory SHALL be used.
+An NVFP4 GEMV SHALL read weights in the tile layout of the weight loader (16 K x 64 N tiles of 512 bytes) and per-16 scales as S0E5M3 `(K/16, N)` bytes. Each output row SHALL be the f32 sum over K of E2M1 value times its decoded scale (an exact f16 product, formed before the activation multiply) times the BF16 activation, multiplied by the row's global scale and rounded once to BF16. Activations SHALL NOT be quantized and no shared memory SHALL be used.
 
 #### Scenario: Zero and subnormal scales
 - **WHEN** a weight's E4M3 scale bytes include 0x00 and the subnormals 0x01 and 0x07

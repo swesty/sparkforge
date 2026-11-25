@@ -15,7 +15,8 @@ pub struct Row {
 /// Sum of isolated kernel times for one decode token (no launch gaps, no graph). None if a kernel
 /// the token needs was not generated or not timed. An expert GEMV counts once per active expert,
 /// except a grouped one (NVFP4, one launch for every active expert), which counts once per layer. A
-/// shared expert adds its two GEMVs and one SiLU-and-multiply.
+/// shared expert adds its two GEMVs and one SiLU-and-multiply, and has no estimate when its width
+/// differs from the routed one (the only width `silu_mul` is generated at).
 pub fn token_estimate_us(p: &Plan, rows: &[Row]) -> Option<f64> {
     let t: HashMap<&str, f64> = rows.iter().filter_map(|r| Some((r.kernel.as_str(), r.us?))).collect();
     let g = |k: &str| t.get(k).copied();
@@ -33,8 +34,11 @@ pub fn token_estimate_us(p: &Plan, rows: &[Row]) -> Option<f64> {
                 + launches("expert_down", k) * g("gemv_expert_down")?;
             if e.shared_experts > 0 {
                 // The shared expert has its own SiLU-and-multiply between its GEMVs. `silu_mul` is
-                // generated at the routed width only; at batch 1 it is launch-bound (2-4 µs at any
-                // width measured), so its time stands in for the shared one.
+                // generated at the routed width only, so a shared expert of another width has no
+                // activation kernel yet, and the token cannot be estimated.
+                if e.shared_intermediate != e.expert_intermediate {
+                    return None;
+                }
                 layer += g("gemv_shared_gate_up")? + g("silu_mul")? + g("gemv_shared_down")?;
             }
         }

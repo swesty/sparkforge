@@ -31,6 +31,10 @@ SHALL omit the estimate when a required kernel was not generated.
 - **WHEN** `verify --bench` runs for Qwen3-30B-A3B with NVFP4 weights on a GB10
 - **THEN** the report includes a per-token estimate that counts `gemv_expert_gate_up` and `gemv_expert_down` once per layer
 
+#### Scenario: Shared expert without a fitting activation kernel
+- **WHEN** a MoE plan's shared expert is 4096 wide while `silu_mul` is generated at the routed width of 768
+- **THEN** the report omits the per-token estimate even when both shared GEMVs were timed
+
 ### Requirement: Verification refuses a model with no generated kernels
 
 `sparkforge verify` MUST fail with a message naming the model when its plan generates no kernels,
@@ -62,6 +66,10 @@ Each NVFP4 GEMV check SHALL include scale bytes 0x00, 0x01 and 0x07 and a distin
 - **WHEN** a kernel applied the gate global scale to the up rows
 - **THEN** the up rows' error exceeds 1/64, because the check's gate and up scales differ by a factor of 2
 
+#### Scenario: Activation at the BF16 limit
+- **WHEN** one row has code +6 with scale byte 0x01 at the only K position whose activation is nonzero, the largest finite BF16
+- **THEN** that row's output is finite and within 1/64 of the reference, about 4e36 times its global scale
+
 ### Requirement: Split-K NVFP4 GEMVs are checked for bitwise replay
 
 A split-K NVFP4 GEMV SHALL run on 4 activation vectors in turn, each checked against its own reference, on one workspace whose counters are never cleared. After 63 more launches, the first vector SHALL run again over a NaN-sentinel output, and the check SHALL fail unless that output is bitwise identical to its first.
@@ -72,7 +80,7 @@ A split-K NVFP4 GEMV SHALL run on 4 activation vectors in turn, each checked aga
 
 ### Requirement: Grouped NVFP4 GEMVs are timed without L2 reuse
 
-With `--bench`, a grouped NVFP4 GEMV SHALL be timed over enough copies of the whole expert table to hold 3 x L2 plus one launch, with each launch's distinct expert ids chosen so that no expert copy is read again within 3 x L2 bytes. The GB/s of any NVFP4 GEMV SHALL count the weight and scale bytes it reads: for a grouped GEMV, those of the active experts.
+With `--bench`, a grouped NVFP4 GEMV SHALL be timed over copies of the whole expert table, each launch reading distinct expert ids, with enough copies that the launches between two reads of one expert copy read at least 3 x L2 bytes. The GB/s of any NVFP4 GEMV SHALL count the weight and scale bytes it reads: for a grouped GEMV, those of the active experts.
 
 #### Scenario: Flash Next gate/up bandwidth
 - **WHEN** `verify --bench` runs for `configs/qwen3.8-flash-next-nvfp4.json` on a GB10
@@ -80,4 +88,8 @@ With `--bench`, a grouped NVFP4 GEMV SHALL be timed over enough copies of the wh
 
 #### Scenario: Small expert table
 - **WHEN** a grouped GEMV has 8 experts of 1,990,656 bytes and 2 slots
-- **THEN** the timing allocates 6 copies of the table, so no launch is served from L2 left by a recent one
+- **THEN** the timing allocates 5 copies of the table and reads each expert copy again only after 19 other launches (75.6 MB)
+
+#### Scenario: Batches that do not divide the table
+- **WHEN** a grouped GEMV has 10 experts of 18,874,368 bytes and 6 slots
+- **THEN** the timing allocates 2 copies of the table, and no expert is read by two consecutive launches
