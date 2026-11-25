@@ -9,6 +9,8 @@ pub mod config;
 pub mod inventory;
 pub mod modules;
 pub mod repack;
+pub mod fp4;
+pub mod estimate;
 pub mod load_plan;
 pub mod plan;
 pub mod target;

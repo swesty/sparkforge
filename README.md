@@ -44,7 +44,7 @@ that would otherwise be runtime heuristics.
 | `runtime.rs` | NVRTC compile for `sm_121a`, checks cc 12.1, loads every generated entry point via `cudarc`, opts kernels above 48 KB into larger dynamic smem. | Verified on GB10 |
 | `verify.rs` | Runs every generated kernel on random bf16 inputs, diffs against an f64 CPU reference, and optionally times it with weights rotated out of L2. `verify-weights` does the same on a real checkpoint. | Verified on GB10 |
 | `weights.rs`, `device_weights.rs` | Opens HF safetensors checkpoints (single file or sharded), validates every tensor against the plan, and copies each linear into GPU memory with q\|k\|v and gate\|up packed, behind a `MemAvailable` guard. Dense BF16 Llama-family only. | Verified on GB10 |
-| `inventory.rs` | Every tensor a Qwen3.8 Flash Next checkpoint must hold, with the dtype and shape of each module's format (BF16, MXFP8, NVFP4). `weights` checks all 301,593 tensors of the reference checkpoint against it; GPU loading of this layout is the next step. | Checked on GB10 (host only) |
+| `inventory.rs` | Every tensor a Qwen3.8 Flash Next checkpoint must hold, with the dtype and shape of each module's format (BF16, MXFP8, NVFP4). `weights` checks all 301,593 tensors of the reference checkpoint against it, and `load-weights` copies them into GPU memory. | Checked on GB10 (host only) |
 
 Generated kernels (all compile for `sm_121a` with NVRTC 13 and match the CPU reference; see "Measured on GB10"):
 
@@ -57,8 +57,13 @@ Generated kernels (all compile for `sm_121a` with NVRTC 13 and match the CPU ref
   `kv_heads × splits ≥ 2 × 48 SMs`.
 - `silu_mul` — fused SwiGLU on the fused gate/up output.
 - `gemv_<linear>` — one kernel per projection with its own N, K, rows-per-warp, and grid; weights streamed with evict-first loads.
+- `gemv_<linear>` for NVFP4 weights — BF16 activations against 4-bit weights (W4A16), reading the weight loader's
+  tile layout (FlashInfer's `GemvBf16Fp4Sm12x` design, re-derived for GB10): one `cvt.rn.f16x2.e2m1x2` per weight
+  byte, f32 accumulation, no shared memory. K is split across blocks until about 20 warps per SM are busy, and the
+  last split to finish each tile sums the partials in a fixed order in the same launch, so the result is bitwise
+  reproducible. Routed experts get one launch for all active experts, with expert ids read from the GPU.
 
-Planned (configs chosen, bodies TODO): prefill `mma.sync` GEMMs per linear, grouped MoE GEMM, W4A16 and NVFP4 decode GEMVs.
+Planned (configs chosen, bodies TODO): prefill `mma.sync` GEMMs per linear, grouped MoE prefill GEMM, W4A16 (AWQ/GPTQ) decode GEMVs.
 
 ## Usage
 
@@ -66,7 +71,7 @@ Planned (configs chosen, bodies TODO): prefill `mma.sync` GEMMs per linear, grou
 cargo build --release
 ./target/release/sparkforge plan configs/llama-3.1-8b.json
 ./target/release/sparkforge plan configs/qwen3-30b-a3b.json --format nvfp4 --ctx 65536
-./target/release/sparkforge plan configs/qwen3.8-flash-next-nvfp4.json   # hybrid: 34 op classes, 7.34 GB/token (planned only)
+./target/release/sparkforge plan configs/qwen3.8-flash-next-nvfp4.json   # hybrid: 34 op classes, 7.34 GB/token (the two NVFP4 expert GEMVs are generated)
 ./target/release/sparkforge emit /path/to/model/config.json --out build      # -> build/<hash>/{model.cu,gemm_tiles.cuh,plan.json,manifest.json}
 
 # On a Spark:
@@ -104,8 +109,18 @@ no CUDA graph.
   faster BF16 GEMV. Run-to-run variation was about 2%.
 - **ptxas (`-Xptxas -v`, nvcc 13.0):** `gemv_down_proj` at K=14336 spills 8 bytes; `attn_decode_split` with GQA
   group 8 uses exactly 128 registers, the `__launch_bounds__(256, 2)` cap, so group 16 would spill.
-- Small MoE GEMVs are latency-bound (`gemv_router` 95 GB/s; each expert GEMV is a separate launch), so one
-  launch covering all top-k experts is the obvious MoE decode fix.
+- Small MoE GEMVs are latency-bound (`gemv_router` 95 GB/s; each BF16 expert GEMV is a separate launch). The NVFP4
+  expert GEMVs cover all top-k experts in one launch.
+
+| NVFP4 GEMV (spark-5, CUDA 13.0, 2026-11-25) | Bytes per launch | Max error | µs | GB/s |
+|---|---|---|---|---|
+| Flash Next `gemv_expert_gate_up` (10 experts) | 18.4 MB | 3.6e-3 | 84.5 | 218 |
+| Flash Next `gemv_expert_down` (10 experts) | 9.2 MB | 3.8e-3 | 42.6 | 216 |
+| Qwen3-30B-A3B `gemv_expert_gate_up` (8 experts) | 14.2 MB | 3.7e-3 | 60.3 | 235 |
+| Qwen3-30B-A3B `gemv_expert_down` (8 experts) | 7.1 MB | 3.8e-3 | 28.5 | 249 |
+
+  The BF16 `gemv_lm_head` measured 238-239 GB/s in the same session. Qwen3-30B-A3B in NVFP4 sums to 40.0 tok/s
+  (ceiling 43.5), with its BF16 `lm_head` 2.6 ms of the 25 ms.
 
 ## Not supported yet (rejected or flagged, never silently wrong)
 
@@ -113,9 +128,10 @@ no CUDA graph.
   (`kv_lora_rank`, DeepSeek V2/V3); GPTQ/AWQ with per-channel scales (`group_size: -1`); modelopt quant
   algorithms other than NVFP4 and MIXED_PRECISION; any other `quant_method`; hybrid linear-attention models other
   than `qwen4_exp`; partial rotary on dense models. `--format` overrides the quantization check.
-- Planned, not generated: Qwen3.8 Flash Next (`qwen4_exp`). `plan` derives its op classes and byte budget; `emit`
-  lists every op as planned, and `verify` and `verify-weights` refuse it until its kernels and the GPU side of
-  the mixed-format loader exist. `weights` checks its checkpoint tensor by tensor.
+- Mostly planned: Qwen3.8 Flash Next (`qwen4_exp`). `plan` derives its op classes and byte budget. `emit`
+  generates its two NVFP4 routed-expert GEMVs and lists every other op as planned, and `verify` checks those two;
+  `verify-weights` refuses it. `weights` checks its checkpoint tensor by tensor, and `load-weights` copies it into
+  GPU memory.
 - Flagged in `plan` notes, output wrong until implemented: Qwen3 per-head q/k RMSNorm (`q_norm`/`k_norm`),
   q/k/v projection bias (Qwen2, `attention_bias: true`).
 - Also ignored today: sliding-window attention (Mistral v0.1) and DeepSeek-style dense-first layers.
@@ -130,8 +146,8 @@ Ordered by what moves tokens/s the most on GB10.
    Next: a scalar Rust reference forward pass to diff every layer against.
 2. **End-to-end BF16 decode** for one dense model using the existing kernels and a CUDA Graph per decode step
    (the launch count is fixed, so graph capture is simple). Measure against the roofline the planner prints.
-3. **Quantized decode GEMVs.** W4A16 (AWQ/GPTQ layouts) and NVFP4 (e2m1 + e4m3 per-16 scales) with dequant in
-   registers. This is the biggest decode win: 4× fewer bytes than BF16.
+3. **Quantized decode GEMVs.** NVFP4 (e2m1 + e4m3 per-16 scales) is done, dense and grouped. Next: W4A16
+   (AWQ/GPTQ layouts) and MXFP8 with dequant in registers.
 4. **Prefill GEMMs** from `gemm_tiles.cuh`: `ldmatrix` + `mma.sync.m16n8k16` BF16 with `cp.async`/TMA multistage
    pipelines, then `kind::mxf4nvf4.block_scale m16n8k64` for true W4A4 NVFP4 (needs activation quantization, so the
    FP4 tensor cores are actually used). Reference implementations: [sm121-kernels](https://github.com/blake-snc/sm121-kernels),

@@ -40,6 +40,21 @@ pub fn tile_byte(i: usize) -> usize {
     k_half * TILE_N + n
 }
 
+/// What the decode GEMV's lane `lane` finds in byte `b` of the `j`-th of the 4 `u32`s it loads from
+/// a tile (`u32`s `4 * lane .. 4 * lane + 4`): the row slot `s` (0..4) and the packed K row (0..8).
+/// The byte holds K values `2 * k_half` (low nibble) and `2 * k_half + 1` of tile row
+/// `lane_row(lane, s)`. The generated kernel (`codegen::GEMV_FP4`) spells out the same formulas; this
+/// is their host mirror, checked against `tile_byte` in `tests/repack.rs`.
+pub fn lane_elem(lane: usize, j: usize, b: usize) -> (usize, usize) {
+    (2 * (j & 1) + (b >> 1), 2 * (lane % 2) + (j >> 1) + 4 * (b & 1))
+}
+
+/// Tile row of lane `lane`'s row slot `slot`: `base + 16 * slot`, `base = (lane/16)*8 + (lane%16)/2`.
+/// Lanes `2i` and `2i + 1` share their 4 rows and hold complementary halves of each row's K.
+pub fn lane_row(lane: usize, slot: usize) -> usize {
+    (lane / 16) * 8 + (lane % 16) / 2 + 16 * slot
+}
+
 /// Whether an `n` x `k` NVFP4 matrix tiles into the GEMV layout.
 pub fn check_fp4_shape(n: usize, k: usize) -> Result<()> {
     ensure!(n % TILE_N == 0 && k % TILE_K == 0, "an NVFP4 matrix of {n} x {k} doesn't tile into {TILE_N} N x {TILE_K} K blocks");
