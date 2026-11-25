@@ -38,6 +38,39 @@ pub struct GemvPlan {
     pub grid: u32,
     pub smem_bytes: u32,
     pub est_us: f64,
+    /// The NVFP4 GEMV's split-K launch; `None` (and absent from the JSON) for a BF16 GEMV.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fp4: Option<Fp4Gemv>,
+}
+
+/// Rows `..end` (after the previous segment's end) take global scale column `col`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct Segment {
+    pub end: u32,
+    pub col: u32,
+}
+
+/// Launch of an NVFP4 decode GEMV (kernel-codegen `GEMV_FP4`): one 64-row N tile per warp, 8 warps
+/// per block, K split across `grid[1]`, routed-expert slots across `grid[2]`.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct Fp4Gemv {
+    /// K splits (S); each covers `kt_per_split` 16-element K tiles, the last possibly fewer.
+    pub splits: u32,
+    pub kt_per_split: u32,
+    /// Outputs computed per launch: the experts per token for a routed-expert linear, else 1.
+    pub slots: u32,
+    /// Expert copies the grouped buffers hold (0 for a dense GEMV, which reads one matrix).
+    pub experts: u32,
+    pub grid: [u32; 3],
+    /// f32 split partials (`slots x S x N`) and u32 arrival counters (`slots x N/64`); 0 when S = 1.
+    pub workspace_bytes: u64,
+    pub counter_bytes: u64,
+    /// Global-scale segments of the rows, in order; the last ends at N.
+    pub segments: Vec<Segment>,
+    /// Global scales per expert in the scale table (3 for the `[E, 3]` grouped table, 0 dense).
+    pub gscale_stride: u32,
+    /// Activation elements between slots: 0 when every slot reads one vector, K for one per slot.
+    pub x_stride: u32,
 }
 
 /// Prefill GEMM tile choice for mma.sync on SM121.
@@ -590,6 +623,77 @@ fn plan_gemv(l: &Linear, t: &Target) -> GemvPlan {
         linear: l.name.clone(), n: l.n, k: l.k, warps_per_block, rows_per_warp, grid,
         smem_bytes: l.k * 2, // bf16 activation vector staged once per block
         est_us: bytes / (t.dram_bw_effective_gbs * 1e3),
+        fp4: None,
+    }
+}
+
+/// Rows of an NVFP4 GEMV's N tile, and its warps per block (one tile per warp).
+pub const FP4_TILE_N: u32 = 64;
+pub const FP4_TILE_K: u32 = 16;
+pub const FP4_WARPS: u32 = 8;
+/// Busy warps per SM at which FlashInfer measured the streaming FP4 GEMV saturating DRAM
+/// (`_bf16_fp4_gemv_knee_split`): one 16-byte load per lane in flight at ~20 warps is ~10 KB per SM,
+/// above the 3-5 KB Little's law asks of GB10's LPDDR5X.
+pub const FP4_WARPS_PER_SM: u32 = 20;
+
+/// Whether `l` gets the NVFP4 GEMV: NVFP4 storage in whole 64 N x 16 K tiles.
+pub fn fp4_tiles(l: &Linear) -> bool {
+    matches!(l.format, WeightFormat::Nvfp4 | WeightFormat::Nvfp4WeightOnly) && l.n % FP4_TILE_N == 0 && l.k % FP4_TILE_K == 0 && l.n > 0 && l.k > 0
+}
+
+/// Whether `l` is a routed-expert linear (`expert_gate_up`, `expert_down`, or a format-split class
+/// of either), as opposed to a dense or shared-expert one.
+pub fn is_routed_expert(l: &Linear) -> bool {
+    l.name.starts_with("expert_gate_up") || l.name.starts_with("expert_down")
+}
+
+/// The checkpoint tensors stacked into an NVFP4 linear's rows, each with its own global scale: q, k,
+/// v for `qkv_proj`; gate, up for the fused gate/up projections. A grouped expert GEMV indexes the
+/// `[E, 3]` (gate, up, down) table of the weight loader, so its down projection uses column 2.
+fn fp4_segments(l: &Linear, m: &ModelSpec, grouped: bool) -> Vec<Segment> {
+    let (n, name) = (l.n, l.name.as_str());
+    if name == "qkv_proj" {
+        let (q, kv) = (m.q_dim(), m.kv_dim());
+        return vec![Segment { end: q, col: 0 }, Segment { end: q + kv, col: 1 }, Segment { end: n, col: 2 }];
+    }
+    if name == "gate_up_proj" || name.starts_with("expert_gate_up") || name.starts_with("shared_gate_up") {
+        return vec![Segment { end: n / 2, col: 0 }, Segment { end: n, col: 1 }];
+    }
+    let col = if grouped && name.starts_with("expert_down") { 2 } else { 0 };
+    vec![Segment { end: n, col }]
+}
+
+/// NVFP4 decode GEMV launch (kernel-planning "NVFP4 GEMVs split K until about 20 warps per SM are
+/// busy"). `l` must tile (`fp4_tiles`).
+pub fn plan_gemv_fp4(l: &Linear, m: &ModelSpec, t: &Target) -> GemvPlan {
+    // A routed-expert linear reads the loader's grouped buffers and `[E, 3]` scale table whatever
+    // the expert count, so its role decides the layout, not `copies > 1` (one stored expert is
+    // still grouped, codex-review of #20).
+    let grouped = is_routed_expert(l);
+    let slots = if grouped { l.active } else { 1 };
+    let (tiles, k_tiles) = (l.n / FP4_TILE_N, l.k / FP4_TILE_K);
+    let blocks_x = tiles.div_ceil(FP4_WARPS);
+    // One wave: the CTAs of 8 warps an SM holds at its thread limit (6 on GB10), with 5% headroom.
+    let ctas_per_sm = t.max_threads_per_sm / (FP4_WARPS * t.warp_size);
+    let cap = ((0.95 * (ctas_per_sm * t.sm_count) as f64 / (blocks_x * slots) as f64).floor() as u32).min(k_tiles / 4).max(1);
+    let knee = (FP4_WARPS_PER_SM * t.sm_count).div_ceil(tiles * slots);
+    let per = k_tiles.div_ceil(knee.min(cap).max(1));
+    let splits = k_tiles.div_ceil(per); // no split left empty
+    let (workspace_bytes, counter_bytes) = if splits > 1 {
+        (slots as u64 * splits as u64 * l.n as u64 * 4, slots as u64 * tiles as u64 * 4)
+    } else {
+        (0, 0)
+    };
+    let x_stride = if grouped && l.name.starts_with("expert_down") { l.k } else { 0 };
+    GemvPlan {
+        linear: l.name.clone(), n: l.n, k: l.k, warps_per_block: FP4_WARPS, rows_per_warp: FP4_TILE_N, grid: blocks_x,
+        smem_bytes: 0,
+        est_us: l.bytes_one() * l.active as f64 / (t.dram_bw_effective_gbs * 1e3),
+        fp4: Some(Fp4Gemv {
+            splits, kt_per_split: per, slots, experts: if grouped { l.copies } else { 0 },
+            grid: [blocks_x, splits, slots], workspace_bytes, counter_bytes,
+            segments: fp4_segments(l, m, grouped), gscale_stride: if grouped { 3 } else { 0 }, x_stride,
+        }),
     }
 }
 
@@ -697,7 +801,6 @@ pub fn build(m: &ModelSpec, t: &Target, o: &PlanOpts) -> Plan {
             let weights = linear_total - lm_resident + emb + ple_table + mtp_weight_bytes(m, h, &formats) + small;
             let fixed = h.count(LayerKind::LinearAttention) as f64 * (h.gdn.state_bytes() + h.gdn.conv_state_bytes()) as f64;
             let decode: f64 = ops.iter().map(|o| o.bytes_per_token).sum();
-            notes.push(format!("{}: every decode op in this plan is planned, not generated; kernels arrive with the milestone M2 tickets, and `emit`/`verify` produce no kernels for this model yet", m.arch));
             notes.push(format!("schedule: {} Gated DeltaNet + {} sparse-attention layers, {} HyperConnection mixers per token, PLE at layer(s) {:?}, {} MTP layer(s)",
                 h.count(LayerKind::LinearAttention), h.count(LayerKind::FullAttention), h.hc_mixers(), h.ple.layer_ids, h.mtp_layers));
             notes.push(format!("PLE table {:.1} GB counts as resident; kept on disk the weights are {:.1} GB", ple_table / 1e9, (weights - ple_table) / 1e9));
@@ -728,9 +831,18 @@ pub fn build(m: &ModelSpec, t: &Target, o: &PlanOpts) -> Plan {
     if m.hidden % 8 != 0 { notes.push("hidden not a multiple of 8; vectorized 16B loads disabled".into()); }
     if weight_bytes + kv > usable { notes.push("model + KV at requested ctx exceeds one Spark; plan tensor/pipeline parallel over ConnectX-7".into()); }
 
-    let mut gemv: Vec<GemvPlan> = ls.iter().map(|l| plan_gemv(l, t)).collect();
-    gemv.push(plan_gemv(&lm, t));
-    for g in gemv.iter().filter(|g| g.smem_bytes > t.smem_per_block_optin) {
+    let gemv_of = |l: &Linear| if fp4_tiles(l) { plan_gemv_fp4(l, m, t) } else { plan_gemv(l, t) };
+    let mut gemv: Vec<GemvPlan> = ls.iter().map(gemv_of).collect();
+    gemv.push(gemv_of(&lm));
+    if m.hybrid.is_some() {
+        let fp4: Vec<String> = gemv.iter().filter(|g| g.fp4.is_some()).map(|g| format!("gemv_{}", g.linear)).collect();
+        notes.insert(0, if fp4.is_empty() {
+            format!("{}: every decode op in this plan is planned, not generated; kernels arrive with the milestone M2 tickets, and `emit`/`verify` produce no kernels for this model yet", m.arch)
+        } else {
+            format!("{}: the NVFP4 GEMVs {} are generated; every other decode op is planned, not generated, until its milestone M2 ticket lands", m.arch, fp4.join(", "))
+        });
+    }
+    for g in gemv.iter().filter(|g| g.fp4.is_none() && g.smem_bytes > t.smem_per_block_optin) {
         notes.push(format!("gemv {} (K={}) needs {} B of shared memory for its activation vector, above the {} B per-block limit; it is not generated until a non-staged GEMV variant exists", g.linear, g.k, g.smem_bytes, t.smem_per_block_optin));
     }
     let mut gemm = vec![];

@@ -156,7 +156,12 @@ fn print_plan(p: &plan::Plan) {
         return;
     }
     println!("\nDecode GEMV (memory-bound):");
-    for g in &p.gemv { println!("  {:<16} N={:<6} K={:<6} warps/blk {} rows/warp {} grid {:<5} ~{:.1} us", g.linear, g.n, g.k, g.warps_per_block, g.rows_per_warp, g.grid, g.est_us); }
+    for g in &p.gemv {
+        match &g.fp4 {
+            None => println!("  {:<16} N={:<6} K={:<6} warps/blk {} rows/warp {} grid {:<5} ~{:.1} us", g.linear, g.n, g.k, g.warps_per_block, g.rows_per_warp, g.grid, g.est_us),
+            Some(f) => println!("  {:<16} N={:<6} K={:<6} NVFP4 split-K {} x {} K tiles, {} slot(s), grid {}x{}x{}  ~{:.1} us", g.linear, g.n, g.k, f.splits, f.kt_per_split, f.slots, f.grid[0], f.grid[1], f.grid[2], g.est_us),
+        }
+    }
     println!("\nPrefill GEMM tiles (mma.sync, smem <= {} B):", p.target.smem_per_block_optin);
     for t in &p.gemm { println!("  {:<16} M={:<5} N={:<6} K={:<6} tile {}x{}x{} stages {} warps {} smem {:>6} ctas/SM {} wave_eff {:.2}", t.linear, t.m, t.n, t.k, t.bm, t.bn, t.bk, t.stages, t.warps, t.smem_bytes, t.ctas_per_sm, t.wave_efficiency); }
     let a = &p.attn;

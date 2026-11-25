@@ -101,14 +101,46 @@ fn flash_next_plans_one_op_per_distinct_kernel() {
     assert!(p.gemm.is_empty(), "prefill tiles for MXFP8/NVFP4 are not planned yet");
 }
 
+/// Entries of a hybrid manifest that are generated, and the number of kernels in its source.
+fn generated(g: &codegen::Generated) -> (Vec<&str>, usize) {
+    let src: usize = g.files.iter().map(|(_, s)| s.matches("__global__").count()).sum();
+    (g.kernels.iter().filter(|k| k.status == "generated").map(|k| k.entry.as_str()).collect(), src)
+}
+
+/// The Flash Next config with every routed-expert entry in MXFP8 instead of NVFP4.
+fn mxfp8_experts() -> Value {
+    let mut v = raw();
+    for (k, e) in ql(&mut v).iter_mut() {
+        if k.ends_with(".mlp.experts") {
+            *e = json!({"quant_algo": "MXFP8", "group_size": 32});
+        }
+    }
+    v
+}
+
 #[test]
-fn flash_next_generates_no_kernels_yet() {
+fn flash_next_generates_only_its_nvfp4_expert_gemvs() {
     let p = plan_of(&spec_of(&raw()).unwrap());
     let g = codegen::generate(&p);
-    assert_eq!(g.kernels.len(), p.ops.len());
-    assert!(g.kernels.iter().all(|k| k.status == "planned"), "nothing may be generated for the hybrid layout yet");
-    assert!(g.files.iter().all(|(_, src)| !src.contains("__global__")), "planned entries have no CUDA source");
-    assert!(p.notes.iter().any(|n| n.contains("planned, not generated")));
+    assert_eq!(g.kernels.len(), p.ops.len(), "one manifest entry per op class");
+    assert_eq!(generated(&g), (vec!["gemv_expert_gate_up", "gemv_expert_down"], 2));
+    let up = g.kernels.iter().find(|k| k.entry == "gemv_expert_gate_up").unwrap();
+    assert_eq!((up.grid, up.block, up.dyn_smem), ([3, 5, 10], 256, 0));
+    // The fused gate/up rows take gate and up scales from the [E, 3] table; down reads column 2.
+    let src = &g.files[0].1;
+    assert!(src.contains("seg_col(int row) { return row < 640 ? 0 : 1; }"), "{src}");
+    assert!(src.contains("seg_col(int /*row*/) { return 2; }"));
+    assert!(src.contains("constexpr int GS_STRIDE = 3, X_STRIDE = 640;") && src.contains("constexpr int GS_STRIDE = 3, X_STRIDE = 0;"));
+    let note = p.notes.iter().find(|n| n.contains("planned, not generated")).unwrap();
+    assert!(note.contains("gemv_expert_gate_up, gemv_expert_down are generated"), "{note}");
+}
+
+#[test]
+fn a_hybrid_without_nvfp4_experts_generates_nothing() {
+    let p = plan_of(&spec_of(&mxfp8_experts()).unwrap());
+    let g = codegen::generate(&p);
+    assert_eq!(generated(&g), (vec![], 0));
+    assert!(p.notes.iter().any(|n| n.contains("every decode op in this plan is planned, not generated")), "{:#?}", p.notes);
 }
 
 #[test]
@@ -320,7 +352,7 @@ fn unplanned_hybrid_shapes_are_rejected_instead_of_mis_budgeted() {
 }
 
 #[test]
-fn a_qwen4_exp_variant_without_linear_attention_stays_planned_only() {
+fn a_qwen4_exp_variant_without_linear_attention_generates_only_its_expert_gemvs() {
     let mut v = raw();
     let n = v["text_config"]["layer_types"].as_array().unwrap().len();
     v["text_config"]["layer_types"] = json!(vec!["full_attention"; n]);
@@ -328,7 +360,7 @@ fn a_qwen4_exp_variant_without_linear_attention_stays_planned_only() {
     let p = plan_of(&spec_of(&v).unwrap());
     assert!(p.model.hybrid.is_some(), "qwen4_exp keeps its HyperConnection, PLE and gated attention");
     let g = codegen::generate(&p);
-    assert!(g.kernels.iter().all(|k| k.status == "planned") && g.files.iter().all(|(_, s)| !s.contains("__global__")));
+    assert_eq!(generated(&g), (vec!["gemv_expert_gate_up", "gemv_expert_down"], 2), "only the NVFP4 expert GEMVs have kernels");
     let mut v = raw();
     v["text_config"].as_object_mut().unwrap().remove("layer_types");
     assert!(format!("{:#}", spec_of(&v).unwrap_err()).contains("missing layer_types"));
@@ -378,11 +410,12 @@ fn formats_the_planner_cannot_honor_are_rejected() {
 #[test]
 fn a_planned_only_model_is_refused_before_any_cuda_call() {
     // `require_generated` is host-only; `verify` calls it before creating the CUDA engine.
-    let g = codegen::generate(&plan_of(&spec_of(&raw()).unwrap()));
+    let g = codegen::generate(&plan_of(&spec_of(&mxfp8_experts()).unwrap()));
     let err = format!("{:#}", codegen::require_generated(&g, "Qwen4ExpForConditionalGeneration").unwrap_err());
     assert!(err.contains("Qwen4ExpForConditionalGeneration") && err.contains("no kernels are generated"), "{err}");
     let llama = ModelSpec::from_json(&std::fs::read_to_string("configs/llama-3.1-8b.json").unwrap(), None).unwrap();
     assert!(codegen::require_generated(&codegen::generate(&plan_of(&llama)), "llama").is_ok());
+    assert!(codegen::require_generated(&codegen::generate(&plan_of(&spec_of(&raw()).unwrap())), "flash next").is_ok(), "its expert GEMVs are generated");
 }
 
 #[test]
@@ -420,7 +453,7 @@ fn the_top_level_model_type_identifies_qwen4_exp() {
     v["text_config"].as_object_mut().unwrap().remove("model_type");
     let p = plan_of(&spec_of(&v).unwrap());
     assert!(p.model.hybrid.is_some());
-    assert!(codegen::generate(&p).kernels.iter().all(|k| k.status == "planned"));
+    assert_eq!(generated(&codegen::generate(&p)).0, ["gemv_expert_gate_up", "gemv_expert_down"]);
 }
 
 #[test]
@@ -932,4 +965,17 @@ fn a_module_kept_inside_an_expert_is_refused_on_resolve() {
     ql(&mut v).insert(obs.into(), json!({"quant_algo": "NVFP4", "group_size": 16}));
     let err = format!("{:#}", resolved_with(&v, &[&format!("{obs}.weight")]).unwrap_err());
     assert!(err.contains("layers.0.mlp.experts.0.observer") && err.contains("doesn't price"), "{err}");
+}
+
+#[test]
+fn flash_next_expert_gemvs_get_split_k_plans() {
+    let p = plan_of(&spec_of(&raw()).unwrap());
+    let g = |l: &str| p.gemv.iter().find(|g| g.linear == l).and_then(|g| g.fp4.clone()).unwrap();
+    let gu = g("expert_gate_up");
+    assert_eq!((gu.splits, gu.grid, gu.workspace_bytes, gu.counter_bytes), (5, [3, 5, 10], 256_000, 800));
+    let d = g("expert_down");
+    assert_eq!((d.splits, d.grid), (3, [5, 3, 10]));
+    // Only the NVFP4 experts get the FP4 GEMV; the MXFP8 and BF16 linears do not.
+    assert!(p.gemv.iter().filter(|g| g.fp4.is_some()).all(|g| g.linear.starts_with("expert_")), "{:?}",
+        p.gemv.iter().filter(|g| g.fp4.is_some()).map(|g| &g.linear).collect::<Vec<_>>());
 }

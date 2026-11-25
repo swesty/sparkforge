@@ -10,7 +10,6 @@ use crate::runtime::Engine;
 use anyhow::{Context, Result};
 use cudarc::driver::sys::CUevent_flags;
 use cudarc::driver::{CudaFunction, CudaStream, LaunchConfig, PushKernelArg};
-use std::collections::HashMap;
 use std::sync::Arc;
 
 pub const TOL: f64 = 1.0 / 64.0;
@@ -21,6 +20,10 @@ pub fn f2bf(x: f32) -> u16 {
 }
 pub fn bf2f(h: u16) -> f32 {
     f32::from_bits((h as u32) << 16)
+}
+
+fn gcd(a: usize, b: usize) -> usize {
+    if b == 0 { a } else { gcd(b, a % b) }
 }
 
 struct Rng(u64);
@@ -52,13 +55,7 @@ pub fn max_err(gpu: &[f32], r: &[f64]) -> f64 {
         .fold(0.0, f64::max)
 }
 
-pub struct Row {
-    pub kernel: String,
-    pub case: String,
-    pub err: f64,
-    pub us: Option<f64>,
-    pub gbs: Option<f64>,
-}
+pub use crate::estimate::{token_estimate_us, Row};
 
 pub struct Opts {
     pub bench: bool,
@@ -272,12 +269,164 @@ impl Ctx<'_> {
         Ok(())
     }
 
+    /// One NVFP4 GEMV (gpu-verification: checkpoint-format inputs against an independent f64
+    /// reference, edge scales, distinct segment scales, unordered expert ids, bitwise replay), then
+    /// with `--bench` its timing over DRAM-resident weights.
+    fn fp4_gemv(&mut self, entry: &str, gp: &crate::plan::GemvPlan, fp: &crate::plan::Fp4Gemv, k: &KernelEntry, f: &CudaFunction) -> Result<()> {
+        use crate::fp4::{Operands, Rng as FpRng};
+        let s = self.e.stream.clone();
+        let (n, kk, slots, splits) = (gp.n as usize, gp.k as usize, fp.slots as usize, fp.splits as usize);
+        let grouped = fp.experts > 0;
+        // Twice the slots in copies, read by distinct ids that are neither contiguous nor sorted:
+        // slot s reads (step * s + 3) % copies, with step odd, >= 7 and coprime with copies.
+        let copies = if grouped { (2 * slots).min(fp.experts as usize) } else { 1 };
+        let step = (7..).step_by(2).find(|&st| gcd(st, copies) == 1).unwrap_or(1);
+        let ids: Vec<u32> = if grouped { (0..slots).map(|i| ((step * i + 3) % copies) as u32).collect() } else { vec![] };
+        let mut frng = FpRng(self.rng.next() | 1);
+        let ops = Operands::random(fp, n, kk, copies, &mut frng);
+        let (w, sf) = ops.packed()?;
+        // Several activation vectors, each checked against its own reference on the same workspace
+        // and counters (no clearing between launches), so a stale partial or counter shows up as a
+        // wrong round, not only as a replay mismatch.
+        const ROUNDS: usize = 4;
+        let xs: Vec<Vec<u16>> = (0..ROUNDS).map(|_| self.rng.bf16((slots - 1) * fp.x_stride as usize + kk)).collect();
+        let refs = xs.iter().map(|x| ops.reference(fp, &ids, &x.iter().map(|&v| bf2f(v) as f64).collect::<Vec<_>>())).collect::<Result<Vec<_>>>()?;
+        let tiles = n / crate::plan::FP4_TILE_N as usize;
+        let (dw, dsf, dgs) = (s.memcpy_stod(&w)?, s.memcpy_stod(&sf)?, s.memcpy_stod(&ops.gscale)?);
+        let ids_i32: Vec<i32> = if grouped { ids.iter().map(|&i| i as i32).collect() } else { vec![0] };
+        let did = s.memcpy_stod(&ids_i32)?;
+        let dxs = xs.iter().map(|x| s.memcpy_stod(x)).collect::<Result<Vec<_>, _>>()?;
+        let mut dy = s.alloc_zeros::<u16>(slots * n)?;
+        // Zeroed once: the last split of each tile resets its counter, so no clearing between launches.
+        let mut part = s.alloc_zeros::<f32>((slots * splits * n).max(1))?;
+        let mut cnt = s.alloc_zeros::<u32>((slots * tiles).max(1))?;
+        let launch = |dx: &cudarc::driver::CudaSlice<u16>, dy: &mut cudarc::driver::CudaSlice<u16>, part: &mut cudarc::driver::CudaSlice<f32>, cnt: &mut cudarc::driver::CudaSlice<u32>| -> Result<()> {
+            unsafe {
+                s.launch_builder(f).arg(&dw).arg(&dsf).arg(&dgs).arg(&did).arg(dx).arg(&mut *dy).arg(&mut *part).arg(&mut *cnt)
+                    .launch(cfg(k.grid, k.block, k.dyn_smem))?
+            };
+            Ok(())
+        };
+        let mut err = 0f64;
+        let mut first = vec![];
+        for (r, dx) in dxs.iter().enumerate() {
+            launch(dx, &mut dy, &mut part, &mut cnt)?;
+            let out = s.memcpy_dtov(&dy)?;
+            err = err.max(max_err(&to_f32(&out), &refs[r]));
+            if r == 0 {
+                first = out;
+            }
+        }
+        let mut case = format!("N {n} K {kk}, {splits} split(s), {slots} slot(s), {ROUNDS} inputs");
+        if splits > 1 {
+            // 63 more launches alternating the inputs, then the first input once more over a NaN
+            // sentinel: a split that never writes (a stale counter) or a stale partial cannot pass.
+            for i in 0..63 {
+                launch(&dxs[1 + i % (ROUNDS - 1)], &mut dy, &mut part, &mut cnt)?;
+            }
+            s.memcpy_htod(&vec![0xffffu16; slots * n], &mut dy)?;
+            launch(&dxs[0], &mut dy, &mut part, &mut cnt)?;
+            let again = s.memcpy_dtov(&dy)?;
+            let same = first == again;
+            case += if same { ", replay bitwise identical" } else { ", REPLAY DIFFERS" };
+            if !same {
+                err = f64::INFINITY;
+            }
+        }
+        // An activation at the BF16 limit times a small block scale (`Operands::overflow_case`):
+        // the rows `OVERFLOW_ROWS` of each slot must be finite and match the reference.
+        {
+            use crate::fp4::OVERFLOW_ROWS;
+            let (big, bx) = ops.overflow_case(fp, slots);
+            let (bw, bsf) = big.packed()?;
+            let br = big.reference(fp, &ids, &bx.iter().map(|&v| bf2f(v) as f64).collect::<Vec<_>>())?;
+            let (dbw, dbsf, dbx, dbgs) = (s.memcpy_stod(&bw)?, s.memcpy_stod(&bsf)?, s.memcpy_stod(&bx)?, s.memcpy_stod(&big.gscale)?);
+            unsafe {
+                s.launch_builder(f).arg(&dbw).arg(&dbsf).arg(&dbgs).arg(&did).arg(&dbx).arg(&mut dy).arg(&mut part).arg(&mut cnt)
+                    .launch(cfg(k.grid, k.block, k.dyn_smem))?
+            };
+            let out = to_f32(&s.memcpy_dtov(&dy)?);
+            let at: Vec<usize> = (0..slots).flat_map(|sl| OVERFLOW_ROWS.map(|r| sl * n + r)).collect();
+            let e = max_err(&at.iter().map(|&i| out[i]).collect::<Vec<_>>(), &at.iter().map(|&i| br[i]).collect::<Vec<_>>());
+            case += if e <= 1.0 / 64.0 { ", BF16-max activation finite" } else { ", BF16-MAX ACTIVATION WRONG" };
+            err = err.max(e);
+        }
+        let dx = &dxs[0];
+        if grouped {
+            case += &format!(", experts {ids:?}");
+        }
+        drop((dw, dsf));
+        let bytes_one = n * kk / 2 + n * kk / 16;
+        let us = if self.o.bench { Some(self.fp4_time(fp, k, f, n, kk, bytes_one, dx)?) } else { None };
+        self.push(entry, case, err, us, (bytes_one * slots) as f64);
+        Ok(())
+    }
+
+    /// Times an NVFP4 GEMV over weights that cannot sit in L2: a grouped one over banks of the whole
+    /// expert table with each launch's experts unread for the last 3 x L2 bytes, a dense one rotating
+    /// through enough copies to make 3 x L2. Weights are zero: the time does not depend on them.
+    #[allow(clippy::too_many_arguments)]
+    fn fp4_time(&mut self, fp: &crate::plan::Fp4Gemv, k: &KernelEntry, f: &CudaFunction, n: usize, kk: usize, bytes_one: usize,
+        dx: &cudarc::driver::CudaSlice<u16>) -> Result<f64> {
+        let s = self.e.stream.clone();
+        let (slots, splits) = (fp.slots as usize, fp.splits as usize);
+        let tiles = n / crate::plan::FP4_TILE_N as usize;
+        let l2 = self.p.target.l2_bytes as usize;
+        let iters = 64usize;
+        // Grouped: banks of the whole expert table, each launch's experts disjoint from every launch
+        // in the last 3 x L2 bytes (`fp4::bench_sets`). Dense: enough copies to make 3 x L2.
+        let experts = fp.experts as usize;
+        let (banks, sets) = if experts > 0 {
+            crate::fp4::bench_sets(experts, slots, bytes_one, l2, iters, &mut crate::fp4::Rng(self.rng.next() | 1))
+        } else {
+            (0, vec![])
+        };
+        let copies = if experts > 0 { banks * experts } else if bytes_one < 3 * l2 { (3 * l2).div_ceil(bytes_one) } else { 1 };
+        let (wb, sb) = (n * kk / 2, n * kk / 16);
+        let dw = s.alloc_zeros::<u8>(copies * wb)?;
+        let dsf = s.alloc_zeros::<u8>(copies * sb)?;
+        let dgs = s.alloc_zeros::<f32>(copies.max(1) * 3)?;
+        let mut dy = s.alloc_zeros::<u16>(slots * n)?;
+        let mut part = s.alloc_zeros::<f32>((slots * splits * n).max(1))?;
+        let mut cnt = s.alloc_zeros::<u32>((slots * tiles).max(1))?;
+        if experts > 0 {
+            let flat: Vec<i32> = sets.iter().flat_map(|(_, ids)| ids.iter().map(|&i| i as i32)).collect();
+            let dsets = s.memcpy_stod(&flat)?;
+            time_us(&s, iters as u32, |i| {
+                let i = i as usize % iters;
+                let b = sets[i].0;
+                let ids = dsets.slice(i * slots..(i + 1) * slots);
+                let (w, sf) = (dw.slice(b * experts * wb..(b + 1) * experts * wb), dsf.slice(b * experts * sb..(b + 1) * experts * sb));
+                unsafe {
+                    s.launch_builder(f).arg(&w).arg(&sf).arg(&dgs).arg(&ids).arg(dx).arg(&mut dy).arg(&mut part).arg(&mut cnt)
+                        .launch(cfg(k.grid, k.block, k.dyn_smem))?
+                };
+                Ok(())
+            })
+        } else {
+            let did = s.alloc_zeros::<i32>(1)?;
+            time_us(&s, 30.max(copies as u32), |i| {
+                let c = i as usize % copies;
+                let (w, sf) = (dw.slice(c * wb..(c + 1) * wb), dsf.slice(c * sb..(c + 1) * sb));
+                unsafe {
+                    s.launch_builder(f).arg(&w).arg(&sf).arg(&dgs).arg(&did).arg(dx).arg(&mut dy).arg(&mut part).arg(&mut cnt)
+                        .launch(cfg(k.grid, k.block, k.dyn_smem))?
+                };
+                Ok(())
+            })
+        }
+    }
+
     fn gemvs(&mut self) -> Result<()> {
         let s = self.e.stream.clone();
         let l2 = self.p.target.l2_bytes as usize;
         for gp in self.p.gemv.clone() {
             let entry = format!("gemv_{}", gp.linear);
             let Some((k, f)) = kernel(self.g, self.e, &entry) else { continue };
+            if let Some(fp) = &gp.fp4 {
+                self.fp4_gemv(&entry, &gp, fp, k, f)?;
+                continue;
+            }
             let (n, kk) = (gp.n as usize, gp.k as usize);
             let w = self.rng.bf16(n * kk);
             let x = self.rng.bf16(kk);
@@ -332,24 +481,6 @@ pub fn run(p: &Plan, g: &Generated, e: &Engine, o: &Opts) -> Result<Vec<Row>> {
     c.silu().context("silu_mul")?;
     c.gemvs().context("gemv")?;
     Ok(c.rows)
-}
-
-/// Sum of isolated kernel times for one decode token (no launch gaps, no graph). None if a
-/// kernel the token needs was not generated or not timed.
-pub fn token_estimate_us(p: &Plan, rows: &[Row]) -> Option<f64> {
-    let t: HashMap<&str, f64> = rows.iter().filter_map(|r| Some((r.kernel.as_str(), r.us?))).collect();
-    let g = |k: &str| t.get(k).copied();
-    let mut layer = 2.0 * g("rmsnorm")? + g("gemv_qkv_proj")? + g("rope_kv_append")? + g("attn_decode (split+combine)")? + g("gemv_o_proj")?;
-    match &p.model.moe {
-        None => layer += g("gemv_gate_up_proj")? + g("silu_mul")? + g("gemv_down_proj")?,
-        Some(e) => {
-            layer += g("gemv_router")? + e.experts_per_tok as f64 * (g("gemv_expert_gate_up")? + g("silu_mul")? + g("gemv_expert_down")?);
-            if e.shared_experts > 0 {
-                layer += g("gemv_shared_gate_up")? + g("gemv_shared_down")?;
-            }
-        }
-    }
-    Some(p.model.layers as f64 * layer + g("rmsnorm")? + g("gemv_lm_head")?)
 }
 
 /// One `verify-weights` result row.

@@ -263,6 +263,197 @@ extern "C" __global__ void __launch_bounds__(@NS@::WARPS * 32)
 }
 "#;
 
+const FP4_HELPERS: &str = r#"
+#include <cuda_fp16.h>
+// NVFP4 helpers (GEMV_FP4). One cvt per byte: two E2M1 codes (low nibble first) to an f16 pair.
+__device__ __forceinline__ void e2m1x8_to_f16x2(unsigned w, unsigned& h0, unsigned& h1, unsigned& h2, unsigned& h3) {
+  asm("{\n .reg .b8 b0, b1, b2, b3;\n mov.b32 {b0, b1, b2, b3}, %4;\n"
+      " cvt.rn.f16x2.e2m1x2 %0, b0;\n cvt.rn.f16x2.e2m1x2 %1, b1;\n"
+      " cvt.rn.f16x2.e2m1x2 %2, b2;\n cvt.rn.f16x2.e2m1x2 %3, b3;\n}"
+      : "=r"(h0), "=r"(h1), "=r"(h2), "=r"(h3) : "r"(w));
+}
+__device__ __forceinline__ float2 f16x2_to_f32x2(unsigned h) { return __half22float2(*reinterpret_cast<const __half2*>(&h)); }
+// S0E5M3 scale byte -> the f16 with bits byte << 7 (exact for every byte the weight loader writes).
+__device__ __forceinline__ float s0e5m3_to_f32(unsigned b) { return __half2float(__ushort_as_half((unsigned short)(b << 7))); }
+__device__ __forceinline__ void bf16x4_to_f32(uint2 v, float* f) {
+  f[0] = __uint_as_float(v.x << 16); f[1] = __uint_as_float(v.x & 0xffff0000u);
+  f[2] = __uint_as_float(v.y << 16); f[3] = __uint_as_float(v.y & 0xffff0000u);
+}
+"#;
+
+const GEMV_FP4: &str = r#"
+namespace @NS@ {
+constexpr int N = @N@, K = @K@, SPLITS = @SPLITS@, KT_PER_SPLIT = @KTPS@;
+constexpr int K_TILES = K / 16, N_TILES = N / 64;
+constexpr bool GROUPED = @GROUPED@, TAIL = SPLITS * KT_PER_SPLIT != K_TILES;
+constexpr size_t W_EXPERT = (size_t)N * K / 32;   // 16-byte vectors per expert
+constexpr size_t SF_EXPERT = (size_t)N * K / 16;  // scale bytes per expert
+constexpr int GS_STRIDE = @GS_STRIDE@, X_STRIDE = @X_STRIDE@;
+// Every segment boundary is a multiple of 64, so each warp's 64-row tile has one global scale.
+constexpr bool TILE_SEGMENTS = @TILE_SEGMENTS@;
+static_assert(N % 64 == 0 && K % 16 == 0, "NVFP4 GEMV tiles are 64 N x 16 K");
+static_assert((SPLITS - 1) * KT_PER_SPLIT < K_TILES && SPLITS * KT_PER_SPLIT >= K_TILES, "every split holds K tiles");
+static_assert(X_STRIDE % 4 == 0, "activation rows must allow 8-byte loads");
+// Global-scale column of output row `row` (the checkpoint tensor stacked at that row).
+__device__ __forceinline__ int seg_col(int @ROW@) { return @SEG@; }
+}
+// NVFP4 x BF16 decode GEMV (W4A16), y[slot][N] = sum_k (e2m1 * scale * gscale(row)) * x[k].
+// Weights: the weight loader's tile layout (16 K x 64 N tiles of 512 bytes, `repack::pack_fp4`);
+// scales: (K/16, N) S0E5M3. One warp per 64-row N tile, K split over grid.y, slots over grid.z.
+// Lane L loads 16-byte vector L of each tile: rows base + {0,16,32,48}, base = (L/16)*8 + (L%16)/2,
+// and of each row the 8 K values its xor-1 partner does not hold (`repack::lane_elem`).
+extern "C" __global__ void __launch_bounds__(256)
+@ENTRY@(const uint4* __restrict__ W, const unsigned char* __restrict__ SF, const float* __restrict__ gscale,
+        const int* __restrict__ experts, const bf16* __restrict__ x, bf16* __restrict__ y,
+        float* __restrict__ partial, unsigned* __restrict__ count) {
+  using namespace @NS@;
+  const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+  const int nt = blockIdx.x * 8 + warp, split = blockIdx.y, slot = blockIdx.z;
+  if (nt >= N_TILES) return;  // no shared memory or block-wide sync, so a warp without a tile may leave
+  const int e = GROUPED ? __ldg(experts + slot) : 0;
+  const uint4* w = W + (size_t)e * W_EXPERT + (size_t)nt * 32 + lane;
+  // Scales: lane L loads bytes 4(L%16) .. +3 of each tile's 64 (one 4-byte load), and lane L's row
+  // slot p reads byte (base + 16p) % 4 of lane (base + 16p) / 4's word by shuffle.
+  const unsigned* sf = reinterpret_cast<const unsigned*>(SF + (size_t)e * SF_EXPERT + nt * 64) + (lane & 15);
+  const int sbase = (lane >> 4) * 8 + ((lane & 15) >> 1);
+  // x[kt*16 + 8h + 4(L%2) ..][..4] as 8-byte vector kt*4 + 2h + L%2.
+  const uint2* xr = reinterpret_cast<const uint2*>(x + (size_t)slot * X_STRIDE) + (lane & 1);
+  // Row slot p's global scale: lane L holds rows nt*64 + L/2 + 16p (odd and even lanes alike).
+  const float* gs = gscale + (size_t)e * GS_STRIDE;
+  const int row0 = nt * 64 + (lane >> 1);
+  // With TILE_SEGMENTS one value (one register) serves all 4; Flash Next's gate/up took 68 registers
+  // with 4 distinct values and fit only 3 blocks per SM, so its 150 blocks ran in two waves.
+  float gp[4];
+#pragma unroll
+  for (int p = 0; p < 4; ++p) gp[p] = __ldg(gs + seg_col(TILE_SEGMENTS ? nt * 64 : row0 + 16 * p));
+  float acc[4] = {0.f, 0.f, 0.f, 0.f};
+  const int kt0 = split * KT_PER_SPLIT;
+  // Software-pipelined in groups of U K tiles: every load of the group (U 16-byte weight vectors, their
+  // activations and 4U scale bytes) is issued before any math, so each lane has U weight loads in
+  // flight. Left to itself the compiler issued one weight load per tile and the scale loads after the
+  // FMAs, a second exposed latency per tile (SASS of the first version; ncu: 90% scoreboard stalls).
+  constexpr int U = @UNROLL@;
+  for (int i0 = 0; i0 < KT_PER_SPLIT; i0 += U) {
+    uint4 wv[U];
+    uint2 xa[U][2];
+    unsigned sc[U];
+#pragma unroll
+    for (int u = 0; u < U; ++u) {
+      const int kt = kt0 + i0 + u;
+      if ((KT_PER_SPLIT % U == 0 || i0 + u < KT_PER_SPLIT) && (!TAIL || kt < K_TILES)) {
+        wv[u] = __ldcs(w + (size_t)kt * N_TILES * 32);
+        xa[u][0] = __ldg(xr + kt * 4);
+        xa[u][1] = __ldg(xr + kt * 4 + 2);
+        sc[u] = __ldg(sf + (size_t)kt * (N / 4));
+      } else {  // past this split's tiles: zero codes, activations and scales add exactly 0
+        wv[u] = make_uint4(0u, 0u, 0u, 0u);
+        xa[u][0] = xa[u][1] = make_uint2(0u, 0u);
+        sc[u] = 0u;
+      }
+    }
+#pragma unroll
+    for (int u = 0; u < U; ++u) {
+      float a[2][4];
+      bf16x4_to_f32(xa[u][0], a[0]);
+      bf16x4_to_f32(xa[u][1], a[1]);
+      const unsigned wj[4] = {wv[u].x, wv[u].y, wv[u].z, wv[u].w};
+      // Row slot p's block scale times its global scale, applied to each E2M1 value before the
+      // activation multiply. The f32 accumulator then holds the row's output itself, so an
+      // activation near the BF16 limit overflows only when a single term of the output does, not
+      // before a small block or global scale applies.
+      float sg[4];
+#pragma unroll
+      for (int p = 0; p < 4; ++p) {
+        const unsigned word = __shfl_sync(0xffffffffu, sc[u], (sbase >> 2) + 4 * p);
+        sg[p] = s0e5m3_to_f32((word >> (8 * (sbase & 3))) & 0xffu) * gp[p];
+      }
+#pragma unroll
+      for (int j = 0; j < 4; ++j) {
+        unsigned h[4];
+        e2m1x8_to_f16x2(wj[j], h[0], h[1], h[2], h[3]);
+#pragma unroll
+        for (int b = 0; b < 4; ++b) {
+          // Byte b of u32 j: row slot 2(j&1) + b/2, K values 4(L%2) + 2(j/2) + 8(b&1) + {0, 1}.
+          const int p = 2 * (j & 1) + (b >> 1), c = 2 * (j >> 1);
+          const float2 f = f16x2_to_f32x2(h[b]);
+          acc[p] = fmaf(f.y * sg[p], a[b & 1][c + 1], fmaf(f.x * sg[p], a[b & 1][c], acc[p]));
+        }
+      }
+    }
+  }
+#pragma unroll
+  for (int p = 0; p < 4; ++p) acc[p] += __shfl_xor_sync(0xffffffffu, acc[p], 1);
+  bf16* yr = y + (size_t)slot * N;
+  if (SPLITS == 1) {
+    if (!(lane & 1)) {
+#pragma unroll
+      for (int p = 0; p < 4; ++p) { const int r = row0 + 16 * p; yr[r] = __float2bfloat16(acc[p]); }
+    }
+    return;
+  }
+  // Split-K: publish this split's partials, then the last split to arrive for the tile sums all of
+  // them in split order (bitwise reproducible) and resets the tile's counter for the next launch.
+  // Release: every writer lane fences its own stores, the warp barrier orders them before lane 0,
+  // and lane 0 fences again (fences are cumulative) before its device-scope atomic. Acquire: lane 0
+  // fences after the atomic, the warp barrier orders every lane after that fence, and each lane
+  // fences before reading partials through L2 (`__ldcg`), never a stale L1 line.
+  float* part = partial + (size_t)slot * SPLITS * N;
+  if (!(lane & 1)) {
+#pragma unroll
+    for (int p = 0; p < 4; ++p) part[(size_t)split * N + row0 + 16 * p] = acc[p];
+  }
+  __threadfence();
+  __syncwarp();
+  unsigned* cnt = count + slot * N_TILES + nt;
+  unsigned prev = 0;
+  if (lane == 0) {
+    __threadfence();
+    prev = atomicAdd(cnt, 1u);
+    __threadfence();
+  }
+  prev = __shfl_sync(0xffffffffu, prev, 0);
+  if (prev != SPLITS - 1) return;
+  __syncwarp();
+  __threadfence();
+#pragma unroll
+  for (int h = 0; h < 2; ++h) {
+    const int r = nt * 64 + lane + 32 * h;
+    float sum = 0.f;
+#pragma unroll
+    for (int q = 0; q < SPLITS; ++q) sum += __ldcg(part + (size_t)q * N + r);
+    yr[r] = __float2bfloat16(sum);
+  }
+  if (lane == 0) *cnt = 0u;
+}
+"#;
+
+/// Argument names of every NVFP4 GEMV, dense or grouped (a dense one ignores `experts`; with one
+/// split, `partial` and `count` are unused).
+pub const FP4_ARGS: [&str; 8] = ["W", "SF", "gscale", "experts", "x", "y", "partial", "count"];
+
+/// Deepest K-tile unroll of the NVFP4 GEMV: 4 independent 16-byte loads in flight per lane.
+pub const FP4_UNROLL: u32 = 4;
+
+fn fp4_source(entry: &str, g: &crate::plan::GemvPlan, f: &crate::plan::Fp4Gemv) -> String {
+    let seg = match f.segments.as_slice() {
+        [only] => only.col.to_string(),
+        segs => {
+            let (last, rest) = segs.split_last().expect("at least one segment");
+            rest.iter().map(|s| format!("row < {} ? {} : ", s.end, s.col)).collect::<String>() + &last.col.to_string()
+        }
+    };
+    let row = if f.segments.len() > 1 { "row" } else { "/*row*/" };
+    fill(GEMV_FP4, &[("NS", format!("{entry}_ns")), ("ENTRY", entry.into()), ("N", g.n.to_string()), ("K", g.k.to_string()),
+        ("SPLITS", f.splits.to_string()), ("KTPS", f.kt_per_split.to_string()), ("GROUPED", (f.experts > 0).to_string()),
+        ("GS_STRIDE", f.gscale_stride.to_string()), ("X_STRIDE", f.x_stride.to_string()), ("ROW", row.into()), ("SEG", seg),
+        ("UNROLL", FP4_UNROLL.min(f.kt_per_split).to_string()),
+        ("TILE_SEGMENTS", f.segments.iter().all(|s| s.end % crate::plan::FP4_TILE_N == 0).to_string())])
+}
+
+fn fp4_entry(entry: String, f: &crate::plan::Fp4Gemv) -> KernelEntry {
+    KernelEntry { entry, file: "model.cu".into(), grid: f.grid, block: crate::plan::FP4_WARPS * 32, dyn_smem: 0, status: "generated", args: FP4_ARGS.to_vec() }
+}
+
 /// RoPE inverse frequencies exactly as HF transformers computes them in f32:
 /// `1.0 / (base ** (arange(0, dim, 2).float() / dim))`, then `rope_scaling` if present.
 pub fn rope_inv_freq(m: &ModelSpec) -> Vec<f32> {
@@ -311,11 +502,20 @@ pub fn generate(p: &Plan) -> Generated {
 
     // The hybrid layout (Gated DeltaNet, sparse attention, HyperConnection) has none of the dense
     // kernels below: RoPE rotates part of each head, attention reads selected positions, and most
-    // weights are MXFP8 or NVFP4. Every op class is listed as planned, with no source, until its
-    // kernel exists.
+    // weights are MXFP8 or NVFP4. Only its NVFP4 GEMVs that tile have a kernel; every other op class
+    // is listed as planned, with no source, until its kernel exists.
     if m.hybrid.is_some() {
+        let mut helpers = false;
         for o in &p.ops {
-            let (grid, block) = p.gemv.iter().find(|g| g.linear == o.name).map_or((1, 0), |g| (g.grid, g.warps_per_block * 32));
+            let gemv = p.gemv.iter().find(|g| g.linear == o.name);
+            if let Some((g, f)) = gemv.and_then(|g| g.fp4.as_ref().map(|f| (g, f))) {
+                let entry = format!("gemv_{}", g.linear);
+                if !std::mem::replace(&mut helpers, true) { src += FP4_HELPERS; }
+                src += &fp4_source(&entry, g, f);
+                kernels.push(fp4_entry(entry, f));
+                continue;
+            }
+            let (grid, block) = gemv.map_or((1, 0), |g| (g.grid, g.warps_per_block * 32));
             kernels.push(KernelEntry { entry: o.name.clone(), file: "model.cu".into(), grid: [grid, 1, 1], block, dyn_smem: 0, status: "planned", args: vec![] });
         }
         let mut h = Sha256::new();
@@ -342,11 +542,19 @@ pub fn generate(p: &Plan) -> Generated {
     src += &fill(SILU_MUL, &[("INTER", inter.to_string())]);
     kernels.push(KernelEntry { entry: "silu_mul".into(), file: "model.cu".into(), grid: [(inter / 8).div_ceil(256), 1, 1], block: 256, dyn_smem: 0, status: "generated", args: vec!["gate_up", "out"] });
 
+    let mut helpers = false;
     for g in &p.gemv {
         let entry = format!("gemv_{}", g.linear);
-        // Only BF16 weights have a GEMV body today, and the body stages x in shared memory, so a K
-        // whose activation vector exceeds the per-block limit cannot launch. Anything else stays
-        // `planned` and gets no CUDA source, so model.cu never contains a kernel for the wrong format.
+        if let Some(f) = &g.fp4 {
+            if !std::mem::replace(&mut helpers, true) { src += FP4_HELPERS; }
+            src += &fp4_source(&entry, g, f);
+            kernels.push(fp4_entry(entry, f));
+            continue;
+        }
+        // The staged BF16 GEMV: BF16 weights only, and it stages x in shared memory, so a K whose
+        // activation vector exceeds the per-block limit cannot launch. NVFP4 weights that tile took
+        // the FP4 GEMV above; anything else stays `planned` with no CUDA source, so model.cu never
+        // contains a kernel for the wrong format.
         let fmt_ok = g.linear == "lm_head" || g.linear == "router" || matches!(m.weights, crate::config::WeightFormat::Bf16);
         let generated = fmt_ok && g.smem_bytes <= p.target.smem_per_block_optin;
         if generated {
