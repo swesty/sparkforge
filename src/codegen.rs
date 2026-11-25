@@ -310,35 +310,62 @@ extern "C" __global__ void __launch_bounds__(256)
   if (nt >= N_TILES) return;  // no shared memory or block-wide sync, so a warp without a tile may leave
   const int e = GROUPED ? __ldg(experts + slot) : 0;
   const uint4* w = W + (size_t)e * W_EXPERT + (size_t)nt * 32 + lane;
-  const unsigned char* sf = SF + (size_t)e * SF_EXPERT + nt * 64 + (lane >> 4) * 8 + ((lane & 15) >> 1);
+  // Scales: lane L loads bytes 4(L%16) .. +3 of each tile's 64 (one 4-byte load), and lane L's row
+  // slot p reads byte (base + 16p) % 4 of lane (base + 16p) / 4's word by shuffle.
+  const unsigned* sf = reinterpret_cast<const unsigned*>(SF + (size_t)e * SF_EXPERT + nt * 64) + (lane & 15);
+  const int sbase = (lane >> 4) * 8 + ((lane & 15) >> 1);
   // x[kt*16 + 8h + 4(L%2) ..][..4] as 8-byte vector kt*4 + 2h + L%2.
   const uint2* xr = reinterpret_cast<const uint2*>(x + (size_t)slot * X_STRIDE) + (lane & 1);
   float acc[4] = {0.f, 0.f, 0.f, 0.f};
   const int kt0 = split * KT_PER_SPLIT;
-#pragma unroll @UNROLL@
-  for (int i = 0; i < KT_PER_SPLIT; ++i) {
-    const int kt = kt0 + i;
-    if (TAIL && kt >= K_TILES) break;
-    const uint4 wv = __ldcs(w + (size_t)kt * N_TILES * 32);
-    float a[2][4];
-    bf16x4_to_f32(__ldg(xr + kt * 4), a[0]);
-    bf16x4_to_f32(__ldg(xr + kt * 4 + 2), a[1]);
-    const unsigned wj[4] = {wv.x, wv.y, wv.z, wv.w};
-    float dot[4] = {0.f, 0.f, 0.f, 0.f};
+  // Software-pipelined in groups of U K tiles: every load of the group (U 16-byte weight vectors, their
+  // activations and 4U scale bytes) is issued before any math, so each lane has U weight loads in
+  // flight. Left to itself the compiler issued one weight load per tile and the scale loads after the
+  // FMAs, a second exposed latency per tile (SASS of the first version; ncu: 90% scoreboard stalls).
+  constexpr int U = @UNROLL@;
+  for (int i0 = 0; i0 < KT_PER_SPLIT; i0 += U) {
+    uint4 wv[U];
+    uint2 xa[U][2];
+    unsigned sc[U];
 #pragma unroll
-    for (int j = 0; j < 4; ++j) {
-      unsigned h[4];
-      e2m1x8_to_f16x2(wj[j], h[0], h[1], h[2], h[3]);
-#pragma unroll
-      for (int b = 0; b < 4; ++b) {
-        // Byte b of u32 j: row slot 2(j&1) + b/2, K values 4(L%2) + 2(j/2) + 8(b&1) + {0, 1}.
-        const float2 f = f16x2_to_f32x2(h[b]);
-        const int p = 2 * (j & 1) + (b >> 1), c = 2 * (j >> 1);
-        dot[p] = fmaf(f.y, a[b & 1][c + 1], fmaf(f.x, a[b & 1][c], dot[p]));
+    for (int u = 0; u < U; ++u) {
+      const int kt = kt0 + i0 + u;
+      if ((KT_PER_SPLIT % U == 0 || i0 + u < KT_PER_SPLIT) && (!TAIL || kt < K_TILES)) {
+        wv[u] = __ldcs(w + (size_t)kt * N_TILES * 32);
+        xa[u][0] = __ldg(xr + kt * 4);
+        xa[u][1] = __ldg(xr + kt * 4 + 2);
+        sc[u] = __ldg(sf + (size_t)kt * (N / 4));
+      } else {  // past this split's tiles: zero codes, activations and scales add exactly 0
+        wv[u] = make_uint4(0u, 0u, 0u, 0u);
+        xa[u][0] = xa[u][1] = make_uint2(0u, 0u);
+        sc[u] = 0u;
       }
     }
 #pragma unroll
-    for (int p = 0; p < 4; ++p) acc[p] = fmaf(dot[p], s0e5m3_to_f32(sf[(size_t)kt * N + 16 * p]), acc[p]);
+    for (int u = 0; u < U; ++u) {
+      float a[2][4];
+      bf16x4_to_f32(xa[u][0], a[0]);
+      bf16x4_to_f32(xa[u][1], a[1]);
+      const unsigned wj[4] = {wv[u].x, wv[u].y, wv[u].z, wv[u].w};
+      float dot[4] = {0.f, 0.f, 0.f, 0.f};
+#pragma unroll
+      for (int j = 0; j < 4; ++j) {
+        unsigned h[4];
+        e2m1x8_to_f16x2(wj[j], h[0], h[1], h[2], h[3]);
+#pragma unroll
+        for (int b = 0; b < 4; ++b) {
+          // Byte b of u32 j: row slot 2(j&1) + b/2, K values 4(L%2) + 2(j/2) + 8(b&1) + {0, 1}.
+          const float2 f = f16x2_to_f32x2(h[b]);
+          const int p = 2 * (j & 1) + (b >> 1), c = 2 * (j >> 1);
+          dot[p] = fmaf(f.y, a[b & 1][c + 1], fmaf(f.x, a[b & 1][c], dot[p]));
+        }
+      }
+#pragma unroll
+      for (int p = 0; p < 4; ++p) {
+        const unsigned word = __shfl_sync(0xffffffffu, sc[u], (sbase >> 2) + 4 * p);
+        acc[p] = fmaf(dot[p], s0e5m3_to_f32((word >> (8 * (sbase & 3))) & 0xffu), acc[p]);
+      }
+    }
   }
 #pragma unroll
   for (int p = 0; p < 4; ++p) acc[p] += __shfl_xor_sync(0xffffffffu, acc[p], 1);

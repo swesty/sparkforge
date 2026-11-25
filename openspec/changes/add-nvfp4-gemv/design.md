@@ -59,7 +59,9 @@ The kernel converts each weight byte with `cvt.rn.f16x2.e2m1x2` to an f16 pair, 
 
 ### 3. Scales: one decode per K tile and row, exact for every accepted byte
 
-Each lane reads 4 S0E5M3 bytes per K tile, one per row: `SF[kt*N + nt*64 + base_n + 16p]`. It decodes each as `__half2float(__ushort_as_half(byte << 7))` and multiplies it into the tile's partial dot before adding to the row accumulator.
+Each lane needs 4 S0E5M3 bytes per K tile, one per row: `SF[kt*N + nt*64 + base_n + 16p]`.
+- **The read:** lane L loads one 4-byte word of the tile's 64 contiguous scale bytes, word `L % 16`. Its row slot p takes byte `base_n % 4` of lane `base_n / 4 + 4p`'s word, by `__shfl_sync`. That is one load and 4 shuffles instead of 4 single-byte loads.
+- **The decode:** `__half2float(__ushort_as_half(byte << 7))`, multiplied into the tile's partial dot before it is added to the row accumulator.
 
 The decode is exact for every byte the repack emits:
 - normal E4M3 values;
@@ -121,7 +123,11 @@ The kernel trusts the ids: range-checking them is the router's contract (SHA-758
 
 ### 7. Loads in flight
 
-A lane's weight load is one 16-byte `__ldcs` per K tile; streaming loads keep weights out of L1, as in the BF16 GEMV. The K loop over the split's constexpr tile count is unrolled 4 deep, so each lane has 4 independent 16-byte loads in flight.
+A lane's weight load is one 16-byte `__ldcs` per K tile; streaming loads keep weights out of L1, as in the BF16 GEMV.
+
+**Explicit software pipelining.** The K loop runs in groups of 4 tiles, and every load of a group (4 weight vectors, their activations and 4 scale words) is issued before any of the group's math. So each lane has 4 independent 16-byte loads in flight.
+
+A plain `#pragma unroll 4` did not achieve this. In the first version's SASS, ptxas issued one weight load per tile and the scale loads after the FMAs, which exposed a second latency per tile. ncu agreed: 90% of warp stall cycles were scoreboard waits on L1TEX, at 19.8 active warps per SM.
 
 Little's law sizes it. At 20 warps per SM, 4 loads in flight per lane is 40 KB per SM. The survey estimates that 3 to 5 KB per SM saturates LPDDR5X, so the unroll gives margin against the long-latency tail. The unroll depth is a constexpr that `verify --bench` can test. If the 225 GB/s bar is missed, the first thing to try is changing the unroll, before changing the split rule.
 
@@ -138,7 +144,11 @@ Little's law sizes it. At 20 warps per SM, 4 loads in flight per lane is 40 KB p
   - **Without reuse:** gate/up reads 211-212 GB/s, and 215-218 GB/s with 20 or 40 experts per launch. A fixed per-launch cost therefore explains only 2-3%.
   - **Rejected changes:** an N-tile-major weight layout (211), 4-warp blocks (217-219), an `L2::256B` load hint (212) and `__ldg` loads (209) all failed to help.
   - **Reference:** the BF16 `gemv_lm_head` read 246 GB/s in the same session, so this shape runs at about 86% of the BF16 GEMV.
-  - **Not done:** counter profiling (`ncu`) needs root on spark-5.
+  - **Profiling as root (ncu):** 90% of stall cycles were scoreboard waits. The SASS showed one weight load in flight per warp and the scale loads issued late.
+  - **Explicit pipelining (decision 7):** gate/up rose from 211-212 to 221-222 GB/s.
+  - **One scale word plus shuffles (decision 3):** gate/up reached 222-223 GB/s, down rose from 201-207 to 210, and Qwen3 gate/up reached 232.
+  - **Rejected:** double buffering (217-218 GB/s), unroll 2 (215), 6 (203-220) and 8 (222, with Qwen3 `o_proj` down to 199).
+  - **More experts per launch:** at 20 and 40 experts the same kernel reads 228 and 227-234 GB/s. Its streaming rate is above 225 GB/s. At 10 experts (18.4 MB), a fixed per-launch cost of about 3% remains, measured as isolated back-to-back launches without PDL or a CUDA graph (both M5).
 
 ### 8. Planner and codegen integration
 
