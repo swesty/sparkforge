@@ -67,6 +67,10 @@ A GEMV over several stacked checkpoint tensors SHALL apply each tensor's global 
 - **WHEN** an expert's gate global scale is 0.01 and its up global scale is 0.02
 - **THEN** rows below the expert intermediate size use 0.01 and the remaining rows use 0.02
 
+#### Scenario: One stored expert
+- **WHEN** a routed `expert_down` linear has one stored expert and one slot
+- **THEN** it still reads the `[E, 3]` table, at column 2 (down), not column 0 (gate)
+
 ### Requirement: Split-K partials merge deterministically in one launch
 
 When K is split across blocks, each split SHALL write f32 partials to a workspace, and the last split to arrive for an N tile SHALL sum all of that tile's partials in split order 0, 1, ... and write the output in the same launch. It SHALL then reset the tile's arrival counter to zero. Counters SHALL start zeroed when the workspace is allocated.

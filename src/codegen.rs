@@ -354,6 +354,10 @@ extern "C" __global__ void __launch_bounds__(256)
   }
   // Split-K: publish this split's partials, then the last split to arrive for the tile sums all of
   // them in split order (bitwise reproducible) and resets the tile's counter for the next launch.
+  // Release: every writer lane fences its own stores, the warp barrier orders them before lane 0,
+  // and lane 0 fences again (fences are cumulative) before its device-scope atomic. Acquire: lane 0
+  // fences after the atomic, the warp barrier orders every lane after that fence, and each lane
+  // fences before reading partials through L2 (`__ldcg`), never a stale L1 line.
   float* part = partial + (size_t)slot * SPLITS * N;
   if (!(lane & 1)) {
 #pragma unroll
@@ -363,9 +367,14 @@ extern "C" __global__ void __launch_bounds__(256)
   __syncwarp();
   unsigned* cnt = count + slot * N_TILES + nt;
   unsigned prev = 0;
-  if (lane == 0) prev = atomicAdd(cnt, 1u);
+  if (lane == 0) {
+    __threadfence();
+    prev = atomicAdd(cnt, 1u);
+    __threadfence();
+  }
   prev = __shfl_sync(0xffffffffu, prev, 0);
   if (prev != SPLITS - 1) return;
+  __syncwarp();
   __threadfence();
 #pragma unroll
   for (int h = 0; h < 2; ++h) {

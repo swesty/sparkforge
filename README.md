@@ -114,13 +114,14 @@ no CUDA graph.
 
 | NVFP4 GEMV (spark-5, CUDA 13.0, 2026-11-25) | Bytes per launch | Max error | µs | GB/s |
 |---|---|---|---|---|
-| Flash Next `gemv_expert_gate_up` (10 experts) | 18.4 MB | 3.6e-3 | 84.5 | 218 |
-| Flash Next `gemv_expert_down` (10 experts) | 9.2 MB | 3.8e-3 | 42.6 | 216 |
-| Qwen3-30B-A3B `gemv_expert_gate_up` (8 experts) | 14.2 MB | 3.7e-3 | 60.3 | 235 |
-| Qwen3-30B-A3B `gemv_expert_down` (8 experts) | 7.1 MB | 3.8e-3 | 28.5 | 249 |
+| Flash Next `gemv_expert_gate_up` (10 experts) | 18.4 MB | 3.7e-3 | 87.1 | 212 |
+| Flash Next `gemv_expert_down` (10 experts) | 9.2 MB | 3.8e-3 | 44.6 | 207 |
+| Qwen3-30B-A3B `gemv_expert_gate_up` (8 experts) | 14.2 MB | 3.7e-3 | 62.8 | 225 |
+| Qwen3-30B-A3B `gemv_expert_down` (8 experts) | 7.1 MB | 3.8e-3 | 30.9 | 229 |
 
-  The BF16 `gemv_lm_head` measured 238-239 GB/s in the same session. Qwen3-30B-A3B in NVFP4 sums to 40.0 tok/s
-  (ceiling 43.5), with its BF16 `lm_head` 2.6 ms of the 25 ms.
+  Expert GEMVs are timed so that no expert is reread within 3x the L2; random expert draws from one table read
+  up to 10% faster from L2 reuse. The Llama 3.1 8B BF16 `gemv_lm_head` measured 246 GB/s in the same session.
+  Qwen3-30B-A3B in NVFP4 sums to 40.0 tok/s (ceiling 43.5), with its BF16 `lm_head` 2.6 ms of the 25 ms.
 
 ## Not supported yet (rejected or flagged, never silently wrong)
 

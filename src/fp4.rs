@@ -142,3 +142,35 @@ impl Operands {
         Ok(out)
     }
 }
+
+/// Expert sets for timing a grouped GEMV from DRAM: `launches` sets of `slots` distinct ids, each
+/// with the bank it reads (an independent copy of the whole `experts`-entry table). Launch `i` uses
+/// bank `i % banks` and the next `slots` ids of that bank's shuffled order, so a (bank, expert) pair
+/// recurs only after every other pair of its bank has been read: at least 3 x L2 bytes plus one
+/// launch later, given `banks` from `bench_banks`. No launch is then served from L2 a recent one
+/// left behind (random draws from one table are, in proportion to how much of it L2 holds).
+pub fn bench_sets(experts: usize, slots: usize, bytes_one: usize, l2: usize, launches: usize, rng: &mut Rng) -> (usize, Vec<(usize, Vec<u32>)>) {
+    assert!(slots >= 1 && slots <= experts, "{slots} slots of {experts} experts");
+    let banks = bench_banks(experts, slots, bytes_one, l2);
+    let orders: Vec<Vec<u32>> = (0..banks).map(|_| {
+        let mut o: Vec<u32> = (0..experts as u32).collect();
+        for i in (1..o.len()).rev() {
+            o.swap(i, (rng.next() % (i as u64 + 1)) as usize);
+        }
+        o
+    }).collect();
+    let mut cursor = vec![0usize; banks];
+    let sets = (0..launches).map(|i| {
+        let b = i % banks;
+        let ids = (0..slots).map(|j| orders[b][(cursor[b] + j) % experts]).collect();
+        cursor[b] = (cursor[b] + slots) % experts;
+        (b, ids)
+    }).collect();
+    (banks, sets)
+}
+
+/// Copies of an `experts`-entry table (`bytes_one` per expert) needed so that the table copies
+/// together hold 3 x L2 plus one launch of `slots` experts.
+pub fn bench_banks(experts: usize, slots: usize, bytes_one: usize, l2: usize) -> usize {
+    (3 * l2 + slots * bytes_one).div_ceil(experts * bytes_one).max(1)
+}

@@ -170,9 +170,75 @@ fn emulate(g: &Fp4Gemv, n: usize, k: usize, w: &[u8], sf: &[u8], gscale: &[f32],
     y
 }
 
+/// Worst per-element error, as `verify` computes it; a non-finite output is infinite error (a NaN
+/// would otherwise vanish in `f64::max`, codex-review of #20).
 fn worst(got: &[f32], want: &[f64]) -> f64 {
+    assert_eq!(got.len(), want.len());
     let amax = want.iter().fold(0f64, |a, &b| a.max(b.abs()));
-    got.iter().zip(want).map(|(&g, &r)| (g as f64 - r).abs() / (r.abs() + 1e-2 * amax)).fold(0.0, f64::max)
+    got.iter().zip(want).map(|(&g, &r)| {
+        let d = (g as f64 - r).abs() / (r.abs() + 1e-2 * amax);
+        if d.is_finite() { d } else { f64::INFINITY }
+    }).fold(0.0, f64::max)
+}
+
+#[test]
+fn a_nan_output_row_fails_the_host_comparison() {
+    assert_eq!(worst(&[f32::NAN, 2.0], &[1.0, 2.0]), f64::INFINITY);
+    assert_eq!(worst(&[2.0, f32::INFINITY], &[1.0, 2.0]), f64::INFINITY);
+    assert_eq!(worst(&[1.0, 2.0], &[1.0, 2.0]), 0.0);
+}
+
+#[test]
+fn a_one_expert_routed_down_projection_reads_the_down_scale() {
+    // One stored expert and one slot is still the grouped layout: [1, 3] scales, column 2 for down.
+    // No config reaches this today (a single expert parses as a dense MLP), so the linear is built
+    // by hand at Flash Next's shapes.
+    use sparkforge::{config::WeightFormat, plan::{plan_gemv_fp4, Linear}};
+    let s = sparkforge::config::ModelSpec::from_json(&std::fs::read_to_string("configs/qwen3.8-flash-next-nvfp4.json").unwrap(), None).unwrap();
+    let lin = |name: &str, n, k| Linear { name: name.into(), n, k, copies: 1, active: 1, format: WeightFormat::Nvfp4, per_token: 48 };
+    let down = plan_gemv_fp4(&lin("expert_down", 2560, 640), &s, &sparkforge::target::GB10).fp4.unwrap();
+    assert_eq!((down.experts, down.slots, down.gscale_stride, down.x_stride), (1, 1, 3, 640));
+    assert_eq!(down.segments, vec![Segment { end: 2560, col: 2 }]);
+    let gu = plan_gemv_fp4(&lin("expert_gate_up", 1280, 2560), &s, &sparkforge::target::GB10).fp4.unwrap();
+    assert_eq!((gu.experts, gu.gscale_stride, gu.segments.clone()), (1, 3, vec![Segment { end: 640, col: 0 }, Segment { end: 1280, col: 1 }]));
+    // Against a [1, 3] table with distinct gate, up and down scales, the emulation matches the
+    // reference, and reading column 0 (the gate scale) instead would not.
+    assert!(check(&down, 2560, 640, 1, &[0], 17) < 1.0 / 64.0);
+    let mut gate = down.clone();
+    gate.segments = vec![Segment { end: 2048, col: 0 }];
+    let mut rng = Rng(19);
+    let ops = Operands::random(&down, 2560, 640, 1, &mut rng);
+    assert!(ops.gscale[0] != ops.gscale[2], "gate and down scales differ");
+    let (w, sf) = ops.packed().unwrap();
+    let x: Vec<f32> = (0..640).map(|i| bf16(((i * 37 % 64) as f32 - 32.0) / 32.0)).collect();
+    let r = ops.reference(&down, &[0], &x.iter().map(|&v| v as f64).collect::<Vec<_>>()).unwrap();
+    assert!(worst(&emulate(&gate, 2560, 640, &w, &sf, &ops.gscale, &[0], &x), &r) > 1.0 / 64.0);
+}
+
+#[test]
+fn benchmark_expert_sets_never_reuse_an_expert_within_3x_l2() {
+    use sparkforge::fp4::{bench_banks, bench_sets};
+    let l2 = 24 << 20;
+    // The reviewer's case: 8 experts of 1.99 MB, 2 slots. One table is 15.9 MB, under 3 x L2.
+    for (experts, slots, bytes) in [(8usize, 2usize, 1_990_656usize), (512, 10, 1_843_200), (128, 8, 1_769_472), (3, 3, 4_000_000)] {
+        let (banks, sets) = bench_sets(experts, slots, bytes, l2, 300, &mut Rng(23));
+        assert_eq!(banks, bench_banks(experts, slots, bytes, l2));
+        assert!(banks * experts * bytes >= 3 * l2 + slots * bytes, "{experts} experts: {banks} banks hold 3 x L2 plus a launch");
+        let mut last: std::collections::HashMap<(usize, u32), usize> = Default::default();
+        for (i, (b, ids)) in sets.iter().enumerate() {
+            let mut d = ids.clone();
+            d.sort();
+            d.dedup();
+            assert_eq!(d.len(), slots, "launch {i}: distinct ids");
+            assert!(ids.iter().all(|&e| (e as usize) < experts));
+            for &e in ids {
+                if let Some(j) = last.insert((*b, e), i) {
+                    // Bytes read by the launches in between must cover 3 x L2.
+                    assert!((i - j - 1) * slots * bytes >= 3 * l2, "{experts} experts: ({b}, {e}) reused after {} launches", i - j);
+                }
+            }
+        }
+    }
 }
 
 fn check(g: &Fp4Gemv, n: usize, k: usize, experts: usize, ids: &[u32], seed: u64) -> f64 {

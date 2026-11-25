@@ -90,10 +90,14 @@ The planner derives segment ends from the model's own dimensions. Every boundary
 
 **Merge.** A warp that finishes its split:
 1. writes its 64 row partials to `partial[(slot*S + split)*N + row]`;
-2. calls `__threadfence()`;
-3. has lane 0 `atomicAdd` the tile's counter `count[slot*N_TILES + nt]`, broadcasting the old value.
+2. has every lane call `__threadfence()` and then `__syncwarp()`;
+3. has lane 0 fence again, `atomicAdd` the tile's counter `count[slot*N_TILES + nt]`, fence, and broadcast the old value.
 
-The warp that sees `S - 1` is last. It calls `__threadfence()`, reads the S partials with `__ldcg` in split order 0..S-1, applies the global scale, writes BF16, and stores 0 to the counter.
+Writer side: every lane fences its own stores, and the warp barrier orders those stores before lane 0's fence. Because fences are cumulative, lane 0's fence then covers them before the device-scope atomic.
+
+The warp that sees `S - 1` is last. It calls `__syncwarp()`, so every lane is ordered after lane 0's post-atomic fence, and then `__threadfence()`. It reads the S partials with `__ldcg` (through L2, never a stale L1 line) in split order 0..S-1, applies the global scale, writes BF16, and stores 0 to the counter.
+
+The first version did not fence lane 0 after the barrier, and its readers relied on the shuffle alone for ordering (codex-review of #20).
 
 **Determinism.** The sum order is fixed regardless of which warp arrives last, so results are bitwise reproducible. The counter returns to zero within the launch, so graph replay needs no memset. With S = 1, the warp writes the output directly and touches neither buffer.
 
@@ -130,7 +134,11 @@ Little's law sizes it. At 20 warps per SM, 4 loads in flight per lane is 40 KB p
   - A tile-major scale layout gave 217-219 GB/s.
   - Dropping the scale loads cut the time only in proportion to the bytes they read.
 - **Defaults kept:** unroll 4, 20 warps per SM.
-- **Against the BF16 GEMV:** the shape runs at about 91% of the bandwidth of the BF16 `gemv_lm_head` in the same session (238-239 GB/s).
+- **Against the BF16 GEMV (rerun after the codex-review of #20):** the sweep above used random expert draws, which L2 reuse inflated by about 3% at 512 experts.
+  - **Without reuse:** gate/up reads 211-212 GB/s, and 215-218 GB/s with 20 or 40 experts per launch. A fixed per-launch cost therefore explains only 2-3%.
+  - **Rejected changes:** an N-tile-major weight layout (211), 4-warp blocks (217-219), an `L2::256B` load hint (212) and `__ldg` loads (209) all failed to help.
+  - **Reference:** the BF16 `gemv_lm_head` read 246 GB/s in the same session, so this shape runs at about 86% of the BF16 GEMV.
+  - **Not done:** counter profiling (`ncu`) needs root on spark-5.
 
 ### 8. Planner and codegen integration
 
@@ -157,9 +165,17 @@ Little's law sizes it. At 20 warps per SM, 4 loads in flight per lane is 40 KB p
 
 **Reference.** In f64, it decodes each code with a 16-entry E2M1 table and each scale with an E4M3 decoder written independently of the S0E5M3 path. It never reads repacked bytes, so the reference checks the repack and the kernel together.
 
-**Grouped inputs.** The check uses 2 x slots experts, with ids taken from a seeded shuffle and kept unsorted. For timing, all `num_experts` copies are allocated. Each launch draws distinct random ids, written in advance into one device array per launch. For Flash Next, `expert_gate_up` takes 0.94 GB and `expert_down` 0.47 GB.
+**Grouped inputs.** The check uses 2 x slots experts, read by ids `(step * s + 3) % copies`, which are distinct, unsorted and not contiguous.
 
-**Determinism check.** The kernel is launched, the output is overwritten with a 0xFFFF NaN sentinel, and the kernel is launched again. The two outputs must be bitwise equal.
+**Timing without L2 reuse.** `fp4::bench_sets` allocates enough banks (copies of the whole expert table) to hold 3 x L2 plus one launch. Launch i uses bank `i % banks` and the next `slots` ids of that bank's shuffled order. An expert copy recurs only after 3 x L2 bytes of other experts.
+- **Why random draws were wrong:** independent random draws from one table let launches reuse experts that L2 still holds, in proportion to how much of the table L2 covers.
+- **Measured on Flash Next gate/up:** before the fix, it read 219 GB/s from all 512 experts, 245 from 128 and 342 from 32. With the fix, it reads 211-212 GB/s.
+- **Memory:** Flash Next needs one bank (0.94 GB for `expert_gate_up`).
+
+**Determinism check.**
+1. The kernel runs on 4 activation vectors, each against its own reference, on one workspace whose counters are never cleared.
+2. 63 more launches follow.
+3. The first vector runs again over a 0xFFFF NaN sentinel, and its output must be bitwise equal to the first.
 
 **Host emulation in CI.** A host test runs a Rust emulation of the kernel on small shapes and compares it with the f64 reference. The emulation is a per-lane walk using `lane_elem`, with partials summed in split order. The shapes:
 - N 128, K 64, S 3;

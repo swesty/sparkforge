@@ -277,3 +277,21 @@ fn the_token_estimate_counts_a_grouped_expert_gemv_once_per_layer() {
     // Missing a kernel the token needs: no estimate.
     assert_eq!(token_estimate_us(&qwen3_nvfp4(), &rows[1..]), None);
 }
+
+#[test]
+fn the_token_estimate_counts_the_shared_expert_activation() {
+    use sparkforge::estimate::{token_estimate_us, Row};
+    let mut v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string("configs/qwen3-30b-a3b.json").unwrap()).unwrap();
+    v["shared_expert_intermediate_size"] = 4096.into();
+    let p = plan::build(&spec(&v.to_string()).unwrap(), &GB10, &plan::PlanOpts { prefill_tokens: 2048, ctx: 32768 });
+    assert!(p.model.moe.as_ref().unwrap().shared_experts > 0);
+    let us = [("rmsnorm", 1.0), ("gemv_qkv_proj", 10.0), ("rope_kv_append", 2.0), ("attn_decode (split+combine)", 20.0),
+        ("gemv_o_proj", 8.0), ("gemv_router", 3.0), ("gemv_expert_gate_up", 30.0), ("silu_mul", 0.5), ("gemv_expert_down", 15.0),
+        ("gemv_shared_gate_up", 40.0), ("gemv_shared_down", 20.0), ("gemv_lm_head", 600.0)];
+    let rows = |skip: &str| us.iter().filter(|(k, _)| *k != skip).map(|&(k, t)| Row { kernel: k.into(), case: String::new(), err: 0.0, us: Some(t), gbs: None }).collect::<Vec<_>>();
+    // BF16 experts: 8 launches each, routed SiLU 8 times, plus the shared GEMVs and their SiLU.
+    let layer = 2.0 + 10.0 + 2.0 + 20.0 + 8.0 + 3.0 + 8.0 * (30.0 + 0.5 + 15.0) + 40.0 + 0.5 + 20.0;
+    assert_eq!(token_estimate_us(&p, &rows("")), Some(48.0 * layer + 1.0 + 600.0));
+    // Without a shared GEMV's timing, no estimate.
+    assert_eq!(token_estimate_us(&p, &rows("gemv_shared_down")), None);
+}

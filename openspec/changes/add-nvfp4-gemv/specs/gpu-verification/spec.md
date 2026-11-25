@@ -64,16 +64,20 @@ Each NVFP4 GEMV check SHALL include scale bytes 0x00, 0x01 and 0x07 and a distin
 
 ### Requirement: Split-K NVFP4 GEMVs are checked for bitwise replay
 
-A split-K NVFP4 GEMV SHALL be launched twice on the same inputs, without clearing its counters, and with its output overwritten by a NaN sentinel between the launches. The check SHALL fail unless both outputs are bitwise identical.
+A split-K NVFP4 GEMV SHALL run on 4 activation vectors in turn, each checked against its own reference, on one workspace whose counters are never cleared. After 63 more launches, the first vector SHALL run again over a NaN-sentinel output, and the check SHALL fail unless that output is bitwise identical to its first.
 
 #### Scenario: Stale counter
 - **WHEN** a split-K GEMV's last-arriving split fails to reset its counter
 - **THEN** no split writes the second launch's output, the NaN sentinel remains, and the check fails
 
-### Requirement: Grouped NVFP4 GEMVs are timed on random expert sets
+### Requirement: Grouped NVFP4 GEMVs are timed without L2 reuse
 
-With `--bench`, a grouped NVFP4 GEMV SHALL be timed with all of the model's experts allocated and a fresh random set of distinct expert ids per launch. The GB/s of any NVFP4 GEMV SHALL count the weight and scale bytes it reads: for a grouped GEMV, those of the active experts.
+With `--bench`, a grouped NVFP4 GEMV SHALL be timed over enough copies of the whole expert table to hold 3 x L2 plus one launch, with each launch's distinct expert ids chosen so that no expert copy is read again within 3 x L2 bytes. The GB/s of any NVFP4 GEMV SHALL count the weight and scale bytes it reads: for a grouped GEMV, those of the active experts.
 
 #### Scenario: Flash Next gate/up bandwidth
 - **WHEN** `verify --bench` runs for `configs/qwen3.8-flash-next-nvfp4.json` on a GB10
-- **THEN** `gemv_expert_gate_up` reports GB/s over 10 x 1,843,200 bytes per launch, with expert ids drawn from all 512 experts
+- **THEN** `gemv_expert_gate_up` reports GB/s over 10 x 1,843,200 bytes per launch from one copy of all 512 experts, with no expert reread within 3 x L2 bytes
+
+#### Scenario: Small expert table
+- **WHEN** a grouped GEMV has 8 experts of 1,990,656 bytes and 2 slots
+- **THEN** the timing allocates 6 copies of the table, so no launch is served from L2 left by a recent one

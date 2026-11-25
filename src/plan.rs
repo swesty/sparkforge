@@ -641,6 +641,12 @@ pub fn fp4_tiles(l: &Linear) -> bool {
     matches!(l.format, WeightFormat::Nvfp4 | WeightFormat::Nvfp4WeightOnly) && l.n % FP4_TILE_N == 0 && l.k % FP4_TILE_K == 0 && l.n > 0 && l.k > 0
 }
 
+/// Whether `l` is a routed-expert linear (`expert_gate_up`, `expert_down`, or a format-split class
+/// of either), as opposed to a dense or shared-expert one.
+pub fn is_routed_expert(l: &Linear) -> bool {
+    l.name.starts_with("expert_gate_up") || l.name.starts_with("expert_down")
+}
+
 /// The checkpoint tensors stacked into an NVFP4 linear's rows, each with its own global scale: q, k,
 /// v for `qkv_proj`; gate, up for the fused gate/up projections. A grouped expert GEMV indexes the
 /// `[E, 3]` (gate, up, down) table of the weight loader, so its down projection uses column 2.
@@ -659,8 +665,11 @@ fn fp4_segments(l: &Linear, m: &ModelSpec, grouped: bool) -> Vec<Segment> {
 
 /// NVFP4 decode GEMV launch (kernel-planning "NVFP4 GEMVs split K until about 20 warps per SM are
 /// busy"). `l` must tile (`fp4_tiles`).
-fn plan_gemv_fp4(l: &Linear, m: &ModelSpec, t: &Target) -> GemvPlan {
-    let grouped = l.copies > 1;
+pub fn plan_gemv_fp4(l: &Linear, m: &ModelSpec, t: &Target) -> GemvPlan {
+    // A routed-expert linear reads the loader's grouped buffers and `[E, 3]` scale table whatever
+    // the expert count, so its role decides the layout, not `copies > 1` (one stored expert is
+    // still grouped, codex-review of #20).
+    let grouped = is_routed_expert(l);
     let slots = if grouped { l.active } else { 1 };
     let (tiles, k_tiles) = (l.n / FP4_TILE_N, l.k / FP4_TILE_K);
     let blocks_x = tiles.div_ceil(FP4_WARPS);
