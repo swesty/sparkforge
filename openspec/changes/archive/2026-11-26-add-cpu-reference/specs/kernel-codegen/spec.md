@@ -22,4 +22,8 @@ in f32 and rounding to bf16.
 
 #### Scenario: Reference agreement
 - **WHEN** `verify` checks `rmsnorm` against a reference that rounds before the weight
-- **THEN** it passes (measured 3.80e-3 on Llama 3.1 8B)
+- **THEN** it passes (measured 3.80e-3 on Llama 3.1 8B), and on every element where rounding before the weight and rounding once give different bf16 values, at least 90% match the first (measured 4138 of 4138)
+
+#### Scenario: Old rounding order
+- **WHEN** `rmsnorm` rounds `x * r * w` once at the end
+- **THEN** `verify` fails it (measured 0 of 4138 elements matching), although the tolerance alone would pass it

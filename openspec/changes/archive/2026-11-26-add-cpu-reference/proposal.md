@@ -16,6 +16,12 @@
   - Runs a 2-layer decode step of random weights in two cases: four steps from an empty cache, and two steps after a random 1000-position prefix. It reports one row per layer boundary and the logits, so error growth per layer is visible.
 - **Layer-boundary metric:** max|gpu - ref| / max|ref|. The per-element metric fails a correct step: both sides round every op to bf16, and a residual add that cancels to near zero turns a 1-ulp difference into a large relative error (measured: 4.4e-2 at layer 0 to 4.2e-1 at the logits). Against the tensor's scale, the same run measures 2.9e-3 to 6.6e-3. Three injected wiring bugs measure 0.6 to 3.9.
 
+- **codex-review cycle 1 fixes:**
+  - `fp:edf3261e6c96`: `reference::check_shapes` checks every weight and cache length, and K and V layer counts, before `DeviceModel::upload` copies anything.
+  - `fp:4159fada9500`: the `rmsnorm` check also requires the kernel to match the double rounding on at least 90% of the elements where the two orders differ. The new kernel matches 4138 of 4138; the old expression matches 0 and fails.
+  - `fp:688a8d36f2cc`: `f64_to_bf16` rounds f64 results once.
+  - `fp:cf7c641e5701`: the KV-slot test checks each slot and that step 1 preserves slot 0.
+
 **Expected GB10 effect:** none on decode speed (`residual_add` measures 2.1 us; it isn't in the per-token estimate yet). Llama 3.1 8B's estimate stays 12.1 tok/s.
 
 ## Non-goals

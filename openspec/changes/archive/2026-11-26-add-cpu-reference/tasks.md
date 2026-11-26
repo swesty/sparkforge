@@ -7,3 +7,4 @@
 - [x] 1.5 `verify`: `residual_add` check, `rmsnorm` reference with the new rounding, 2-layer decode step (fresh and 1000-position prefix) with the scaled metric, skip line for other models
 - [x] 1.6 GB10 (spark-5): Llama 3.1 8B and Qwen3-30B-A3B pass; three injected wiring bugs fail
 - [x] 1.7 `openspec validate add-cpu-reference --strict`, archive, `verify.sh`
+- [x] 1.8 Review cycle 1: upload checks every weight and cache length (`fp:edf3261e6c96`); the `rmsnorm` check requires the double rounding where the orders differ (`fp:4159fada9500`); f64 results round once to bf16 (`fp:688a8d36f2cc`); the KV-slot test checks each slot (`fp:cf7c641e5701`)

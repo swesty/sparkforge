@@ -76,8 +76,10 @@ pub struct DeviceModel {
 
 impl DeviceModel {
     /// Copies `w` and the current contents of `cache` (so a prefilled prefix carries over).
+    /// Every length is checked against `m` first, since the kernels index with the model's shapes
+    /// and the cache's declared capacity, and nothing is copied when one is wrong.
     pub fn upload(s: &Arc<CudaStream>, m: &ModelSpec, w: &DenseWeights, cache: &KvCache) -> Result<Self> {
-        ensure!(cache.k.len() == w.layers.len(), "the cache has {} layers, the weights {}", cache.k.len(), w.layers.len());
+        crate::reference::check_shapes(m, w, cache)?;
         let layers = w
             .layers
             .iter()

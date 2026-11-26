@@ -310,14 +310,14 @@ fn main() -> Result<()> {
             codegen::require_generated(&g, &p.model.arch)?;
             let e = sparkforge::runtime::Engine::load(&g, &cuda_include)?;
             let rows = verify::run(&p, &g, &e, &verify::Opts { bench, seed })?;
-            println!("{:<28} {:<26} {:>10} {:>5} {:>10} {:>8}", "kernel", "case", "max err", "ok", "us", "GB/s");
+            println!("{:<28} {:<30} {:>10} {:>5} {:>10} {:>8}", "kernel", "case", "max err", "ok", "us", "GB/s");
             let mut fails = 0;
             for r in &rows {
                 let ok = r.err < verify::TOL;
                 fails += !ok as usize;
                 let us = r.us.map_or("-".into(), |t| format!("{t:.1}"));
                 let gbs = r.gbs.map_or("-".into(), |b| format!("{b:.0}"));
-                println!("{:<28} {:<26} {:>10.2e} {:>5} {:>10} {:>8}", r.kernel, r.case, r.err, if ok { "yes" } else { "NO" }, us, gbs);
+                println!("{:<28} {:<30} {:>10.2e} {:>5} {:>10} {:>8}", r.kernel, r.case, r.err, if ok { "yes" } else { "NO" }, us, gbs);
             }
             let skipped: Vec<_> = g.kernels.iter().filter(|k| k.status != "generated").map(|k| k.entry.as_str()).collect();
             if !skipped.is_empty() { println!("not generated yet (skipped): {}", skipped.join(", ")); }

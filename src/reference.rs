@@ -19,8 +19,22 @@ pub fn f2bf(x: f32) -> u16 {
 pub fn bf2f(h: u16) -> f32 {
     f32::from_bits((h as u32) << 16)
 }
+/// f64 to bf16, round to nearest even, rounded once: going through f32 first can land exactly on
+/// a bf16 midpoint and then tie the wrong way. Values below the f32 normal range (irrelevant to
+/// these activations) go through f32.
+pub fn f64_to_bf16(x: f64) -> u16 {
+    if !x.is_finite() || x.abs() < f32::MIN_POSITIVE as f64 {
+        return f2bf(x as f32);
+    }
+    // Keep 7 of the 52 mantissa bits, round to nearest even; the result has 8 significant bits,
+    // so it converts to f32 exactly (or to infinity past f32::MAX) and its low 16 bits are zero.
+    const SHIFT: u32 = 52 - 7;
+    let b = x.to_bits();
+    let r = b.wrapping_add((1u64 << (SHIFT - 1)) - 1 + ((b >> SHIFT) & 1)) & !((1u64 << SHIFT) - 1);
+    f2bf(f64::from_bits(r) as f32)
+}
 fn round(v: &[f64]) -> Vec<u16> {
-    v.iter().map(|&x| f2bf(x as f32)).collect()
+    v.iter().map(|&x| f64_to_bf16(x)).collect()
 }
 
 /// Seeded xorshift64; `unif` is uniform in [-1, 1).
@@ -121,6 +135,34 @@ impl KvCache {
     }
 }
 
+/// Fails, naming the tensor, unless every weight and cache length matches `m` and the cache's
+/// declared capacity, and the cache has a K and a V buffer for every weight layer. The GPU step
+/// indexes with these shapes, so `forward::DeviceModel::upload` checks before copying anything.
+pub fn check_shapes(m: &ModelSpec, w: &DenseWeights, cache: &KvCache) -> Result<()> {
+    let (h, inter, q, qkv, kv) = (m.hidden as usize, m.intermediate as usize, m.q_dim() as usize, m.qkv_dim() as usize, m.kv_dim() as usize);
+    let len = |what: String, got: usize, want: usize| -> Result<()> {
+        ensure!(got == want, "{what} has {got} elements, the model needs {want}");
+        Ok(())
+    };
+    let l = w.layers.len();
+    ensure!(l > 0, "no layers to run");
+    ensure!(cache.k.len() == l && cache.v.len() == l, "the cache has {} K and {} V layers, the weights {l}", cache.k.len(), cache.v.len());
+    ensure!(!w.embed.is_empty() && w.embed.len().is_multiple_of(h), "the embedding has {} elements, not a whole number of {h}-wide rows", w.embed.len());
+    len("final_norm".into(), w.final_norm.len(), h)?;
+    len("lm_head".into(), w.lm_head.len(), m.vocab as usize * h)?;
+    for (i, lw) in w.layers.iter().enumerate() {
+        len(format!("layer {i} attn_norm"), lw.attn_norm.len(), h)?;
+        len(format!("layer {i} qkv"), lw.qkv.len(), qkv * h)?;
+        len(format!("layer {i} o_proj"), lw.o_proj.len(), h * q)?;
+        len(format!("layer {i} mlp_norm"), lw.mlp_norm.len(), h)?;
+        len(format!("layer {i} gate_up"), lw.gate_up.len(), 2 * inter * h)?;
+        len(format!("layer {i} down"), lw.down.len(), h * inter)?;
+        len(format!("layer {i} K cache"), cache.k[i].len(), cache.capacity * kv)?;
+        len(format!("layer {i} V cache"), cache.v[i].len(), cache.capacity * kv)?;
+    }
+    Ok(())
+}
+
 /// The hidden state after each layer's attention and MLP residual adds, and the final logits.
 pub struct Trace {
     pub after_attn: Vec<Vec<u16>>,
@@ -131,7 +173,8 @@ pub struct Trace {
 pub fn rmsnorm(x: &[u16], w: &[u16], eps: f64) -> Vec<u16> {
     let ss: f64 = x.iter().map(|&v| (bf2f(v) as f64).powi(2)).sum();
     let inv = 1.0 / (ss / x.len() as f64 + eps).sqrt();
-    x.iter().zip(w).map(|(&v, &wv)| f2bf(bf2f(wv) * bf2f(f2bf((bf2f(v) as f64 * inv) as f32)))).collect()
+    // The weight times a bf16 value is exact in f32, so the last rounding is f32 to bf16.
+    x.iter().zip(w).map(|(&v, &wv)| f2bf(bf2f(wv) * bf2f(f64_to_bf16(bf2f(v) as f64 * inv)))).collect()
 }
 
 /// `W x` for row-major `W` of `n` rows, in f64, unrounded.
@@ -165,8 +208,8 @@ pub fn rope(m: &ModelSpec, qkv: &mut [u16], pos: usize) {
         for i in 0..hd / 2 {
             let ang = (pos as f32 * inv_freq[i]) as f64;
             let (x1, x2) = (bf2f(qkv[h * hd + i]) as f64, bf2f(qkv[h * hd + i + hd / 2]) as f64);
-            qkv[h * hd + i] = f2bf((x1 * ang.cos() - x2 * ang.sin()) as f32);
-            qkv[h * hd + i + hd / 2] = f2bf((x2 * ang.cos() + x1 * ang.sin()) as f32);
+            qkv[h * hd + i] = f64_to_bf16(x1 * ang.cos() - x2 * ang.sin());
+            qkv[h * hd + i + hd / 2] = f64_to_bf16(x2 * ang.cos() + x1 * ang.sin());
         }
     }
 }
@@ -186,7 +229,7 @@ pub fn attention(m: &ModelSpec, q: &[u16], k_cache: &[u16], v_cache: &[u16], len
         let z: f64 = p.iter().sum();
         for d in 0..hd {
             let o: f64 = (0..len).map(|t| p[t] * bf2f(v_cache[(t * kvh + kv) * hd + d]) as f64).sum();
-            out[h * hd + d] = f2bf((o / z) as f32);
+            out[h * hd + d] = f64_to_bf16(o / z);
         }
     }
     out
@@ -198,7 +241,7 @@ pub fn silu_mul(gate_up: &[u16]) -> Vec<u16> {
     (0..inter)
         .map(|i| {
             let (g, u) = (bf2f(gate_up[i]) as f64, bf2f(gate_up[inter + i]) as f64);
-            f2bf((g / (1.0 + (-g).exp()) * u) as f32)
+            f64_to_bf16(g / (1.0 + (-g).exp()) * u)
         })
         .collect()
 }

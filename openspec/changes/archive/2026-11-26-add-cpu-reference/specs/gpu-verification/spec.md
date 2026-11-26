@@ -60,8 +60,8 @@ per-element error meaningless there.
 
 ### Requirement: The CPU reference rounds where HF transformers does in bf16
 
-The reference (`src/reference.rs`) SHALL compute each op in f64 and round its output to bf16
-wherever the GPU stores bf16: RMSNorm rounds `x * rsqrt(mean(x^2) + eps)` before the weight
+The reference (`src/reference.rs`) SHALL compute each op in f64 and round its output once to bf16
+(round to nearest even, not through f32) wherever the GPU stores bf16: RMSNorm rounds `x * rsqrt(mean(x^2) + eps)` before the weight
 multiply (as HF's `LlamaRMSNorm` does) and again after it; each GEMV, the RoPE output, the attention
 output, SiLU-and-multiply and the residual sum are rounded; attention probabilities are not; the
 logits are compared unrounded.
@@ -69,3 +69,7 @@ logits are compared unrounded.
 #### Scenario: RMSNorm rounding
 - **WHEN** the reference normalizes 4096 random elements
 - **THEN** each output equals bf16(w * bf16(x * r)), and some differ from rounding x * r * w once
+
+#### Scenario: Rounding through f32 would tie the wrong way
+- **WHEN** an f64 result is 1 + 2^-8 + 2^-25, just above a bf16 midpoint that f32 rounds onto
+- **THEN** the reference gives 1 + 2^-7, where going through f32 gives 1

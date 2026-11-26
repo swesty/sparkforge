@@ -116,15 +116,25 @@ impl Ctx<'_> {
         let (dx, dw) = (s.memcpy_stod(&x)?, s.memcpy_stod(&w)?);
         let mut dy = s.alloc_zeros::<u16>(rows * h)?;
         unsafe { s.launch_builder(f).arg(&dx).arg(&dw).arg(&mut dy).arg(&eps).launch(cfg([rows as u32, 1, 1], k.block, 0))? };
-        let y = to_f32(&s.memcpy_dtov(&dy)?);
+        let yb = s.memcpy_dtov(&dy)?;
+        let y = to_f32(&yb);
         let mut r = vec![0f64; rows * h];
+        // Where rounding x * r before the weight (HF) and rounding once at the end give different
+        // bf16 values, the kernel must give the first: the tolerance alone can't tell them apart.
+        let (mut differ, mut agree) = (0usize, 0usize);
         for row in 0..rows {
             let xs = &x[row * h..(row + 1) * h];
             let ss: f64 = xs.iter().map(|&v| (bf2f(v) as f64).powi(2)).sum();
             let inv = 1.0 / (ss / h as f64 + eps as f64).sqrt();
             // x * inv is rounded to bf16 before the weight multiply, as HF and the kernel do.
             for i in 0..h {
-                r[row * h + i] = bf2f(w[i]) as f64 * bf2f(f2bf((bf2f(xs[i]) as f64 * inv) as f32)) as f64;
+                let xr = crate::reference::f64_to_bf16(bf2f(xs[i]) as f64 * inv);
+                r[row * h + i] = bf2f(w[i]) as f64 * bf2f(xr) as f64;
+                let (two, once) = (f2bf(bf2f(w[i]) * bf2f(xr)), crate::reference::f64_to_bf16(bf2f(xs[i]) as f64 * inv * bf2f(w[i]) as f64));
+                if two != once {
+                    differ += 1;
+                    agree += (yb[row * h + i] == two) as usize;
+                }
             }
         }
         let us = if self.o.bench {
@@ -133,7 +143,9 @@ impl Ctx<'_> {
                 Ok(())
             })?)
         } else { None };
-        self.push("rmsnorm", format!("{rows} rows x {h}"), max_err(&y, &r), us, (3 * h * 2) as f64);
+        let rounds_first = differ >= 16 && agree * 10 >= differ * 9;
+        let err = if rounds_first { max_err(&y, &r) } else { f64::INFINITY };
+        self.push("rmsnorm", format!("{rows}x{h}, x*r rounded {agree}/{differ}"), err, us, (3 * h * 2) as f64);
         Ok(())
     }
 
