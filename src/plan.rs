@@ -566,12 +566,16 @@ fn mtp_weight_bytes(m: &ModelSpec, h: &Hybrid, f: &Formats) -> f64 {
     };
     // Each input projection at its own format (codex-review fp:25aaaee34a54 on #18).
     let fc = hd * hd * (f.mtp_shared("fc_embedding").bytes_per_elem() + f.mtp_shared("fc_hidden").bytes_per_elem());
+    // The norms in front of those projections, BF16 as `inventory::hybrid` checks them:
+    // `mtp.pre_fc_norm_embedding` (hidden width) and `mtp.pre_fc_norm_hidden` (residual width)
+    // (codex-review fp:04b498446b41 on #19).
+    let pre_fc_norms = (hd + res) * 2.0;
     // The MTP mixers' norms are BF16, as `inventory::hybrid` checks them (F32 in the main model;
     // codex-review fp:cf55fb8f7ebd on #18).
     let mixer = |inject: bool| ((h.hc.lowrank + if inject { h.hc.streams } else { 0 }) as f64 * res + res * h.hc.lowrank as f64) * 2.0 + res * 2.0;
-    // The input projections (`mtp.fc_embedding`, `mtp.fc_hidden`) and the final mixer exist once;
-    // each draft layer has its own attention, experts and two mixers.
-    (0..h.mtp_layers).map(layer).sum::<f64>() + h.mtp_layers as f64 * 2.0 * mixer(true) + fc + mixer(false)
+    // The input projections (`mtp.fc_embedding`, `mtp.fc_hidden`), their norms and the final mixer
+    // exist once; each draft layer has its own attention, experts and two mixers.
+    (0..h.mtp_layers).map(layer).sum::<f64>() + h.mtp_layers as f64 * 2.0 * mixer(true) + fc + pre_fc_norms + mixer(false)
 }
 
 fn linear_op(l: &Linear, group: &'static str) -> OpClass {

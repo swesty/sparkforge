@@ -580,6 +580,28 @@ fn memory_used_after_admission_is_rechecked_before_allocating() {
 }
 
 #[test]
+fn the_reported_baseline_is_the_memory_admission_checked_before_allocating() {
+    // codex-review fp:69a474a7ea8f on #19: `load-weights` read its "before" figure ahead of
+    // admission, so memory another process freed while this load waited showed up as memory the
+    // load used. `confirm` returns the reading it checked, under the lock right before allocating.
+    use sparkforge::weights::admit;
+    use std::cell::Cell;
+    const GIB: u64 = 1 << 30;
+    let lock = dir("admission-baseline").join("admission.lock");
+    let avail = Cell::new(20 * GIB);
+    let adm = admit(&user_lock(&lock), 14 * GIB, 0, || Some(avail.get()), std::time::Duration::from_secs(1)).expect("fits at admission");
+    // Another process frees 4 GiB between admission and the allocation.
+    avail.set(24 * GIB);
+    let baseline = adm.confirm(14 * GIB, 0, || Some(avail.get())).unwrap();
+    assert_eq!(baseline, 24 * GIB);
+    // fp:08579c39429a on #22: a change after the final check doesn't move the saved baseline. It
+    // shows only in the reading taken after the copy.
+    avail.set(28 * GIB);
+    assert_eq!(baseline, 24 * GIB, "the baseline is the checked reading, not a later one");
+    assert_eq!(avail.get() - baseline, 4 * GIB, "a later reading sees the change");
+}
+
+#[test]
 fn a_metadata_file_that_grows_past_the_cap_is_refused_not_truncated() {
     // codex-review P2: the first `cap` bytes parse as JSON; the byte after them must still fail the read.
     use sparkforge::weights::read_capped;
@@ -1431,7 +1453,11 @@ fn the_shared_mtp_input_projections_are_resident_once() {
     };
     let (w0, w1, w2) = (resident(0), resident(1), resident(2));
     // fc: 2 x 64 x 64 BF16; final mixer: down and up (8 x 256 each, BF16) plus a BF16 norm of 256.
-    let shared = 2.0 * 64.0 * 64.0 * 2.0 + (2.0 * 8.0 * 256.0) * 2.0 + 256.0 * 2.0;
+    // fp:04b498446b41 on #19: the two pre-FC norms (`mtp.pre_fc_norm_embedding`, hidden width 64,
+    // and `mtp.pre_fc_norm_hidden`, residual width 256, both BF16) are shared too: 640 bytes.
+    let pre_fc_norms = (64.0 + 256.0) * 2.0;
+    assert_eq!(pre_fc_norms, 640.0);
+    let shared = 2.0 * 64.0 * 64.0 * 2.0 + (2.0 * 8.0 * 256.0) * 2.0 + 256.0 * 2.0 + pre_fc_norms;
     assert!((2.0 * (w1 - w0) - (w2 - w0) - shared).abs() < 1e-3, "{}", 2.0 * (w1 - w0) - (w2 - w0));
 }
 

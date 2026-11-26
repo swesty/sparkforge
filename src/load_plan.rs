@@ -101,6 +101,17 @@ impl PleTable {
         Ok((rows, bytes))
     }
 
+    /// Host bytes a timed gather of `tokens` tokens holds at its peak: the gathered bytes twice
+    /// (pinned on the host and in a device buffer, which share GB10's memory) and the row IDs that
+    /// `sample_rows` keeps alive alongside them, one `u64` per token and head (codex-review
+    /// fp:44b41fc11198 on #19).
+    pub fn gather_peak_bytes(&self, tokens: usize) -> Result<u64> {
+        let (rows, bytes) = self.gather_size(tokens)?;
+        (rows as u64).checked_mul(std::mem::size_of::<u64>() as u64)
+            .and_then(|ids| bytes.checked_mul(2)?.checked_add(ids))
+            .with_context(|| format!("the peak of a {tokens}-token PLE gather overflows a byte count"))
+    }
+
     /// The rows of `tokens` tokens for timing a gather: per token, one row inside each head's own
     /// range (token-major, heads in order), drawn uniformly by a 64-bit LCG seeded with `seed`, as
     /// distinct n-grams spread over each head's table.
@@ -422,6 +433,20 @@ pub fn host_scratch_bytes(plan: &LoadPlan, ck: &Checkpoint, staging: u64, sample
         _ => 2 * len,
     }).max().unwrap_or(0);
     copy.max(read_back)
+}
+
+/// Host bytes `load-weights` reserves besides the copied weights: the largest of its phases, which
+/// run one after another and free their buffers before the next starts. `scratch` is the copy and
+/// read-back peak (`host_scratch_bytes`); in disk mode the timed gather of `gather_tokens` tokens
+/// follows (`PleTable::gather_peak_bytes`). Summing the phases instead would count the scratch
+/// while the gather runs, when it is already freed, and still miss the row IDs whenever they
+/// outgrow the scratch (codex-review fp:44b41fc11198 on #19).
+pub fn hybrid_overhead_bytes(plan: &LoadPlan, scratch: u64, gather_tokens: usize) -> Result<u64> {
+    let gather = match plan.mode {
+        PleMode::Disk => plan.ple_table.gather_peak_bytes(gather_tokens)?,
+        PleMode::Resident => 0,
+    };
+    Ok(scratch.max(gather))
 }
 
 /// Buffers up to this size are read back whole; larger ones by their first and last piece, and a
