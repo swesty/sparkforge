@@ -249,11 +249,15 @@ sparkforge assumes one account runs it per node.
 
 #### Scenario: Upgrade from a loader before SHA-765
 - **WHEN** sparkforge is upgraded from any earlier version, including one that locked in `/run/user/<uid>`, `$XDG_RUNTIME_DIR`, the temp directory or `/run/sparkforge`
-- **THEN** running loads are drained first, since an earlier version may hold a lock this one doesn't take
+- **THEN** running loads are drained first, since an earlier version may hold a lock this one doesn't take, and any launcher (a script or scheduled job) is switched to the new binary before loads resume
 
 #### Scenario: State directory deleted during a load
 - **WHEN** the account deletes the lock file or `~/.local/state/sparkforge` while a load is admitted
 - **THEN** that is unsupported: a load started afterwards locks a new file and isn't coordinated with the admitted one, so the directory must not be removed while sparkforge runs
+
+#### Scenario: A different home mounted at the account's home path
+- **WHEN** a sparkforge process runs as the account but sees a different directory at its home path, as in a container that mounts its own home
+- **THEN** that is unsupported: it takes a different lock file and isn't coordinated with the host's loads, so every sparkforge process on a node must see the same `~/.local/state/sparkforge`
 
 #### Scenario: Memory used after admission
 - **WHEN** `MemAvailable` drops below the guard between admission and upload

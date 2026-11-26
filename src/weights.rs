@@ -1316,6 +1316,11 @@ const USER_LOCK_NAME: &str = "sparkforge-gpu-admission.lock";
 /// `spark`, so that is every load on the node. A node-wide lock shared between accounts was built
 /// in #13 to #15 and removed in SHA-789, since no Spark has a second account. A second account
 /// loading weights on the same GB10 at the same time would need it back.
+///
+/// Every sparkforge process on a node must see the same `~/.local/state/sparkforge`. sparkforge
+/// runs on the host as `spark`; a container that mounted a different directory at that home
+/// path would take a different lock file and isn't coordinated with the host's loads, so running
+/// sparkforge that way is unsupported (only vLLM runs in containers on the Sparks).
 pub fn admission_lock_in(uid: u32, home: impl FnOnce() -> Option<PathBuf>) -> Result<PathBuf> {
     let home = home().with_context(|| format!("no home directory for uid {uid} in the password database"))?;
     let d = home.join(".local/state/sparkforge");
