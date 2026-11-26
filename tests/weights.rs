@@ -995,6 +995,11 @@ fn a_holder_that_outlasts_the_wait_never_leads_to_an_admission() {
     // The first attempt finds the lock held. During the pause before the next attempt, the
     // deadline passes and only then is the lock released, so the next attempt would get it.
     // Admission still times out. The pause is the test's own, so the order is exact.
+    //
+    // The clock starts at the first pause, not before `admit_with` is called. Admission computes
+    // its deadline before its first attempt, and the first pause follows that attempt, so waiting
+    // past `wait` from the first pause always ends after admission's own deadline, however long
+    // the test thread is descheduled before admission starts (codex-review of #16, cycle 3).
     use sparkforge::weights::{admit_with, AdmitHooks};
     use std::time::{Duration, Instant};
     let lock = dir("late-release").join("sparkforge-gpu-admission.lock");
@@ -1003,8 +1008,9 @@ fn a_holder_that_outlasts_the_wait_never_leads_to_an_admission() {
     holder.lock().unwrap();
     let holder = std::sync::Mutex::new(Some(holder));
     let wait = Duration::from_millis(10);
-    let start = Instant::now();
+    let first_pause = std::sync::OnceLock::<Instant>::new();
     let pause = |_: Duration| {
+        let start = *first_pause.get_or_init(Instant::now);
         while start.elapsed() <= wait {
             std::thread::sleep(Duration::from_millis(1));
         }
