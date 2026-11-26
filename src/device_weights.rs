@@ -50,11 +50,77 @@ pub fn upload(stream: &Arc<CudaStream>, ck: &Checkpoint, b: &Binding, admission:
     Ok(out)
 }
 
+/// A dense BF16 checkpoint in GPU memory for the decode runtime: every linear (fused in kernel row
+/// order), every other tensor the step reads, and their addresses as the step takes them.
+pub struct DenseDevice {
+    _linears: DeviceWeights,
+    _others: HashMap<String, DeviceTensor>,
+    ptrs: crate::forward::WeightPtrs,
+    pub bytes_copied: u64,
+    pub load_secs: f64,
+    /// `MemAvailable` that the admission check read right before allocating.
+    pub mem_available_before: u64,
+}
+
+/// Copies `b` for the decode runtime. `admission` comes from `weights::admit_runtime` with the
+/// same `runtime_bytes`; it is confirmed for everything this copies plus the runtime's buffers
+/// before any allocation, and the caller holds it until the runtime has allocated them.
+pub fn upload_dense(stream: &Arc<CudaStream>, ck: &Checkpoint, b: &Binding, m: &crate::config::ModelSpec, admission: &Admission, runtime_bytes: u64) -> Result<DenseDevice> {
+    use crate::forward::{LayerPtrs, WeightPtrs};
+    let mem_available_before = admission.confirm(crate::weights::dense_bytes(ck, b), STAGING_BYTES + runtime_bytes, mem_available)?;
+    let t0 = Instant::now();
+    let linears = upload(stream, ck, b, admission, false)?;
+    let mut others = HashMap::new();
+    let mut buf = vec![0u8; STAGING_BYTES as usize];
+    let mut bytes = linears.bytes_copied;
+    for name in &b.others {
+        let t = copy_parts(stream, ck, std::slice::from_ref(name), &mut buf).with_context(|| format!("copying {name}"))?;
+        bytes += t.bytes as u64;
+        others.insert(name.clone(), t);
+    }
+    stream.synchronize()?;
+    let lin = |key: String| linears.linears.get(&key).map(|t| t.ptr).with_context(|| format!("{key} was not uploaded"));
+    let oth = |name: String| others.get(&name).map(|t| t.ptr).with_context(|| format!("{name} was not uploaded"));
+    let layers = (0..m.layers)
+        .map(|l| {
+            Ok(LayerPtrs {
+                attn_norm: oth(format!("model.layers.{l}.input_layernorm.weight"))?,
+                qkv: lin(format!("layers.{l}.qkv_proj"))?,
+                o_proj: lin(format!("layers.{l}.o_proj"))?,
+                mlp_norm: oth(format!("model.layers.{l}.post_attention_layernorm.weight"))?,
+                gate_up: lin(format!("layers.{l}.gate_up_proj"))?,
+                down: lin(format!("layers.{l}.down_proj"))?,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let ptrs = WeightPtrs {
+        embed: oth("model.embed_tokens.weight".into())?,
+        embed_rows: m.vocab as usize,
+        final_norm: oth("model.norm.weight".into())?,
+        lm_head: lin("lm_head".into())?,
+        layers,
+    };
+    Ok(DenseDevice { _linears: linears, _others: others, ptrs, bytes_copied: bytes, load_secs: t0.elapsed().as_secs_f64(), mem_available_before })
+}
+
+impl crate::forward::DeviceWeights for DenseDevice {
+    fn weight_ptrs(&self) -> &crate::forward::WeightPtrs {
+        &self.ptrs
+    }
+}
+
 fn copy_linear(stream: &Arc<CudaStream>, ck: &Checkpoint, l: &BoundLinear, buf: &mut [u8]) -> Result<DeviceTensor> {
-    let total: usize = l.parts.iter().map(|p| ck.tensors[p].len() as usize).sum();
+    copy_parts(stream, ck, &l.parts, buf)
+}
+
+/// Copies the named tensors back to back into one GPU allocation.
+fn copy_parts(stream: &Arc<CudaStream>, ck: &Checkpoint, parts: &[String], buf: &mut [u8]) -> Result<DeviceTensor> {
+    let l_parts = parts;
+    let total: usize = l_parts.iter().map(|p| ck.tensors.get(p).map_or(0, |t| t.len() as usize)).sum();
+    anyhow::ensure!(l_parts.iter().all(|p| ck.tensors.contains_key(p)), "a tensor in {l_parts:?} is not in the checkpoint");
     let mut dst = unsafe { stream.alloc::<u8>(total)? };
     let mut off = 0;
-    for p in &l.parts {
+    for p in l_parts {
         let t = &ck.tensors[p];
         let mut done = 0u64;
         while done < t.len() {

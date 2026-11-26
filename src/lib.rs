@@ -15,6 +15,7 @@ pub mod load_plan;
 pub mod plan;
 pub mod reference;
 pub mod target;
+pub mod tokenizer;
 pub mod weights;
 
 #[cfg(feature = "cuda")]

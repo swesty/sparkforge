@@ -44,6 +44,9 @@ that would otherwise be runtime heuristics.
 | `runtime.rs` | NVRTC compile for `sm_121a`, checks cc 12.1, loads every generated entry point via `cudarc`, opts kernels above 48 KB into larger dynamic smem. | Verified on GB10 |
 | `verify.rs` | Runs every generated kernel on random bf16 inputs, diffs against an f64 CPU reference, and optionally times it with weights rotated out of L2. `verify-weights` does the same on a real checkpoint. | Verified on GB10 |
 | `weights.rs`, `device_weights.rs` | Opens HF safetensors checkpoints (single file or sharded), validates every tensor against the plan, and copies each linear into GPU memory with q\|k\|v and gate\|up packed, behind a `MemAvailable` guard. Dense BF16 Llama-family only. | Verified on GB10 |
+| `reference.rs` | Scalar CPU reference for one dense decode step in f64, rounding to bf16 where HF transformers does. It reads random weights or streams a checkpoint. | Tested in CI |
+| `forward.rs` | The generated kernels wired into a dense decode step whose token and position live on the GPU, captured as one CUDA Graph per step. `verify` diffs it against the reference at every layer boundary; `generate` runs it on real weights. | Verified on GB10 |
+| `tokenizer.rs` | Token ids to text for a byte-level BPE `tokenizer.json` (decoding only). | Tested in CI |
 | `inventory.rs` | Every tensor a Qwen3.8 Flash Next checkpoint must hold, with the dtype and shape of each module's format (BF16, MXFP8, NVFP4). `weights` checks all 301,593 tensors of the reference checkpoint against it, and `load-weights` copies them into GPU memory. | Checked on GB10 (host only) |
 
 Generated kernels (all compile for `sm_121a` with NVRTC 13 and match the CPU reference; see "Measured on GB10"):
@@ -56,6 +59,9 @@ Generated kernels (all compile for `sm_121a` with NVRTC 13 and match the CPU ref
   all query heads in the group, so each K/V row is read once per split. Split count is chosen so
   `kv_heads × splits ≥ 2 × 48 SMs`.
 - `silu_mul` — fused SwiGLU on the fused gate/up output.
+- `residual_add` — in place, summed in f32.
+- `embed_gather`, `argmax_advance` — the step's token lookup and greedy choice on the GPU; `argmax_advance` also
+  records the token and advances the device-side position, so one captured graph replays every step.
 - `gemv_<linear>` — one kernel per projection with its own N, K, rows-per-warp, and grid; weights streamed with evict-first loads.
 - `gemv_<linear>` for NVFP4 weights — BF16 activations against 4-bit weights (W4A16), reading the weight loader's
   tile layout (FlashInfer's `GemvBf16Fp4Sm12x` design, re-derived for GB10): one `cvt.rn.f16x2.e2m1x2` per weight
@@ -79,6 +85,8 @@ cargo run --release --features cuda -- load configs/llama-3.1-8b.json --cuda-inc
 cargo run --release --features cuda -- verify configs/llama-3.1-8b.json --bench   # correctness + timing per kernel
 ./target/release/sparkforge weights /path/to/checkpoint          # validate a safetensors checkpoint (host only)
 cargo run --release --features cuda -- verify-weights /path/to/checkpoint   # GEMVs on the real weights vs f64
+cargo run --release --features cuda -- generate /path/to/llama-3.1-8b --tokens 128000,791,... \
+    --steps 48 --check 3 --tokenizer tokenizer.json --bench-ctx 1024,4096,32768   # greedy decode, one graph per step
 cargo test
 ```
 
@@ -111,6 +119,18 @@ no CUDA graph.
   group 8 uses exactly 128 registers, the `__launch_bounds__(256, 2)` cap, so group 16 would spill.
 - Small MoE GEMVs are latency-bound (`gemv_router` 95 GB/s; each BF16 expert GEMV is a separate launch). The NVFP4
   expert GEMVs cover all top-k experts in one launch.
+
+**End-to-end decode** (`generate`, Llama 3.1 8B BF16, spark-5, CUDA 13.0, 2026-11-26, the GPU otherwise idle; one CUDA
+Graph per step, 32 replays timed at each context, 14.96 GiB loaded in 8 s):
+
+| Context | Measured | Planner ceiling | Sum of isolated kernel times |
+|---|---|---|---|
+| 1K | 15.5 tok/s (64.7 ms) | 15.5 | 15.5 |
+| 4K | 15.0 tok/s (66.5 ms) | 15.1 | 15.6 |
+| 32K | 12.1 tok/s (82.4 ms) | 12.2 | 12.2 |
+
+The first 24 steps' logits match the CPU reference on the real weights (worst 1.37e-2, tolerance 1/64), and the greedy
+tokens match its argmax in 24 of 24. The output is coherent text.
 
 | NVFP4 GEMV (spark-5, CUDA 13.0, 2026-11-25) | Bytes per launch | Max error | µs | GB/s |
 |---|---|---|---|---|
