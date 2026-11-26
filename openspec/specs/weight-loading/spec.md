@@ -444,7 +444,7 @@ different files can both be admitted before either allocates.
 - **THEN** the launcher is pointed at the incoming binary before it resumes, so it dispatches the incoming version instead of failing on the disabled copy
 
 #### Scenario: Rollback
-- **WHEN** a node rolls back to the version it ran before
+- **WHEN** a node rolls back to the version it ran before, and that version isn't retired (see "Loaders older than SHA-765 are retired")
 - **THEN** the same rule applies with the roles swapped: the newer version's launchers stop, its pending invocations are cancelled and its copies are disabled, and the switch waits until every command that may run it has exited or been cancelled; then the older copy is made runnable again, and every launcher that keeps dispatching is pointed back at it before it resumes
 
 ### Requirement: Loaders older than SHA-765 are retired
@@ -456,7 +456,11 @@ so loads under any two of them are serialized by admission in whatever order ver
 
 #### Scenario: Kept checkout of a retired loader
 - **WHEN** a source checkout, build output or binary of a loader older than SHA-765 is still on a Spark, including one kept after a switch has finished
-- **THEN** it is not built or run, and it is removed from the node, since it locks `$XDG_RUNTIME_DIR` or a temp-directory path that a current load never takes; retirement doesn't end when the switch does
+- **THEN** it is not built or run; its launchers stop, its pending invocations are cancelled, and once every running invocation of it has exited it is removed from the node, since removing its files doesn't stop a running process and it locks `$XDG_RUNTIME_DIR` or a temp-directory path that a current load never takes; retirement doesn't end when the switch does
+
+#### Scenario: Rollback to a retired loader
+- **WHEN** the version a rollback would restore is older than SHA-765, for example one restored from a snapshot
+- **THEN** the rollback is refused before the current version is stopped, so the current version stays runnable; a rollback may only target a version from SHA-765 on
 
 #### Scenario: Overlapping switches
 - **WHEN** two version switches overlap on one node, such as an upgrade and a rollback that each make a different version runnable

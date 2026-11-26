@@ -14,6 +14,10 @@ Detecting those old locks at run time was tried and removed in SHA-788 (#15, `ef
 
 - **New requirement, "Loaders older than SHA-765 are retired":** no build whose loader predates SHA-765 may be built, run or rolled back to on a Spark, including from a kept checkout. Loads under any two later versions are serialized by the shared user lock, whatever order versions are switched in.
 - **Scenarios:** "Kept checkout of a retired loader" (`fp:10a6fa12ef96`), "Overlapping switches" (`fp:1b92534be296`), and "Telling a retired loader apart" (the user-lock test; builds without the `cuda` feature have no loader).
+- **codex-review cycle 1 on this change:**
+  - `fp:525a1ca7c462`: the cutover rule's "Rollback" scenario still said to make the previous version runnable, even a retired one. It now applies only when that version isn't retired, and the new scenario "Rollback to a retired loader" refuses such a rollback before the current version is stopped.
+  - `fp:68a8eb5b762e`: removing a retired copy doesn't stop a load already running from it. "Kept checkout of a retired loader" now stops its launchers, cancels pending invocations and waits for running ones to exit before removing it. (On spark-5, `pgrep -af sparkforge` was empty before the removal.)
+  - `fp:8918c466aaf1` (two accounts with different homes on one Spark) is out of scope: the weight-loading spec already assumes one account per node and requires every sparkforge process on a node to see the same `~/.local/state/sparkforge`.
 - **Fleet (done with this change):**
   - The only pre-SHA-765 copy on any Spark was spark-5 `~/experiments/sparkforge-probe` (Nov 20, source only). It is removed.
   - Its one file not in git history, `examples/probe_sm121a.rs`, is a standalone 84-line sm_121a capability probe that doesn't use the loader. It is kept as `~/experiments/probe_sm121a.rs`.
@@ -30,7 +34,7 @@ Detecting those old locks at run time was tried and removed in SHA-788 (#15, `ef
 ## Capabilities
 
 ### Modified Capabilities
-- `weight-loading`: adds the requirement "Loaders older than SHA-765 are retired".
+- `weight-loading`: adds the requirement "Loaders older than SHA-765 are retired", and limits the cutover rule's "Rollback" scenario to versions that aren't retired.
 
 ## Impact
 
