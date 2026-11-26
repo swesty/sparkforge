@@ -393,5 +393,36 @@ fn the_prefill_estimate_sums_layers_of_gemms_and_one_lm_head() {
     let (t, tokens) = prefill_estimate_us(&p, &rows("")).unwrap();
     assert_eq!(tokens, 2048);
     assert!((t - (32.0 * 12900.0 + 4400.0)).abs() < 1e-6, "{t}");
-    assert!(prefill_estimate_us(&p, &rows("gemm_down_proj")).is_none(), "an untimed GEMM gives no estimate");
+    let e = prefill_estimate_us(&p, &rows("gemm_down_proj")).unwrap_err();
+    assert!(e.contains("gemm_down_proj"), "an untimed GEMM gives no estimate and names it: {e}");
+}
+
+#[test]
+fn a_bf16_shape_gets_a_tile_that_divides_it_when_one_exists() {
+    // N = 2 x 14400 = 28800: 128 divides it, 256 doesn't. The 128x256 tile scores higher, but only a
+    // dividing tile has a generated kernel.
+    let mut v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string("configs/llama-3.1-8b.json").unwrap()).unwrap();
+    v["intermediate_size"] = 14400.into();
+    let p = plan::build(&ModelSpec::from_json(&v.to_string(), None).unwrap(), &GB10, &plan::PlanOpts { prefill_tokens: 2048, ctx: 4096 });
+    let t = p.gemm.iter().find(|t| t.linear == "gate_up_proj").unwrap();
+    assert_eq!(t.n, 28800);
+    assert_eq!(t.n % t.bn, 0, "{t:?}");
+    let g = codegen::generate(&p);
+    assert_eq!(g.kernels.iter().find(|k| k.entry == "gemm_gate_up_proj").unwrap().status, "generated");
+}
+
+#[test]
+fn the_prefill_estimate_counts_a_shared_experts_gemms() {
+    use sparkforge::estimate::{prefill_estimate_us, Row};
+    let mut p = load("configs/qwen3-30b-a3b.json");
+    p.model.moe.as_mut().unwrap().shared_experts = 1;
+    let experts = p.model.moe.as_ref().unwrap().num_experts as f64;
+    let mut us = vec![("gemm_qkv_proj", 600.0), ("gemm_o_proj", 500.0), ("gemm_router", 40.0), ("gemm_expert_gate_up", 25.0), ("gemm_expert_down", 16.0), ("gemv_lm_head", 4000.0)];
+    let row = |&(k, t): &(&str, f64)| Row { kernel: k.into(), case: String::new(), err: 0.0, us: Some(t), gbs: None };
+    let e = prefill_estimate_us(&p, &us.iter().map(row).collect::<Vec<_>>()).unwrap_err();
+    assert!(e.contains("gemm_shared_gate_up"), "{e}");
+    us.extend([("gemm_shared_gate_up", 30.0), ("gemm_shared_down", 20.0)]);
+    let (t, _) = prefill_estimate_us(&p, &us.iter().map(row).collect::<Vec<_>>()).unwrap();
+    let layer = 600.0 + 500.0 + 40.0 + experts * (25.0 + 16.0) + 30.0 + 20.0;
+    assert!((t - (p.model.layers as f64 * layer + 4000.0)).abs() < 1e-6, "{t}");
 }

@@ -47,23 +47,23 @@ pub fn token_estimate_us(p: &Plan, rows: &[Row]) -> Option<f64> {
 }
 
 /// Prefill time for the planned prompt length from isolated GEMM times: per layer the q/k/v,
-/// o_proj and MLP GEMMs (for MoE, the router plus one expert GEMM pair per expert at the planned
-/// tokens per expert), then `gemv_lm_head` once for the last position. Attention, norms, RoPE and
-/// activations are not included. Returns (microseconds, prompt tokens), or None if a GEMM the
-/// prompt needs was not generated or not timed.
-pub fn prefill_estimate_us(p: &Plan, rows: &[Row]) -> Option<(f64, u32)> {
+/// o_proj and MLP GEMMs (for MoE, the router, one expert GEMM pair per expert at the planned tokens
+/// per expert, and the shared expert's pair), then `gemv_lm_head` once for the last position.
+/// Attention, norms, RoPE and activations are not included. Returns (microseconds, prompt tokens),
+/// or the name of the kernel that has no timing.
+pub fn prefill_estimate_us(p: &Plan, rows: &[Row]) -> Result<(f64, u32), String> {
     let t: HashMap<&str, f64> = rows.iter().filter_map(|r| Some((r.kernel.as_str(), r.us?))).collect();
-    let g = |k: &str| t.get(k).copied();
-    let tokens = p.gemm.iter().find(|t| t.linear == "qkv_proj")?.m;
+    let g = |k: &str| t.get(k).copied().ok_or_else(|| format!("{k} was not generated or not timed"));
+    let tokens = p.gemm.iter().find(|t| t.linear == "qkv_proj").ok_or("no qkv_proj GEMM is planned")?.m;
     let mut layer = g("gemm_qkv_proj")? + g("gemm_o_proj")?;
     match &p.model.moe {
         None => layer += g("gemm_gate_up_proj")? + g("gemm_down_proj")?,
         Some(e) => {
             layer += g("gemm_router")? + e.num_experts as f64 * (g("gemm_expert_gate_up")? + g("gemm_expert_down")?);
             if e.shared_experts > 0 {
-                return None;
+                layer += g("gemm_shared_gate_up")? + g("gemm_shared_down")?;
             }
         }
     }
-    Some((p.model.layers as f64 * layer + g("gemv_lm_head")?, tokens))
+    Ok((p.model.layers as f64 * layer + g("gemv_lm_head")?, tokens))
 }

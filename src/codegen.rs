@@ -297,6 +297,8 @@ const GEMM: &str = r#"
 namespace @NS@ {
 // C[M][N] = A[M][K] . W[N][K]^T in bf16 with f32 accumulation. N, K and the tile are compile-time;
 // M (the prompt length) is a launch argument, with rows past M zero-filled on load and not stored.
+// A and W must be 16-byte aligned (16-byte cp.async) and C 4-byte aligned; `prefill::gemm` checks
+// that, and sizes the grid as ceil(M / BM) * N / BN, before launching.
 constexpr int N = @N@, K = @K@, BM = @BM@, BN = @BN@, BK = @BK@, STAGES = @STAGES@, GROUP_N = @GROUP_N@;
 constexpr int WM = 64, WN = @WN@;                     // warp tile: 4 x WN/8 mma.sync m16n8k16
 constexpr int WARPS_N = BN / WN, THREADS = (BM / WM) * WARPS_N * 32;
@@ -315,6 +317,9 @@ extern "C" __global__ void __launch_bounds__(@NS@::THREADS)
   // Tile order: groups of GROUP_N N tiles; inside a group N varies fastest, so consecutive CTAs
   // share an A tile and the group's W tiles stay in L2 while every M tile reuses them.
   const int nt_m = (M + BM - 1) / BM;
+  // A grid sized for a longer prompt (the manifest's, for the planned M) has blocks past the last
+  // tile: they exit before computing tile coordinates.
+  if (M <= 0 || (int)blockIdx.x >= nt_m * NT_N) return;
   const int per_group = GROUP_N * nt_m, group = blockIdx.x / per_group, first_n = group * GROUP_N;
   const int gsize = min(NT_N - first_n, GROUP_N), in_group = blockIdx.x - group * per_group;
   const int tn = first_n + in_group % gsize, tm = in_group / gsize;

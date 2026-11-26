@@ -6,3 +6,4 @@
 - [x] 1.4 CI tests: no `lm_head` GEMM, padded shared memory and warp counts, the L2 order rule, generated vs planned by format, the estimate; goldens regenerated
 - [x] 1.5 GB10 (spark-5): both models pass; tile sweep and raster comparison; cuBLAS baseline from PyTorch
 - [x] 1.6 `openspec validate add-bf16-prefill-gemm --strict`, archive, `verify.sh`
+- [x] 1.7 Review cycle 1: in-kernel exit past the last tile and `prefill::gemm` (`fp:e2719f559050`, `fp:ce42d0643802`), dividing tiles first (`fp:25ef53094238`), shared experts in the estimate (`fp:01f50afe3619`)

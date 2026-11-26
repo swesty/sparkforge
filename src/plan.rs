@@ -712,7 +712,13 @@ pub fn plan_gemv_fp4(l: &Linear, m: &ModelSpec, t: &Target) -> GemvPlan {
     }
 }
 
+/// The best legal tile for `l`, preferring one whose BN divides N (the only kind the BF16 GEMM is
+/// generated for); a shape no BN divides still gets its best tile, which stays planned.
 fn plan_gemm(l: &Linear, m: u32, t: &Target) -> GemmTile {
+    plan_gemm_where(l, m, t, true).or_else(|| plan_gemm_where(l, m, t, false)).expect("no legal GEMM tile for this shape")
+}
+
+fn plan_gemm_where(l: &Linear, m: u32, t: &Target, n_divides: bool) -> Option<GemmTile> {
     let mut best: Option<GemmTile> = None;
     for &bm in &[64u32, 128] {
         for &bn in &[64u32, 128, 256] {
@@ -735,7 +741,7 @@ fn plan_gemm(l: &Linear, m: u32, t: &Target) -> GemmTile {
                     let ctas_by_reg = t.regs_per_sm / (threads * regs);
                     let ctas = ctas_by_smem.min(ctas_by_thr).min(ctas_by_reg);
                     if ctas == 0 { continue; }
-                    if l.k % bk != 0 { continue; }
+                    if !l.k.is_multiple_of(bk) || (n_divides && !l.n.is_multiple_of(bn)) { continue; }
                     let tiles = ceil_div(m, bm) * ceil_div(l.n, bn);
                     let slots = t.sm_count * ctas;
                     let waves = ceil_div(tiles, slots);
@@ -756,7 +762,7 @@ fn plan_gemm(l: &Linear, m: u32, t: &Target) -> GemmTile {
             }
         }
     }
-    best.expect("no legal GEMM tile for this shape")
+    best
 }
 
 /// For an activation matrix larger than L2: the most N tiles per L2 group such that one wave's

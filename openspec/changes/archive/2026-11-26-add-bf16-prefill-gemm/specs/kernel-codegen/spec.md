@@ -41,3 +41,18 @@ planned `group_n` order, rows past M zero-filled on load and not stored.
 #### Scenario: Ragged prompt
 - **WHEN** a GEMM runs with M 37 rows short of the planned length
 - **THEN** the rows below M match the reference and the rows past M are left as they were
+
+### Requirement: Prefill GEMMs launch through a checked host call
+
+`prefill::gemm` SHALL launch a generated prefill GEMM for M prompt rows with a grid of
+ceil(M / BM) x N / BN, after checking that A holds M x K elements, W exactly N x K, C M x N, A and W
+are 16-byte aligned and C 4-byte aligned. A launch with a larger grid, such as the manifest's for the
+planned M, SHALL leave its extra blocks idle.
+
+#### Scenario: Misaligned activations
+- **WHEN** A is a view one element past an aligned allocation
+- **THEN** `prefill::gemm` refuses it before launching
+
+#### Scenario: Manifest grid for a shorter prompt
+- **WHEN** a Llama GEMM is launched with the manifest's grid (for M = 2048) and M = 1024
+- **THEN** the output matches the reference and rows past 1024 are untouched (without the in-kernel exit, the same launch faulted with an illegal address)

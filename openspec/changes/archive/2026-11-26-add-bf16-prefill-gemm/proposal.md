@@ -30,6 +30,12 @@ The planner tiled every prefill GEMM, but each `gemm_<linear>` was `planned`: pr
   - `--bench` reports TFLOP/s and prints a GEMM-only prefill estimate (`estimate::prefill_estimate_us`).
 - **Goldens:** `tests/golden/*.plan.json` are regenerated for the deliberate plan change: tiles, notes, no `lm_head` GEMM.
 
+- **codex-review cycle 1 on this change:**
+  - `fp:e2719f559050` (P1): a grid sized for the planned M launched for a shorter prompt made the extra blocks read past W. The kernel now exits blocks past the last tile, and `prefill::gemm` sizes the grid from M. Without the exit, that launch faulted on GB10.
+  - `fp:ce42d0643802`: `prefill::gemm` checks the alignment of A, W and C, and the buffer lengths, before launching.
+  - `fp:25ef53094238`: the planner prefers a tile whose BN divides N.
+  - `fp:01f50afe3619`: the prefill estimate includes a shared expert's GEMMs and names any untimed kernel.
+
 **Expected GB10 effect:**
 - Llama 3.1 8B prefill GEMMs run at 65.6-75.1 TFLOP/s, 70-92% of cuBLAS on the same GPU (81-101 TFLOP/s, PyTorch 2.13 in the vLLM image).
 - The GEMMs of a 2048-token prompt take about 403 ms (about 5,080 tok/s). Decode is unchanged.

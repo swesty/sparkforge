@@ -484,9 +484,11 @@ fn main() -> Result<()> {
                 println!("decode token, sum of isolated kernel times @ ctx {}: {:.2} ms -> {:.1} tok/s (planner ceiling {:.1})",
                     p.budget.ctx, t / 1e3, 1e6 / t, p.budget.decode_tok_s_ceiling);
             }
-            if let Some((t, tokens)) = sparkforge::estimate::prefill_estimate_us(&p, &rows) {
-                println!("prefill, sum of isolated GEMM times for a {tokens}-token prompt: {:.1} ms -> {:.0} tok/s (GEMMs and the last position's lm_head only; attention, norms, RoPE and activations not included)",
-                    t / 1e3, tokens as f64 * 1e6 / t);
+            match sparkforge::estimate::prefill_estimate_us(&p, &rows) {
+                Ok((t, tokens)) => println!("prefill, sum of isolated GEMM times for a {tokens}-token prompt: {:.1} ms -> {:.0} tok/s (GEMMs and the last position's lm_head only; attention, norms, RoPE and activations not included)",
+                    t / 1e3, tokens as f64 * 1e6 / t),
+                Err(e) if bench => println!("prefill estimate skipped: {e}"),
+                Err(_) => {}
             }
             anyhow::ensure!(fails == 0, "{fails} check(s) above tolerance {:.4}", verify::TOL);
         }

@@ -48,3 +48,12 @@ there, or else the group with the smallest such working set, from the target's S
 #### Scenario: Llama on GB10
 - **WHEN** Llama 3.1 8B is planned with a 2048-token prompt
 - **THEN** `qkv_proj`, `o_proj` and `gate_up_proj` (16 MiB of activations) walk M, and `down_proj` (56 MiB) uses groups of 4 N tiles
+
+### Requirement: A prefill tile divides N when a legal one does
+
+The planner SHALL prefer tiles whose BN divides N, the only kind the BF16 GEMM is generated for, and
+SHALL fall back to the best legal tile only when no BN divides N.
+
+#### Scenario: N = 28800
+- **WHEN** a BF16 model has `gate_up_proj` N = 28800 (128 divides it, 256 doesn't)
+- **THEN** its tile's BN divides 28800 and `gemm_gate_up_proj` is generated

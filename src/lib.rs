@@ -26,3 +26,5 @@ pub mod verify;
 pub mod device_weights;
 #[cfg(feature = "cuda")]
 pub mod forward;
+#[cfg(feature = "cuda")]
+pub mod prefill;

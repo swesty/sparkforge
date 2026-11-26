@@ -590,11 +590,17 @@ impl Ctx<'_> {
             let (da, dw) = (s.memcpy_stod(&a)?, s.memcpy_stod(&w)?);
             let mut err = 0f64;
             let mut untouched = true;
-            for mr in [m, m.saturating_sub(37).max(1)] {
+            // The planned M and 37 rows fewer through `prefill::gemm` (grid from M), then half the
+            // planned M launched raw with the manifest's grid (for the planned M): its extra blocks
+            // must exit without touching anything.
+            for (mr, manifest_grid) in [(m, false), (m.saturating_sub(37).max(1), false), ((m / 2).max(1), true)] {
                 let mut dc = s.memcpy_stod(&vec![0xffffu16; m * n])?;
-                let grid = (mr.div_ceil(bm) * (n / bn)) as u32;
-                let m32 = mr as i32;
-                unsafe { s.launch_builder(f).arg(&da).arg(&dw).arg(&mut dc).arg(&m32).launch(cfg([grid, 1, 1], k.block, k.dyn_smem))? };
+                if manifest_grid {
+                    let m32 = mr as i32;
+                    unsafe { s.launch_builder(f).arg(&da).arg(&dw).arg(&mut dc).arg(&m32).launch(cfg(k.grid, k.block, k.dyn_smem))? };
+                } else {
+                    crate::prefill::gemm(&s, &t, k, f, &da.slice(..), &dw.slice(..), &mut dc.slice_mut(..), mr)?;
+                }
                 let c = s.memcpy_dtov(&dc)?;
                 untouched &= c[mr * n..].iter().all(|&v| v == 0xffff);
                 let mut rows: Vec<usize> = vec![0, 1, bm - 1, bm, mr / 2, mr.saturating_sub(bm), mr.saturating_sub(2), mr - 1];
@@ -615,7 +621,12 @@ impl Ctx<'_> {
                     err = err.max(max_err(&got, &want));
                 }
             }
-            if !untouched {
+            // An A view one element (2 bytes) past an aligned base is refused before launch.
+            let refused = {
+                let mut dc = s.alloc_zeros::<u16>(m * n)?;
+                crate::prefill::gemm(&s, &t, k, f, &da.slice(1..), &dw.slice(..), &mut dc.slice_mut(..), m - 1).is_err()
+            };
+            if !untouched || !refused {
                 err = f64::INFINITY;
             }
             let flop = 2.0 * (m * n * kk) as f64;
@@ -628,7 +639,7 @@ impl Ctx<'_> {
                 })?)
             } else { None };
             let tf = us.map_or(String::new(), |u| format!(", {:.1} TFLOP/s", flop / (u * 1e-6) / 1e12));
-            let case = format!("{m}x{n}x{kk}{}{tf}", if untouched { "" } else { ", ROWS PAST M WRITTEN" });
+            let case = format!("{m}x{n}x{kk}{}{}{tf}", if untouched { "" } else { ", ROWS PAST M WRITTEN" }, if refused { "" } else { ", MISALIGNED A LAUNCHED" });
             self.push(&entry, case, err, us, ((m * kk + n * kk + m * n) * 2) as f64);
         }
         Ok(())
