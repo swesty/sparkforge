@@ -84,18 +84,20 @@ rmsnorm(const bf16* __restrict__ x, const bf16* __restrict__ w, bf16* __restrict
 
 const ROPE_KV: &str = r#"
 namespace rope_ns {
-constexpr int HD = @HD@, HEADS = @HEADS@, KVH = @KVH@;
+constexpr int HD = @HD@, HEADS = @HEADS@, KVH = @KVH@, QKV = (HEADS + 2 * KVH) * HD;
 // inv_freq[i] = 1 / theta^(2i/HD), computed on the host in f32 exactly as HF transformers does.
 __constant__ float INV_FREQ[HD / 2] = {@INV_FREQ@};
 }
-// Decode step, one token: rotates q and k in the fused qkv buffer (NeoX half-split layout)
-// and appends k/v into the cache at the position `*pos_p`, read from device memory so one
-// captured CUDA Graph serves every step. Grid = HEADS + 2*KVH, block = HD/2.
+// Rotates q and k in the fused qkv buffer (NeoX half-split layout) and appends k/v into the cache.
+// Row blockIdx.y of qkv is at position `*pos_p + blockIdx.y`, the start read from device memory so
+// one captured CUDA Graph serves every decode step (one row, grid.y = 1); prefill launches one row
+// per prompt token (grid.y = M), so a prompt row is rotated exactly as a decode step rotates it.
+// Grid = (HEADS + 2*KVH, rows), block = HD/2.
 extern "C" __global__ void __launch_bounds__(rope_ns::HD / 2)
 rope_kv_append(bf16* __restrict__ qkv, bf16* __restrict__ k_cache, bf16* __restrict__ v_cache, const int* __restrict__ pos_p) {
   using namespace rope_ns;
-  const int h = blockIdx.x, i = threadIdx.x, pos = *pos_p;
-  bf16* base = qkv + (size_t)h * HD;
+  const int h = blockIdx.x, i = threadIdx.x, pos = *pos_p + (int)blockIdx.y;
+  bf16* base = qkv + (size_t)blockIdx.y * QKV + (size_t)h * HD;
   if (h < HEADS + KVH) {
     // The angle is formed in f32 (as HF does), but sin/cos must be precise: under --use_fast_math
     // sincosf becomes __sincosf, whose error grows with |angle| (pos * inv_freq reaches ~1e5 rad).
@@ -212,14 +214,190 @@ attn_decode_combine(const float* __restrict__ part_ml, const float* __restrict__
 }
 "#;
 
+const ATTN_PREFILL: &str = r#"
+namespace attn_prefill_ns {
+constexpr int HD = @HD@, HEADS = @HEADS@, KVH = @KVH@, GROUP = HEADS / KVH, QKV = (HEADS + 2 * KVH) * HD;
+constexpr int BM = @BM@, BN = @BN@, STAGES = @STAGES@, WARPS = BM / 16, THREADS = WARPS * 32;
+constexpr int LDS = HD + @PAD@;                // smem row stride (bf16): 16-byte pad
+constexpr int KV_STAGE = BN * LDS, CHUNKS = HD / 8;
+constexpr int KS = HD / 16, NS = BN / 8, DS = HD / 8;  // k-steps over HD; S and O n-tiles of 8
+static_assert(HD % 16 == 0 && BN % 16 == 0 && BM % 16 == 0 && STAGES >= 2 && HEADS % KVH == 0, "attn_prefill shape");
+}
+// Causal prefill attention, FlashAttention-2 style on mma.sync m16n8k16. Prompt row r (of M) is at
+// position start + r and attends to cache positions 0..start + r. Q is the first HEADS * HD values
+// of each qkv row (after RoPE); K/V are read from the decode cache layout [pos][KVH][HD], which
+// already holds positions 0..start + M - 1; out is [M][HEADS * HD]. Grid (HEADS, ceil(M / BM)):
+// the heads sharing a kv head are adjacent, so their K/V tiles come from L2, and blockIdx.y runs the
+// longest query tiles first. Each warp owns 16 query rows, holds its Q fragments in registers, and
+// keeps an fp32 online softmax (scale_log2 = log2(e) / sqrt(HD), exp2). P is rounded to bf16 for
+// the P.V product. K/V tiles stream through a STAGES-deep cp.async pipeline that reuses the Q
+// tile's shared memory.
+extern "C" __global__ void __launch_bounds__(attn_prefill_ns::THREADS)
+attn_prefill(const bf16* __restrict__ qkv, const bf16* __restrict__ k_cache, const bf16* __restrict__ v_cache,
+             bf16* __restrict__ out, int M, int start, float scale_log2) {
+  using namespace attn_prefill_ns;
+  extern __shared__ __align__(16) unsigned char smem_raw[];
+  bf16* const sm = reinterpret_cast<bf16*>(smem_raw);
+  const int nt_m = (M + BM - 1) / BM;
+  if (M <= 0 || (int)blockIdx.y >= nt_m) return;
+  const int h = blockIdx.x, kvh = h / GROUP, r0 = (nt_m - 1 - (int)blockIdx.y) * BM;
+  const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
+  // Q tile (rows past M zero-filled) into shared memory, then into registers.
+  for (int i = tid; i < BM * CHUNKS; i += THREADS) {
+    const int r = i / CHUNKS, c = i % CHUNKS, gr = r0 + r;
+    const bf16* src = qkv + (size_t)min(gr, M - 1) * QKV + h * HD + c * 8;
+    const unsigned dst = (unsigned)__cvta_generic_to_shared(sm + r * LDS + c * 8);
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;" :: "r"(dst), "l"(src), "r"(gr < M ? 16 : 0));
+  }
+  asm volatile("cp.async.commit_group;");
+  asm volatile("cp.async.wait_group 0;");
+  __syncthreads();
+  unsigned qf[KS][4];
+#pragma unroll
+  for (int kk = 0; kk < KS; ++kk) {
+    const unsigned p = (unsigned)__cvta_generic_to_shared(sm + (warp * 16 + (lane & 15)) * LDS + kk * 16 + (lane >> 4) * 8);
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];"
+                 : "=r"(qf[kk][0]), "=r"(qf[kk][1]), "=r"(qf[kk][2]), "=r"(qf[kk][3]) : "r"(p));
+  }
+  __syncthreads();  // the K/V stages below overwrite the Q tile
+  // Keys this tile needs: positions 0 .. kv_end - 1, the last real row's position included.
+  const int kv_end = start + min(r0 + BM, M), n_tiles = (kv_end + BN - 1) / BN;
+  bf16* const sK = sm;
+  bf16* const sV = sm + STAGES * KV_STAGE;
+  auto load = [&](int stage, int j) {
+    for (int i = tid; i < BN * CHUNKS; i += THREADS) {
+      const int r = i / CHUNKS, c = i % CHUNKS, p = j * BN + r;
+      const size_t off = ((size_t)min(p, kv_end - 1) * KVH + kvh) * HD + c * 8;
+      const int sz = p < kv_end ? 16 : 0;
+      const unsigned dk = (unsigned)__cvta_generic_to_shared(sK + stage * KV_STAGE + r * LDS + c * 8);
+      const unsigned dv = (unsigned)__cvta_generic_to_shared(sV + stage * KV_STAGE + r * LDS + c * 8);
+      asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;" :: "r"(dk), "l"(k_cache + off), "r"(sz));
+      asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;" :: "r"(dv), "l"(v_cache + off), "r"(sz));
+    }
+  };
+  // This thread's two rows of the warp's 16: g and g + 8 (the mma accumulator layout).
+  const int qp0 = start + r0 + warp * 16 + (lane >> 2), qp1 = qp0 + 8;
+  const int warp_first = start + r0 + warp * 16;
+  float mrow[2] = {NEG_INF, NEG_INF}, lrow[2] = {0.f, 0.f};
+  float o[DS][4];
+#pragma unroll
+  for (int d = 0; d < DS; ++d)
+#pragma unroll
+    for (int e = 0; e < 4; ++e) o[d][e] = 0.f;
+#pragma unroll
+  for (int s = 0; s < STAGES - 1; ++s) {
+    if (s < n_tiles) load(s, s);
+    asm volatile("cp.async.commit_group;");
+  }
+  for (int j = 0; j < n_tiles; ++j) {
+    asm volatile("cp.async.wait_group %0;" :: "n"(STAGES - 2));
+    __syncthreads();  // tile j is resident, and every warp is done with the stage refilled below
+    if (j + STAGES - 1 < n_tiles) load((j + STAGES - 1) % STAGES, j + STAGES - 1);
+    asm volatile("cp.async.commit_group;");
+    // Keys past this warp's last row are masked for all its rows: skip the tile's math.
+    if (j * BN > warp_first + 15) continue;
+    const bf16* k = sK + (j % STAGES) * KV_STAGE;
+    const bf16* v = sV + (j % STAGES) * KV_STAGE;
+    float s[NS][4];
+#pragma unroll
+    for (int n = 0; n < NS; ++n)
+#pragma unroll
+      for (int e = 0; e < 4; ++e) s[n][e] = 0.f;
+#pragma unroll
+    for (int kk = 0; kk < KS; ++kk) {
+#pragma unroll
+      for (int n = 0; n < NS; n += 2) {
+        unsigned b0, b1, b2, b3;
+        const unsigned p = (unsigned)__cvta_generic_to_shared(k + (n * 8 + (lane & 7) + ((lane >> 4) << 3)) * LDS + kk * 16 + ((lane >> 3) & 1) * 8);
+        asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];" : "=r"(b0), "=r"(b1), "=r"(b2), "=r"(b3) : "r"(p));
+        asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+                     : "+f"(s[n][0]), "+f"(s[n][1]), "+f"(s[n][2]), "+f"(s[n][3])
+                     : "r"(qf[kk][0]), "r"(qf[kk][1]), "r"(qf[kk][2]), "r"(qf[kk][3]), "r"(b0), "r"(b1));
+        asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+                     : "+f"(s[n + 1][0]), "+f"(s[n + 1][1]), "+f"(s[n + 1][2]), "+f"(s[n + 1][3])
+                     : "r"(qf[kk][0]), "r"(qf[kk][1]), "r"(qf[kk][2]), "r"(qf[kk][3]), "r"(b2), "r"(b3));
+      }
+    }
+    // Scale into the log2 domain, mask keys past each row's position, and update the running max.
+    const bool diag = j * BN + BN - 1 > warp_first;
+    float mx[2] = {mrow[0], mrow[1]};
+#pragma unroll
+    for (int n = 0; n < NS; ++n)
+#pragma unroll
+      for (int e = 0; e < 4; ++e) {
+        float x = s[n][e] * scale_log2;
+        if (diag && j * BN + n * 8 + (lane & 3) * 2 + (e & 1) > (e < 2 ? qp0 : qp1)) x = NEG_INF;
+        s[n][e] = x;
+        mx[e >> 1] = fmaxf(mx[e >> 1], x);
+      }
+    float alpha[2];
+#pragma unroll
+    for (int i = 0; i < 2; ++i) {
+      mx[i] = fmaxf(mx[i], __shfl_xor_sync(0xffffffffu, mx[i], 1));
+      mx[i] = fmaxf(mx[i], __shfl_xor_sync(0xffffffffu, mx[i], 2));
+      // Tile 0 holds position 0, which every row attends, so the max is finite from the first tile on.
+      alpha[i] = exp2f(mrow[i] - mx[i]);
+      mrow[i] = mx[i];
+      lrow[i] *= alpha[i];
+    }
+#pragma unroll
+    for (int d = 0; d < DS; ++d) { o[d][0] *= alpha[0]; o[d][1] *= alpha[0]; o[d][2] *= alpha[1]; o[d][3] *= alpha[1]; }
+    // P = exp2(s - max); each pair of S n-tiles is one A fragment of the P.V product.
+#pragma unroll
+    for (int kk = 0; kk < BN / 16; ++kk) {
+      unsigned a[4];
+#pragma unroll
+      for (int half = 0; half < 2; ++half) {
+        const int n = 2 * kk + half;
+        const float p0 = exp2f(s[n][0] - mrow[0]), p1 = exp2f(s[n][1] - mrow[0]);
+        const float p2 = exp2f(s[n][2] - mrow[1]), p3 = exp2f(s[n][3] - mrow[1]);
+        lrow[0] += p0 + p1; lrow[1] += p2 + p3;
+        __nv_bfloat162 lo = __floats2bfloat162_rn(p0, p1), hi = __floats2bfloat162_rn(p2, p3);
+        a[2 * half] = *reinterpret_cast<unsigned*>(&lo);
+        a[2 * half + 1] = *reinterpret_cast<unsigned*>(&hi);
+      }
+#pragma unroll
+      for (int d = 0; d < DS; d += 2) {
+        unsigned b0, b1, b2, b3;
+        const unsigned p = (unsigned)__cvta_generic_to_shared(v + (kk * 16 + ((lane >> 3) & 1) * 8 + (lane & 7)) * LDS + d * 8 + (lane >> 4) * 8);
+        asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];" : "=r"(b0), "=r"(b1), "=r"(b2), "=r"(b3) : "r"(p));
+        asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+                     : "+f"(o[d][0]), "+f"(o[d][1]), "+f"(o[d][2]), "+f"(o[d][3])
+                     : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+        asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+                     : "+f"(o[d + 1][0]), "+f"(o[d + 1][1]), "+f"(o[d + 1][2]), "+f"(o[d + 1][3])
+                     : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b2), "r"(b3));
+      }
+    }
+  }
+  asm volatile("cp.async.wait_group 0;");
+  // Each row's sum is spread over the 4 lanes that share it.
+#pragma unroll
+  for (int i = 0; i < 2; ++i) {
+    lrow[i] += __shfl_xor_sync(0xffffffffu, lrow[i], 1);
+    lrow[i] += __shfl_xor_sync(0xffffffffu, lrow[i], 2);
+  }
+  const int r = r0 + warp * 16 + (lane >> 2);
+  const float inv0 = 1.f / lrow[0], inv1 = 1.f / lrow[1];
+#pragma unroll
+  for (int d = 0; d < DS; ++d) {
+    const int c = h * HD + d * 8 + (lane & 3) * 2;
+    if (r < M) *reinterpret_cast<__nv_bfloat162*>(out + (size_t)r * HEADS * HD + c) = __floats2bfloat162_rn(o[d][0] * inv0, o[d][1] * inv0);
+    if (r + 8 < M) *reinterpret_cast<__nv_bfloat162*>(out + (size_t)(r + 8) * HEADS * HD + c) = __floats2bfloat162_rn(o[d][2] * inv1, o[d][3] * inv1);
+  }
+}
+"#;
+
 const RESIDUAL_ADD: &str = r#"
 namespace residual_ns { constexpr int HIDDEN = @HIDDEN@; static_assert(HIDDEN % 8 == 0, ""); }
-// Residual add in place: h = bf16(h + d), summed in f32. One thread per 8 elements.
+// Residual add in place: h = bf16(h + d), summed in f32. One thread per 8 elements; row blockIdx.y
+// (one row in decode, one per prompt token in prefill).
 extern "C" __global__ void __launch_bounds__(256)
 residual_add(bf16* __restrict__ h, const bf16* __restrict__ d) {
   using namespace residual_ns;
   const int v = blockIdx.x * 256 + threadIdx.x;
   if (v >= HIDDEN / 8) return;
+  h += (size_t)blockIdx.y * HIDDEN; d += (size_t)blockIdx.y * HIDDEN;
   float a[8], b[8]; unpack8(reinterpret_cast<const uint4*>(h)[v], a); unpack8(reinterpret_cast<const uint4*>(d)[v], b);
   uint4 r; bf16* o = reinterpret_cast<bf16*>(&r);
 #pragma unroll
@@ -230,13 +408,14 @@ residual_add(bf16* __restrict__ h, const bf16* __restrict__ d) {
 
 const EMBED_ARGMAX: &str = r#"
 namespace token_ns { constexpr int HIDDEN = @HIDDEN@, VOCAB = @VOCAB@, THREADS = 1024; static_assert(HIDDEN % 8 == 0, ""); }
-// x = table[*token], the row read from device memory. One thread per 8 elements.
+// x[r] = table[token[r]] for row r = blockIdx.y, the token read from device memory (one row in
+// decode, one per prompt token in prefill). One thread per 8 elements.
 extern "C" __global__ void __launch_bounds__(256)
 embed_gather(const bf16* __restrict__ table, const int* __restrict__ token, bf16* __restrict__ x) {
   using namespace token_ns;
   const int v = blockIdx.x * 256 + threadIdx.x;
   if (v >= HIDDEN / 8) return;
-  reinterpret_cast<uint4*>(x)[v] = reinterpret_cast<const uint4*>(table + (size_t)*token * HIDDEN)[v];
+  reinterpret_cast<uint4*>(x + (size_t)blockIdx.y * HIDDEN)[v] = reinterpret_cast<const uint4*>(table + (size_t)token[blockIdx.y] * HIDDEN)[v];
 }
 // Greedy step end, one block: token = argmax(logits) (lowest index on ties; NaN never wins, so
 // -inf can; all NaN gives 0), out[*pos] = token, then *pos += 1, so the next replay of the step
@@ -278,12 +457,14 @@ argmax_advance(const bf16* __restrict__ logits, int* __restrict__ token, int* __
 
 const SILU_MUL: &str = r#"
 namespace silu_ns { constexpr int INTER = @INTER@; static_assert(INTER % 8 == 0, ""); }
-// gate_up = [gate(INTER) | up(INTER)] -> out = silu(gate) * up. One thread per 8 elements.
+// gate_up = [gate(INTER) | up(INTER)] -> out = silu(gate) * up. One thread per 8 elements; row
+// blockIdx.y (one row in decode, one per prompt token in prefill).
 extern "C" __global__ void __launch_bounds__(256)
 silu_mul(const bf16* __restrict__ gate_up, bf16* __restrict__ out) {
   using namespace silu_ns;
   const int v = blockIdx.x * 256 + threadIdx.x;
   if (v >= INTER / 8) return;
+  gate_up += (size_t)blockIdx.y * 2 * INTER; out += (size_t)blockIdx.y * INTER;
   const uint4* gp = reinterpret_cast<const uint4*>(gate_up);
   float g[8], u[8]; unpack8(gp[v], g); unpack8(gp[INTER / 8 + v], u);
   uint4 r; bf16* o = reinterpret_cast<bf16*>(&r);
@@ -713,6 +894,12 @@ pub fn generate(p: &Plan) -> Generated {
     src += &fill(ATTN, &[("HD", a.head_dim.to_string()), ("KVH", a.kv_heads.to_string()), ("GROUP", a.group.to_string()), ("WARPS", a.warps.to_string()), ("SPLITS", a.splits.to_string())]);
     kernels.push(KernelEntry { entry: "attn_decode_split".into(), file: "model.cu".into(), grid: [a.grid[0], a.grid[1], 1], block: a.warps * 32, dyn_smem: a.smem_bytes, status: "generated", args: vec!["q", "k_cache", "v_cache", "part_ml", "part_acc", "pos_p", "scale"] });
     kernels.push(KernelEntry { entry: "attn_decode_combine".into(), file: "model.cu".into(), grid: [m.heads, 1, 1], block: m.head_dim, dyn_smem: 0, status: "generated", args: vec!["part_ml", "part_acc", "out"] });
+
+    if let Some(pa) = &p.prefill_attn {
+        src += &fill(ATTN_PREFILL, &[("HD", m.head_dim.to_string()), ("HEADS", m.heads.to_string()), ("KVH", m.kv_heads.to_string()),
+            ("BM", pa.block_m.to_string()), ("BN", pa.block_n.to_string()), ("STAGES", pa.stages.to_string()), ("PAD", crate::plan::GEMM_ROW_PAD.to_string())]);
+        kernels.push(KernelEntry { entry: "attn_prefill".into(), file: "model.cu".into(), grid: [pa.grid[0], pa.grid[1], 1], block: pa.warps * 32, dyn_smem: pa.smem_bytes, status: "generated", args: vec!["qkv", "k_cache", "v_cache", "out", "M", "start", "scale_log2"] });
+    }
 
     src += &fill(RESIDUAL_ADD, &[("HIDDEN", m.hidden.to_string())]);
     kernels.push(KernelEntry { entry: "residual_add".into(), file: "model.cu".into(), grid: [(m.hidden / 8).div_ceil(256), 1, 1], block: 256, dyn_smem: 0, status: "generated", args: vec!["h", "d"] });

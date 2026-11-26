@@ -46,16 +46,20 @@ pub fn token_estimate_us(p: &Plan, rows: &[Row]) -> Option<f64> {
     Some(p.model.layers as f64 * layer + g("rmsnorm")? + g("gemv_lm_head")?)
 }
 
-/// Prefill time for the planned prompt length from isolated GEMM times: per layer the q/k/v,
+/// Prefill time for the planned prompt length from isolated kernel times: per layer the q/k/v,
 /// o_proj and MLP GEMMs (for MoE, the router, one expert GEMM pair per expert at the planned tokens
-/// per expert, and the shared expert's pair), then `gemv_lm_head` once for the last position.
-/// Attention, norms, RoPE and activations are not included. Returns (microseconds, prompt tokens),
-/// or the name of the kernel that has no timing.
+/// per expert, and the shared expert's pair) and `attn_prefill` over the whole prompt from position
+/// 0, then `gemv_lm_head` once for the last position. Norms, RoPE and activations are not included.
+/// Returns (microseconds, prompt tokens), or the name of the kernel that has no timing.
 pub fn prefill_estimate_us(p: &Plan, rows: &[Row]) -> Result<(f64, u32), String> {
     let t: HashMap<&str, f64> = rows.iter().filter_map(|r| Some((r.kernel.as_str(), r.us?))).collect();
     let g = |k: &str| t.get(k).copied().ok_or_else(|| format!("{k} was not generated or not timed"));
     let tokens = p.gemm.iter().find(|t| t.linear == "qkv_proj").ok_or("no qkv_proj GEMM is planned")?.m;
-    let mut layer = g("gemm_qkv_proj")? + g("gemm_o_proj")?;
+    // attn_prefill is timed at several prompt lengths; the estimate takes the planned one.
+    let attn_case = format!("{tokens} rows from position 0,");
+    let attn = rows.iter().find(|r| r.kernel == "attn_prefill" && r.case.starts_with(&attn_case)).and_then(|r| r.us)
+        .ok_or_else(|| format!("attn_prefill at {tokens} rows was not generated or not timed"))?;
+    let mut layer = g("gemm_qkv_proj")? + attn + g("gemm_o_proj")?;
     match &p.model.moe {
         None => layer += g("gemm_gate_up_proj")? + g("gemm_down_proj")?,
         Some(e) => {

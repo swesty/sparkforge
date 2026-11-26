@@ -244,6 +244,20 @@
     "smem_bytes": 33280,
     "ref_ctx": 32768
   },
+  "prefill_attn": {
+    "head_dim": 128,
+    "block_m": 128,
+    "block_n": 64,
+    "stages": 2,
+    "warps": 8,
+    "smem_bytes": 69632,
+    "ctas_per_sm": 1,
+    "grid": [
+      32,
+      16
+    ],
+    "prompt_tokens": 2048
+  },
   "norm": {
     "hidden": 2048,
     "threads": 256,

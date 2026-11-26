@@ -39,19 +39,22 @@ that would otherwise be runtime heuristics.
 |---|---|---|
 | `config.rs` | Parses HF configs (Llama/Qwen/Mistral-style dense, Qwen3-MoE/Mixtral MoE aliases, `quantization_config`, Llama 3 `rope_scaling`) into a `ModelSpec`. Anything it cannot plan correctly is an error, not a silent default (see below). | Working |
 | `target.rs` | GB10 hardware model: SMs, smem, regs, L2, effective bandwidth, usable unified memory. | Working |
-| `plan.rs` | Derives every linear (fused QKV, fused gate/up, experts, lm_head), picks decode GEMV grids, prefill GEMM tiles (smem/regs/wave-quantization scoring), flash-decoding split count, RMSNorm threading, memory budget, and decode roofline. | Working |
+| `plan.rs` | Derives every linear (fused QKV, fused gate/up, experts, lm_head), picks decode GEMV grids, prefill GEMM tiles (smem/regs/wave-quantization scoring), prefill attention tiles, flash-decoding split count, RMSNorm threading, memory budget, and decode roofline. | Working |
 | `codegen.rs` | Emits `model.cu` + `gemm_tiles.cuh` with shapes baked in, plus `manifest.json` (entry, grid, block, dyn smem, args). | Working |
 | `runtime.rs` | NVRTC compile for `sm_121a`, checks cc 12.1, loads every generated entry point via `cudarc`, opts kernels above 48 KB into larger dynamic smem. | Verified on GB10 |
 | `verify.rs` | Runs every generated kernel on random bf16 inputs, diffs against an f64 CPU reference, and optionally times it with weights rotated out of L2. `verify-weights` does the same on a real checkpoint. | Verified on GB10 |
 | `weights.rs`, `device_weights.rs` | Opens HF safetensors checkpoints (single file or sharded), validates every tensor against the plan, and copies each linear into GPU memory with q\|k\|v and gate\|up packed, behind a `MemAvailable` guard. Dense BF16 Llama-family only. | Verified on GB10 |
 | `reference.rs` | Scalar CPU reference for one dense decode step in f64, rounding to bf16 where HF transformers does. It reads random weights or streams a checkpoint. | Tested in CI |
-| `forward.rs` | The generated kernels wired into a dense decode step whose token and position live on the GPU, captured as one CUDA Graph per step. `verify` diffs it against the reference at every layer boundary; `generate` runs it on real weights. | Verified on GB10 |
+| `forward.rs` | The generated kernels wired into a dense decode step whose token and position live on the GPU, captured as one CUDA Graph per step, and a prefill that runs the prompt through the GEMMs and `attn_prefill` in one pass per chunk, then hands the token and position to the graph. `verify` diffs decode against the reference at every layer boundary and prefill against decode; `generate` runs both on real weights. | Verified on GB10 |
 | `tokenizer.rs` | Token ids to text for a byte-level BPE `tokenizer.json` (decoding only). | Tested in CI |
 | `inventory.rs` | Every tensor a Qwen3.8 Flash Next checkpoint must hold, with the dtype and shape of each module's format (BF16, MXFP8, NVFP4). `weights` checks all 301,593 tensors of the reference checkpoint against it, and `load-weights` copies them into GPU memory. | Checked on GB10 (host only) |
 
 Generated kernels (all compile for `sm_121a` with NVRTC 13 and match the CPU reference; see "Measured on GB10"):
 
 - `rmsnorm` — one CTA per row, 16-byte vector loads, thread count chosen so `hidden = threads × iters × 8` exactly.
+- `rmsnorm`, `rope_kv_append`, `residual_add`, `silu_mul` and `embed_gather` take one row per `blockIdx` (y, or x for
+  `rmsnorm`): one row in a decode step, one per prompt token in prefill, so a prompt row is computed exactly as a
+  decode step computes it.
 - `rope_kv_append` — NeoX RoPE on q/k in the fused QKV buffer, fused with K/V cache append. `inv_freq` is a
   host-computed `__constant__` table (HF's f32 formula, plus Llama 3 scaling); sin/cos use double `sincos`
   because fast-math `__sincosf` loses accuracy at large angles (error 0.55 at position 131071 before the fix).
@@ -73,6 +76,11 @@ Generated kernels (all compile for `sm_121a` with NVRTC 13 and match the CPU ref
   `cp.async` pipeline into shared memory padded 16 bytes per row, `ldmatrix`, `mma.sync m16n8k16` on 64x64 or 64x32
   warp tiles, tiles walked down M when the activations fit in L2. `lm_head` runs once at prefill, for the last position,
   as the decode GEMV.
+- `attn_prefill` — causal prefill attention, FlashAttention-2 style: each warp owns 16 query rows with its Q fragments in
+  registers, K/V tiles stream from the decode KV cache through a `cp.async` pipeline that reuses the Q tile's shared
+  memory, `mma.sync m16n8k16` for Q·Kᵀ and P·V (`ldmatrix.trans` for V), fp32 online softmax in exp2. Prompt rows start
+  at any cache position, so long prompts run in chunks. Tiles (128 query rows × 64 keys, 2 stages, 68 KB for
+  `head_dim` 128) are planned for resident warps per SM, then K/V reuse.
 
 Planned (configs chosen, bodies TODO): grouped MoE prefill GEMM, NVFP4 and MXFP8 prefill GEMMs, W4A16 (AWQ/GPTQ) decode GEMVs.
 
@@ -91,7 +99,8 @@ cargo run --release --features cuda -- verify configs/llama-3.1-8b.json --bench 
 ./target/release/sparkforge weights /path/to/checkpoint          # validate a safetensors checkpoint (host only)
 cargo run --release --features cuda -- verify-weights /path/to/checkpoint   # GEMVs on the real weights vs f64
 cargo run --release --features cuda -- generate /path/to/llama-3.1-8b --tokens 128000,791,... \
-    --steps 48 --check 3 --tokenizer tokenizer.json --bench-ctx 1024,4096,32768   # greedy decode, one graph per step
+    --steps 48 --check 3 --tokenizer tokenizer.json --bench-ctx 1024,4096,32768 \
+    --bench-prefill 2048,8192   # prompt in one prefill pass, then greedy decode, one graph per step
 cargo test
 ```
 
@@ -137,6 +146,35 @@ Graph per step, 32 replays timed at each context, 14.96 GiB loaded in 8 s):
 The first 24 steps' logits match the CPU reference on the real weights (worst 1.37e-2, tolerance 1/64), and the greedy
 tokens match its argmax in 24 of 24. The output is coherent text.
 
+**Prefill** (`generate`, Llama 3.1 8B BF16, spark-5, CUDA 13.0.3, 2026-11-26, the GPU otherwise idle; chunks of 2048
+tokens, mean of 3 after a warm-up, from an empty cache to the first token):
+
+| Prompt | Time to first token | Prefill rate |
+|---|---|---|
+| 20 tokens | 93.9 ms | 213 tok/s |
+| 128 tokens | 99.8 ms | 1,283 tok/s |
+| 2048 tokens | 490.5 ms | 4,176 tok/s |
+| 8192 tokens | 2,122.9 ms | 3,859 tok/s |
+
+Before prefill, `generate` ran the prompt as decode steps at about 65 ms per token (about 133 s for 2048 tokens). A short
+prompt costs about one pass over the 15 GB of weights. The prefill's logits match the CPU reference on the real weights
+(8.5e-3), and so do the next three steps'.
+
+`attn_prefill` (`verify --bench`, 32 heads, 8 KV heads, `head_dim` 128): 69.4–70.4 TFLOP/s for a 2048-token prompt and
+79.3–82.2 TFLOP/s at 8192, within 3.68e-3 of f64 causal attention (scaled by the output's largest value, since P is
+rounded to bf16 for the P·V product). Tile sweep at 2048 / 8192 tokens (TFLOP/s):
+
+| Query rows × keys, stages | 2048 | 8192 |
+|---|---|---|
+| 128 × 64, 2 (planned) | 69.4 | 80.3 |
+| 192 × 64, 2 | 67.3 | 85.3 |
+| 192 × 32, 2 | 65.8 | 81.6 |
+| 64 × 32, 2 | 65.5 | 73.9 |
+| 128 × 32, 2 | 64.2 | 75.8 |
+| 128 × 32, 3 | 61.9 | 72.5 |
+| 64 × 64, 2 | 50.9 | 55.6 |
+| 64 × 32, 3 | 41.9 | 45.0 |
+
 **Prefill GEMMs** (`verify --bench`, spark-5, CUDA 13.0, 2026-11-26, with a vLLM engine resident and idle; M = 2048):
 
 | Llama 3.1 8B | Tile | TFLOP/s | cuBLAS (PyTorch 2.13) |
@@ -147,7 +185,8 @@ tokens match its argmax in 24 of 24. The output is coherent text.
 | `gemm_down_proj` 2048x4096x14336 | 128x256x32, 3 stages | 65.6–66.0 | 94.1 |
 
 Every GEMM is within 3.82e-3 of an f64 reference, at M = 2048 and at a ragged 2011. The GEMMs of a 2048-token prompt take
-about 403 ms (about 5,080 tok/s; attention, norms, RoPE and activations not included). Walking M down each weight tile
+about 403 ms (about 5,080 tok/s); with attention, the isolated kernel times sum to about 417 ms (norms, RoPE and
+activations not included). Walking M down each weight tile
 (the activations fit in L2) measured 66–75 TFLOP/s, L2 groups of N tiles 64–72, and a plain N-major order 20–50.
 
 | NVFP4 GEMV (spark-5, CUDA 13.0, 2026-11-25) | Bytes per launch | Max error | µs | GB/s |
@@ -193,7 +232,8 @@ Ordered by what moves tokens/s the most on GB10.
    pipelines, then `kind::mxf4nvf4.block_scale m16n8k64` for true W4A4 NVFP4 (needs activation quantization, so the
    FP4 tensor cores are actually used). Reference implementations: [sm121-kernels](https://github.com/blake-snc/sm121-kernels),
    [nvfp4bench design notes](https://github.com/secYOUre/nvfp4bench/blob/main/DESIGN.md).
-5. **Prefill attention**: FA2-style with `mma.sync`, tiles sized to the 99 KB budget for the model's `head_dim`.
+5. **Prefill attention**: dense causal FA2-style `attn_prefill` is done, and `generate` prefills through it and the GEMMs.
+   Next: QSA sparse prefill attention for Qwen3.8 Flash Next (SHA-757), which reuses its core.
 6. **Autotune loop.** The planner proposes the top-k configs per shape; the runtime benchmarks them on the actual
    Spark once and writes the winner into the cache (the cache key already covers model + plan + arch).
 7. **Paged KV cache + batching.** Batch size becomes another compile-time parameter (B = 1, 2, 4, 8 variants).

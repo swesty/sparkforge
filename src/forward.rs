@@ -6,7 +6,14 @@
 //! final RMSNorm, `lm_head`, and `argmax_advance`, which writes the greedy next token, records it
 //! and increments the position. Every launch is the same each step, so one captured CUDA Graph
 //! replays the whole step with no host work between tokens.
+//!
+//! `Runtime::prefill` runs a prompt in one pass per chunk with the same kernels launched one row per
+//! prompt token (grid.y), the prefill GEMMs in place of the GEMVs and `attn_prefill` in place of the
+//! split attention; it fills the KV cache and leaves the token and position where the next step
+//! expects them, so the captured graph continues decoding from the prompt.
 use crate::codegen::{Generated, KernelEntry};
+use crate::plan::{GemmTile, Plan};
+use crate::prefill::{gemm_at, Buf};
 use crate::config::ModelSpec;
 use crate::reference::{DenseWeights, KvCache};
 use crate::runtime::Engine;
@@ -55,6 +62,62 @@ impl<'a> Kernels<'a> {
     fn get(&self, name: &str) -> &Kernel<'a> {
         &self.0[name]
     }
+}
+
+/// Every prefill-only kernel: the prefill GEMMs (with their tiles) and `attn_prefill`.
+pub const PREFILL_KERNELS: [&str; 5] = ["gemm_qkv_proj", "gemm_o_proj", "gemm_gate_up_proj", "gemm_down_proj", "attn_prefill"];
+
+/// The prefill GEMMs and attention of a dense plan, each with its plan entry.
+pub struct PrefillKernels<'a> {
+    gemm: HashMap<&'static str, (&'a GemmTile, Kernel<'a>)>,
+    attn: Kernel<'a>,
+    block_m: u32,
+}
+
+impl<'a> PrefillKernels<'a> {
+    /// Looks up every kernel in `PREFILL_KERNELS` with its tile; fails naming the ones that were
+    /// not generated.
+    pub fn new(p: &'a Plan, g: &'a Generated, e: &'a Engine) -> Result<Self> {
+        let found = |name: &str| -> Option<Kernel<'a>> {
+            let entry = g.kernels.iter().find(|k| k.entry == name && k.status == "generated")?;
+            Some(Kernel { entry, func: e.funcs.get(name)? })
+        };
+        let mut gemm = HashMap::new();
+        let mut missing = vec![];
+        for name in &PREFILL_KERNELS[..4] {
+            let tile = p.gemm.iter().find(|t| format!("gemm_{}", t.linear) == *name);
+            match (tile, found(name)) {
+                (Some(t), Some(k)) => { gemm.insert(*name, (t, k)); }
+                _ => missing.push(*name),
+            }
+        }
+        let attn = found("attn_prefill");
+        let pa = p.prefill_attn.as_ref();
+        if attn.is_none() || pa.is_none() { missing.push("attn_prefill"); }
+        ensure!(missing.is_empty(), "prefill needs kernels that were not generated: {}", missing.join(", "));
+        Ok(Self { gemm, attn: attn.expect("checked"), block_m: pa.expect("checked").block_m })
+    }
+}
+
+/// Bytes `Runtime::enable_prefill` allocates for chunks of `rows` prompt tokens.
+pub fn prefill_bytes(m: &ModelSpec, rows: usize) -> u64 {
+    let (h, inter, q, qkv) = (m.hidden as u64, m.intermediate as u64, m.q_dim() as u64, m.qkv_dim() as u64);
+    rows as u64 * ((4 * h + qkv + q + 3 * inter) * 2 + 4)
+}
+
+/// Activations for a chunk of up to `rows` prompt tokens.
+struct PrefillBufs<'a> {
+    k: PrefillKernels<'a>,
+    rows: usize,
+    tokens: CudaSlice<i32>,
+    x: CudaSlice<u16>,
+    xn: CudaSlice<u16>,
+    qkv: CudaSlice<u16>,
+    att: CudaSlice<u16>,
+    o: CudaSlice<u16>,
+    gate_up: CudaSlice<u16>,
+    act: CudaSlice<u16>,
+    down: CudaSlice<u16>,
 }
 
 /// Device addresses of one layer's weights, row-major `[n][k]` bf16, fused as the binding packs
@@ -173,6 +236,7 @@ pub struct Runtime<'a> {
     logits: CudaSlice<u16>,
     part_ml: CudaSlice<f32>,
     part_acc: CudaSlice<f32>,
+    prefill: Option<PrefillBufs<'a>>,
 }
 
 /// Bytes a `Runtime` allocates besides the weights: KV caches, activations and token state.
@@ -236,7 +300,118 @@ impl<'a> Runtime<'a> {
             logits: s.alloc_zeros(m.vocab as usize)?,
             part_ml: s.alloc_zeros(heads * splits * 2)?,
             part_acc: s.alloc_zeros(heads * splits * m.head_dim as usize)?,
+            prefill: None,
         })
+    }
+
+    /// Allocates prefill activations for chunks of up to `rows` prompt tokens (`prefill_bytes`).
+    pub fn enable_prefill(&mut self, k: PrefillKernels<'a>, rows: usize) -> Result<()> {
+        // grid.y carries the row of the row-wise kernels.
+        ensure!((1..=65_535).contains(&rows), "a prefill chunk of {rows} rows (1 to 65535)");
+        let m = self.m;
+        let (h, inter, q, qkv) = (m.hidden as usize, m.intermediate as usize, m.q_dim() as usize, m.qkv_dim() as usize);
+        let s = &self.s;
+        self.prefill = Some(PrefillBufs {
+            k,
+            rows,
+            tokens: s.alloc_zeros(rows)?,
+            x: s.alloc_zeros(rows * h)?,
+            xn: s.alloc_zeros(rows * h)?,
+            qkv: s.alloc_zeros(rows * qkv)?,
+            att: s.alloc_zeros(rows * q)?,
+            o: s.alloc_zeros(rows * h)?,
+            gate_up: s.alloc_zeros(rows * 2 * inter)?,
+            act: s.alloc_zeros(rows * inter)?,
+            down: s.alloc_zeros(rows * h)?,
+        });
+        Ok(())
+    }
+
+    /// Runs `tokens` at positions `start..start + tokens.len()` in chunks of the enabled rows: fills
+    /// the KV cache, then computes the last position's logits and greedy token with the decode
+    /// kernels, so the next `step` decodes that token at the position after the prompt. Positions
+    /// before `start` must already be in the cache.
+    pub fn prefill(&mut self, tokens: &[u32], start: usize) -> Result<()> {
+        let rows = self.prefill.as_ref().map(|p| p.rows).context("prefill was not enabled")?;
+        ensure!(!tokens.is_empty(), "an empty prompt");
+        let end = start.checked_add(tokens.len()).context("prompt positions overflow")?;
+        ensure!(end <= self.capacity, "positions {start}..{end} are past the cache capacity {}", self.capacity);
+        ensure!(end <= i32::MAX as usize, "positions {start}..{end} overflow the kernels' int positions");
+        let rows_m = self.w.embed_rows;
+        ensure!(tokens.iter().all(|&t| (t as usize) < rows_m), "a prompt token is past the {rows_m} embedding rows");
+        for (i, chunk) in tokens.chunks(rows).enumerate() {
+            self.prefill_chunk(chunk, start + i * rows)?;
+        }
+        // The last prompt position's logits and greedy token, exactly as a decode step ends.
+        let pb = self.prefill.as_ref().expect("checked");
+        let h = self.m.hidden as usize;
+        let last = (tokens.len() - 1) % rows;
+        let k = &self.k;
+        let (norm, g_lm, argmax) = (k.get("rmsnorm"), k.get("gemv_lm_head"), k.get("argmax_advance"));
+        let eps = self.m.rms_eps as f32;
+        self.s.memcpy_htod(&[(end - 1) as i32], &mut self.d_pos)?;
+        let xl = pb.x.slice(last * h..(last + 1) * h);
+        unsafe {
+            self.s.launch_builder(norm.func).arg(&xl).arg(&self.w.final_norm).arg(&mut self.xn).arg(&eps).launch(LaunchConfig { grid_dim: (1, 1, 1), ..norm.cfg() })?;
+            self.s.launch_builder(g_lm.func).arg(&self.w.lm_head).arg(&self.xn).arg(&mut self.logits).launch(g_lm.cfg())?;
+            self.s.launch_builder(argmax.func).arg(&self.logits).arg(&mut self.d_token).arg(&mut self.out).arg(&mut self.d_pos).launch(argmax.cfg())?;
+        }
+        self.pos = end;
+        self.host_token = false;
+        Ok(())
+    }
+
+    fn prefill_chunk(&mut self, tokens: &[u32], start: usize) -> Result<()> {
+        let m = self.m;
+        let n = tokens.len();
+        let (eps, scale_log2) = (m.rms_eps as f32, std::f32::consts::LOG2_E / (m.head_dim as f32).sqrt());
+        let s = self.s.clone();
+        let k = &self.k;
+        let w = self.w;
+        let pb = self.prefill.as_mut().expect("checked by prefill");
+        let ids: Vec<i32> = tokens.iter().map(|&t| t as i32).collect();
+        s.memcpy_htod(&ids, &mut pb.tokens.slice_mut(..n))?;
+        // RoPE reads the chunk's first position from d_pos and adds the row.
+        s.memcpy_htod(&[start as i32], &mut self.d_pos)?;
+        let (embed, norm, rope, silu, add) = (k.get("embed_gather"), k.get("rmsnorm"), k.get("rope_kv_append"), k.get("silu_mul"), k.get("residual_add"));
+        let rows = |kn: &Kernel| { let c = kn.cfg(); LaunchConfig { grid_dim: (c.grid_dim.0, n as u32, 1), ..c } };
+        let norm_cfg = LaunchConfig { grid_dim: (n as u32, 1, 1), ..norm.cfg() };
+        let a = &pb.k.attn;
+        let attn_cfg = LaunchConfig { grid_dim: (m.heads, n.div_ceil(pb.k.block_m as usize) as u32, 1), ..a.cfg() };
+        let (n32, start32) = (n as i32, start as i32);
+        let at = |x: &CudaSlice<u16>| Buf { ptr: addr(&s, x), len: x.len() };
+        let (bx, bxn, bqkv, batt, bo, bgu, bact, bdown) = (at(&pb.x), at(&pb.xn), at(&pb.qkv), at(&pb.att), at(&pb.o), at(&pb.gate_up), at(&pb.act), at(&pb.down));
+        let gemm = |name: &str, a: Buf, wp: u64, c: Buf| -> Result<()> {
+            let (t, kn) = &pb.k.gemm[name];
+            gemm_at(&s, t, kn.entry, kn.func, a, Buf { ptr: wp, len: (t.n * t.k) as usize }, c, n)
+        };
+        unsafe { s.launch_builder(embed.func).arg(&w.embed).arg(&pb.tokens).arg(&bx.ptr).launch(rows(embed))? };
+        for (l, lw) in w.layers.iter().enumerate() {
+            unsafe { s.launch_builder(norm.func).arg(&bx.ptr).arg(&lw.attn_norm).arg(&bxn.ptr).arg(&eps).launch(norm_cfg)? };
+            gemm("gemm_qkv_proj", bxn, lw.qkv, bqkv)?;
+            unsafe {
+                s.launch_builder(rope.func).arg(&bqkv.ptr).arg(&mut self.k_cache[l]).arg(&mut self.v_cache[l]).arg(&self.d_pos).launch(rows(rope))?;
+                s.launch_builder(a.func).arg(&bqkv.ptr).arg(&self.k_cache[l]).arg(&self.v_cache[l]).arg(&batt.ptr).arg(&n32).arg(&start32).arg(&scale_log2)
+                    .launch(attn_cfg)?;
+            }
+            gemm("gemm_o_proj", batt, lw.o_proj, bo)?;
+            unsafe {
+                s.launch_builder(add.func).arg(&bx.ptr).arg(&bo.ptr).launch(rows(add))?;
+                s.launch_builder(norm.func).arg(&bx.ptr).arg(&lw.mlp_norm).arg(&bxn.ptr).arg(&eps).launch(norm_cfg)?;
+            }
+            gemm("gemm_gate_up_proj", bxn, lw.gate_up, bgu)?;
+            unsafe { s.launch_builder(silu.func).arg(&bgu.ptr).arg(&bact.ptr).launch(rows(silu))? };
+            gemm("gemm_down_proj", bact, lw.down, bdown)?;
+            unsafe { s.launch_builder(add.func).arg(&bx.ptr).arg(&bdown.ptr).launch(rows(add))? };
+        }
+        Ok(())
+    }
+
+    /// Layer `layer`'s K and V cache, positions `0..to`.
+    pub fn kv(&self, layer: usize, to: usize) -> Result<(Vec<u16>, Vec<u16>)> {
+        ensure!(layer < self.k_cache.len() && to <= self.capacity, "layer {layer} positions ..{to} are outside the cache");
+        let n = to * self.m.kv_dim() as usize;
+        Ok((self.s.memcpy_dtov(&self.k_cache[layer].slice(..n))?, self.s.memcpy_dtov(&self.v_cache[layer].slice(..n))?))
     }
 
     pub fn capacity(&self) -> usize {

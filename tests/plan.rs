@@ -385,16 +385,23 @@ fn bf16_prefill_gemms_are_generated_and_quantized_ones_planned() {
 }
 
 #[test]
-fn the_prefill_estimate_sums_layers_of_gemms_and_one_lm_head() {
+fn the_prefill_estimate_sums_layers_of_gemms_and_attention_and_one_lm_head() {
     use sparkforge::estimate::{prefill_estimate_us, Row};
     let p = load("configs/llama-3.1-8b.json");
     let us = [("gemm_qkv_proj", 1500.0), ("gemm_o_proj", 1000.0), ("gemm_gate_up_proj", 6700.0), ("gemm_down_proj", 3700.0), ("gemv_lm_head", 4400.0)];
-    let rows = |skip: &str| us.iter().filter(|(k, _)| *k != skip).map(|&(k, t)| Row { kernel: k.into(), case: String::new(), err: 0.0, us: Some(t), gbs: None }).collect::<Vec<_>>();
+    let row = |k: &str, case: &str, t: Option<f64>| Row { kernel: k.into(), case: case.into(), err: 0.0, us: t, gbs: None };
+    // attn_prefill rows at several lengths: only the planned one (2048 from position 0) counts.
+    let attn = || vec![row("attn_prefill", "128 rows from position 0, 128 sampled", None), row("attn_prefill", "2048 rows from position 0, 59 sampled, 50.0 TFLOP/s", Some(900.0)),
+        row("attn_prefill", "8192 rows from position 0, 59 sampled, 60.0 TFLOP/s", Some(12000.0))];
+    let rows = |skip: &str| us.iter().filter(|(k, _)| *k != skip).map(|&(k, t)| row(k, "", Some(t))).chain(attn()).collect::<Vec<_>>();
     let (t, tokens) = prefill_estimate_us(&p, &rows("")).unwrap();
     assert_eq!(tokens, 2048);
-    assert!((t - (32.0 * 12900.0 + 4400.0)).abs() < 1e-6, "{t}");
+    assert!((t - (32.0 * 13800.0 + 4400.0)).abs() < 1e-6, "{t}");
     let e = prefill_estimate_us(&p, &rows("gemm_down_proj")).unwrap_err();
     assert!(e.contains("gemm_down_proj"), "an untimed GEMM gives no estimate and names it: {e}");
+    let no_attn: Vec<Row> = rows("").into_iter().filter(|r| !r.case.starts_with("2048 ")).collect();
+    let e = prefill_estimate_us(&p, &no_attn).unwrap_err();
+    assert!(e.contains("attn_prefill at 2048"), "attention at another length is not the planned prompt's: {e}");
 }
 
 #[test]
@@ -417,12 +424,39 @@ fn the_prefill_estimate_counts_a_shared_experts_gemms() {
     let mut p = load("configs/qwen3-30b-a3b.json");
     p.model.moe.as_mut().unwrap().shared_experts = 1;
     let experts = p.model.moe.as_ref().unwrap().num_experts as f64;
-    let mut us = vec![("gemm_qkv_proj", 600.0), ("gemm_o_proj", 500.0), ("gemm_router", 40.0), ("gemm_expert_gate_up", 25.0), ("gemm_expert_down", 16.0), ("gemv_lm_head", 4000.0)];
-    let row = |&(k, t): &(&str, f64)| Row { kernel: k.into(), case: String::new(), err: 0.0, us: Some(t), gbs: None };
+    let mut us = vec![("gemm_qkv_proj", 600.0), ("gemm_o_proj", 500.0), ("gemm_router", 40.0), ("gemm_expert_gate_up", 25.0), ("gemm_expert_down", 16.0), ("gemv_lm_head", 4000.0), ("attn_prefill", 700.0)];
+    let row = |&(k, t): &(&str, f64)| Row { kernel: k.into(), case: if k == "attn_prefill" { "2048 rows from position 0, 59 sampled".into() } else { String::new() }, err: 0.0, us: Some(t), gbs: None };
     let e = prefill_estimate_us(&p, &us.iter().map(row).collect::<Vec<_>>()).unwrap_err();
     assert!(e.contains("gemm_shared_gate_up"), "{e}");
     us.extend([("gemm_shared_gate_up", 30.0), ("gemm_shared_down", 20.0)]);
     let (t, _) = prefill_estimate_us(&p, &us.iter().map(row).collect::<Vec<_>>()).unwrap();
-    let layer = 600.0 + 500.0 + 40.0 + experts * (25.0 + 16.0) + 30.0 + 20.0;
+    let layer = 600.0 + 700.0 + 500.0 + 40.0 + experts * (25.0 + 16.0) + 30.0 + 20.0;
     assert!((t - (p.model.layers as f64 * layer + 4000.0)).abs() < 1e-6, "{t}");
+}
+
+#[test]
+fn dense_plans_tile_prefill_attention_within_gb10_limits() {
+    for c in ["configs/llama-3.1-8b.json", "configs/qwen3-30b-a3b.json"] {
+        let p = load(c);
+        let a = p.prefill_attn.as_ref().unwrap();
+        assert_eq!(a.head_dim, p.model.head_dim, "{c}");
+        assert!(a.smem_bytes <= GB10.smem_per_block_optin, "{c}: {a:?}");
+        assert_eq!(a.warps * 16, a.block_m, "{c}: one warp per 16 query rows");
+        assert_eq!(a.grid, [p.model.heads, 2048u32.div_ceil(a.block_m)], "{c}");
+        // The K/V stages reuse the Q tile's shared memory, rows padded by 16 bytes.
+        let lds = p.model.head_dim + 8;
+        assert_eq!(a.smem_bytes, (a.block_m * lds).max(2 * a.stages * a.block_n * lds) * 2, "{c}");
+        assert!(plan::prefill_attn_regs(a.head_dim, a.block_n) * a.warps * 32 * a.ctas_per_sm <= GB10.regs_per_sm, "{c}");
+        let g = sparkforge::codegen::generate(&p);
+        let k = g.kernels.iter().find(|k| k.entry == "attn_prefill").unwrap();
+        assert_eq!((k.status, k.block, k.dyn_smem), ("generated", a.warps * 32, a.smem_bytes), "{c}");
+        assert!(g.files[0].1.contains("attn_prefill("), "{c}");
+    }
+}
+
+#[test]
+fn hybrid_plans_have_no_dense_prefill_attention() {
+    let p = load("configs/qwen3.8-flash-next-nvfp4.json");
+    assert!(p.prefill_attn.is_none());
+    assert!(!sparkforge::codegen::generate(&p).kernels.iter().any(|k| k.entry == "attn_prefill"));
 }

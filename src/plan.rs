@@ -116,6 +116,30 @@ pub struct AttnPlan {
     pub ref_ctx: u32,
 }
 
+/// Causal prefill attention tiles (kernel-codegen `attn_prefill`): BLOCK_M query rows per CTA, 16
+/// per warp, against BLOCK_N-key K/V tiles streamed through `stages` cp.async buffers.
+#[derive(Debug, Clone, Serialize)]
+pub struct PrefillAttnPlan {
+    pub head_dim: u32,
+    pub block_m: u32,
+    pub block_n: u32,
+    pub stages: u32,
+    pub warps: u32,
+    /// max(Q tile, K and V stages), rows padded by 16 bytes: the K/V stages reuse the Q tile's
+    /// shared memory once its fragments are in registers.
+    pub smem_bytes: u32,
+    pub ctas_per_sm: u32,
+    /// Grid for the planned prompt length: (heads, ceil(M / block_m)).
+    pub grid: [u32; 2],
+    pub prompt_tokens: u32,
+}
+
+/// Registers per thread the prefill attention needs, estimated: the O accumulator (HD/2), the S
+/// tile (BN/2), the Q fragments (HD/4), and 40 for addresses, softmax state and K/V fragments.
+pub fn prefill_attn_regs(head_dim: u32, block_n: u32) -> u32 {
+    head_dim / 2 + block_n / 2 + head_dim / 4 + 40
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct NormPlan { pub hidden: u32, pub threads: u32, pub iters: u32 }
 
@@ -159,6 +183,9 @@ pub struct Plan {
     pub gemv: Vec<GemvPlan>,
     pub gemm: Vec<GemmTile>,
     pub attn: AttnPlan,
+    /// Dense causal prefill attention; absent for a hybrid plan (its attention is sparse).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prefill_attn: Option<PrefillAttnPlan>,
     pub norm: NormPlan,
     pub budget: Budget,
     /// Every distinct decode op of a hybrid plan, with shapes and bytes per token.
@@ -793,6 +820,37 @@ fn plan_attn(m: &ModelSpec, t: &Target, ctx: u32) -> AttnPlan {
     }
 }
 
+/// The prefill attention tile with the most resident warps per SM, then the largest K/V reuse
+/// (block_m x block_n / (block_m + block_n)), then the deeper pipeline; every candidate fits the
+/// per-block shared memory, threads and the estimated registers.
+fn plan_prefill_attn(m: &ModelSpec, t: &Target, tokens: u32) -> Option<PrefillAttnPlan> {
+    let hd = m.head_dim;
+    if !hd.is_multiple_of(16) || !m.heads.is_multiple_of(m.kv_heads) { return None; }
+    let lds = hd + GEMM_ROW_PAD;
+    let mut best: Option<(PrefillAttnPlan, (u32, u32, u32))> = None;
+    for &bm in &[64u32, 128] {
+        for &bn in &[32u32, 64, 128] {
+            for &stages in &[2u32, 3] {
+                let smem = (bm * lds).max(2 * stages * bn * lds) * 2;
+                let warps = bm / 16;
+                let threads = warps * t.warp_size;
+                let regs = prefill_attn_regs(hd, bn);
+                if smem > t.smem_per_block_optin || threads > t.max_threads_per_block || regs > 255 { continue; }
+                let ctas = (t.smem_per_sm / smem).min(t.max_threads_per_sm / threads).min(t.regs_per_sm / (threads * regs));
+                if ctas == 0 { continue; }
+                let key = (ctas * warps, bm * bn / (bm + bn), stages);
+                if best.as_ref().is_none_or(|(_, k)| key > *k) {
+                    best = Some((PrefillAttnPlan {
+                        head_dim: hd, block_m: bm, block_n: bn, stages, warps, smem_bytes: smem, ctas_per_sm: ctas,
+                        grid: [m.heads, tokens.div_ceil(bm)], prompt_tokens: tokens,
+                    }, key));
+                }
+            }
+        }
+    }
+    best.map(|b| b.0)
+}
+
 fn plan_norm(hidden: u32, t: &Target) -> NormPlan {
     let vecs = hidden / 8;
     let mut threads = 32;
@@ -908,7 +966,9 @@ pub fn build(m: &ModelSpec, t: &Target, o: &PlanOpts) -> Plan {
 
     Plan {
         target: t.clone(), model: m.clone(), linears: ls, gemv, gemm,
-        attn: plan_attn(m, t, attn_ctx), norm: plan_norm(m.hidden, t),
+        attn: plan_attn(m, t, attn_ctx),
+        prefill_attn: if m.hybrid.is_some() { None } else { plan_prefill_attn(m, t, o.prefill_tokens) },
+        norm: plan_norm(m.hidden, t),
         budget: Budget {
             weight_gib: weight_bytes / (1u64 << 30) as f64,
             kv_gib_at_ctx: kv / (1u64 << 30) as f64,
