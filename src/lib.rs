@@ -13,6 +13,7 @@ pub mod fp4;
 pub mod estimate;
 pub mod load_plan;
 pub mod plan;
+pub mod reference;
 pub mod target;
 pub mod weights;
 
@@ -22,3 +23,5 @@ pub mod runtime;
 pub mod verify;
 #[cfg(feature = "cuda")]
 pub mod device_weights;
+#[cfg(feature = "cuda")]
+pub mod forward;

@@ -75,7 +75,8 @@ rmsnorm(const bf16* __restrict__ x, const bf16* __restrict__ w, bf16* __restrict
     float wf[8]; unpack8(wr[i * THREADS + threadIdx.x], wf);
     uint4 out; bf16* o = reinterpret_cast<bf16*>(&out);
 #pragma unroll
-    for (int j = 0; j < 8; ++j) o[j] = __float2bfloat16(v[i][j] * inv * wf[j]);
+    // HF LlamaRMSNorm: x * rsqrt(...) is rounded to bf16 before the weight multiply.
+    for (int j = 0; j < 8; ++j) o[j] = __float2bfloat16(wf[j] * __bfloat162float(__float2bfloat16(v[i][j] * inv)));
     yr[i * THREADS + threadIdx.x] = out;
   }
 }
@@ -205,6 +206,22 @@ attn_decode_combine(const float* __restrict__ part_ml, const float* __restrict__
     L += part_ml[pi * 2 + 1] * e; O += part_acc[pi * HD + d] * e;
   }
   out[(size_t)h * HD + d] = __float2bfloat16(O / L);
+}
+"#;
+
+const RESIDUAL_ADD: &str = r#"
+namespace residual_ns { constexpr int HIDDEN = @HIDDEN@; static_assert(HIDDEN % 8 == 0, ""); }
+// Residual add in place: h = bf16(h + d), summed in f32. One thread per 8 elements.
+extern "C" __global__ void __launch_bounds__(256)
+residual_add(bf16* __restrict__ h, const bf16* __restrict__ d) {
+  using namespace residual_ns;
+  const int v = blockIdx.x * 256 + threadIdx.x;
+  if (v >= HIDDEN / 8) return;
+  float a[8], b[8]; unpack8(reinterpret_cast<const uint4*>(h)[v], a); unpack8(reinterpret_cast<const uint4*>(d)[v], b);
+  uint4 r; bf16* o = reinterpret_cast<bf16*>(&r);
+#pragma unroll
+  for (int j = 0; j < 8; ++j) o[j] = __float2bfloat16(a[j] + b[j]);
+  reinterpret_cast<uint4*>(h)[v] = r;
 }
 "#;
 
@@ -537,6 +554,9 @@ pub fn generate(p: &Plan) -> Generated {
     src += &fill(ATTN, &[("HD", a.head_dim.to_string()), ("KVH", a.kv_heads.to_string()), ("GROUP", a.group.to_string()), ("WARPS", a.warps.to_string()), ("SPLITS", a.splits.to_string())]);
     kernels.push(KernelEntry { entry: "attn_decode_split".into(), file: "model.cu".into(), grid: [a.grid[0], a.grid[1], 1], block: a.warps * 32, dyn_smem: a.smem_bytes, status: "generated", args: vec!["q", "k_cache", "v_cache", "part_ml", "part_acc", "seq_len", "scale"] });
     kernels.push(KernelEntry { entry: "attn_decode_combine".into(), file: "model.cu".into(), grid: [m.heads, 1, 1], block: m.head_dim, dyn_smem: 0, status: "generated", args: vec!["part_ml", "part_acc", "out"] });
+
+    src += &fill(RESIDUAL_ADD, &[("HIDDEN", m.hidden.to_string())]);
+    kernels.push(KernelEntry { entry: "residual_add".into(), file: "model.cu".into(), grid: [(m.hidden / 8).div_ceil(256), 1, 1], block: 256, dyn_smem: 0, status: "generated", args: vec!["h", "d"] });
 
     let inter = m.moe.as_ref().map_or(m.intermediate, |e| e.expert_intermediate);
     src += &fill(SILU_MUL, &[("INTER", inter.to_string())]);

@@ -14,32 +14,14 @@ use std::sync::Arc;
 
 pub const TOL: f64 = 1.0 / 64.0;
 
-pub fn f2bf(x: f32) -> u16 {
-    let b = x.to_bits();
-    (b.wrapping_add(0x7fff + ((b >> 16) & 1)) >> 16) as u16
-}
-pub fn bf2f(h: u16) -> f32 {
-    f32::from_bits((h as u32) << 16)
-}
+pub use crate::reference::{bf2f, f2bf};
+use crate::reference::Rng;
+
+/// Layers of random weights the decode-step check runs.
+pub const STEP_LAYERS: usize = 2;
 
 fn gcd(a: usize, b: usize) -> usize {
     if b == 0 { a } else { gcd(b, a % b) }
-}
-
-struct Rng(u64);
-impl Rng {
-    fn next(&mut self) -> u64 {
-        self.0 ^= self.0 << 13;
-        self.0 ^= self.0 >> 7;
-        self.0 ^= self.0 << 17;
-        self.0
-    }
-    fn unif(&mut self) -> f32 {
-        (self.next() >> 40) as f32 / (1u64 << 23) as f32 - 1.0
-    }
-    fn bf16(&mut self, n: usize) -> Vec<u16> {
-        (0..n).map(|_| f2bf(self.unif())).collect()
-    }
 }
 
 /// Worst per-element error; NaN or inf on the GPU side counts as infinite error.
@@ -50,6 +32,23 @@ pub fn max_err(gpu: &[f32], r: &[f64]) -> f64 {
         .zip(r)
         .map(|(&g, &r)| {
             let d = (g as f64 - r).abs() / (r.abs() + 1e-2 * amax);
+            if d.is_finite() { d } else { f64::INFINITY }
+        })
+        .fold(0.0, f64::max)
+}
+
+/// Worst |gpu - ref| over the tensor's largest |ref|; NaN or inf on the GPU side counts as
+/// infinite error. Used where both sides round every op to bf16 (the decode-step check): a 1-ulp
+/// difference in one op's output is expected there, and a residual add that cancels to near zero
+/// turns it into a large per-element relative error, so the error is measured against the scale
+/// of the whole tensor instead.
+pub fn max_err_scaled(gpu: &[f32], r: &[f64]) -> f64 {
+    assert_eq!(gpu.len(), r.len());
+    let amax = r.iter().fold(0f64, |a, &b| a.max(b.abs())).max(1e-30);
+    gpu.iter()
+        .zip(r)
+        .map(|(&g, &r)| {
+            let d = (g as f64 - r).abs() / amax;
             if d.is_finite() { d } else { f64::INFINITY }
         })
         .fold(0.0, f64::max)
@@ -117,14 +116,25 @@ impl Ctx<'_> {
         let (dx, dw) = (s.memcpy_stod(&x)?, s.memcpy_stod(&w)?);
         let mut dy = s.alloc_zeros::<u16>(rows * h)?;
         unsafe { s.launch_builder(f).arg(&dx).arg(&dw).arg(&mut dy).arg(&eps).launch(cfg([rows as u32, 1, 1], k.block, 0))? };
-        let y = to_f32(&s.memcpy_dtov(&dy)?);
+        let yb = s.memcpy_dtov(&dy)?;
+        let y = to_f32(&yb);
         let mut r = vec![0f64; rows * h];
+        // Where rounding x * r before the weight (HF) and rounding once at the end give different
+        // bf16 values, the kernel must give the first: the tolerance alone can't tell them apart.
+        let (mut differ, mut agree) = (0usize, 0usize);
         for row in 0..rows {
             let xs = &x[row * h..(row + 1) * h];
             let ss: f64 = xs.iter().map(|&v| (bf2f(v) as f64).powi(2)).sum();
             let inv = 1.0 / (ss / h as f64 + eps as f64).sqrt();
+            // x * inv is rounded to bf16 before the weight multiply, as HF and the kernel do.
             for i in 0..h {
-                r[row * h + i] = bf2f(xs[i]) as f64 * inv * bf2f(w[i]) as f64;
+                let xr = crate::reference::f64_to_bf16(bf2f(xs[i]) as f64 * inv);
+                r[row * h + i] = bf2f(w[i]) as f64 * bf2f(xr) as f64;
+                let (two, once) = (f2bf(bf2f(w[i]) * bf2f(xr)), crate::reference::f64_to_bf16(bf2f(xs[i]) as f64 * inv * bf2f(w[i]) as f64));
+                if two != once {
+                    differ += 1;
+                    agree += (yb[row * h + i] == two) as usize;
+                }
             }
         }
         let us = if self.o.bench {
@@ -133,7 +143,9 @@ impl Ctx<'_> {
                 Ok(())
             })?)
         } else { None };
-        self.push("rmsnorm", format!("{rows} rows x {h}"), max_err(&y, &r), us, (3 * h * 2) as f64);
+        let rounds_first = differ >= 16 && agree * 10 >= differ * 9;
+        let err = if rounds_first { max_err(&y, &r) } else { f64::INFINITY };
+        self.push("rmsnorm", format!("{rows}x{h}, x*r rounded {agree}/{differ}"), err, us, (3 * h * 2) as f64);
         Ok(())
     }
 
@@ -244,6 +256,72 @@ impl Ctx<'_> {
         Ok(())
     }
 
+    fn residual(&mut self) -> Result<()> {
+        let Some((k, f)) = kernel(self.g, self.e, "residual_add") else { return Ok(()) };
+        let s = self.e.stream.clone();
+        let h = self.p.model.hidden as usize;
+        let (a, b) = (self.rng.bf16(h), self.rng.bf16(h));
+        let mut da = s.memcpy_stod(&a)?;
+        let db = s.memcpy_stod(&b)?;
+        unsafe { s.launch_builder(f).arg(&mut da).arg(&db).launch(cfg(k.grid, k.block, 0))? };
+        let got = to_f32(&s.memcpy_dtov(&da)?);
+        let r: Vec<f64> = a.iter().zip(&b).map(|(&x, &y)| bf2f(x) as f64 + bf2f(y) as f64).collect();
+        let us = if self.o.bench {
+            Some(time_us(&s, 200, |_| {
+                unsafe { s.launch_builder(f).arg(&mut da).arg(&db).launch(cfg(k.grid, k.block, 0))? };
+                Ok(())
+            })?)
+        } else { None };
+        self.push("residual_add", format!("hidden {h}"), max_err(&got, &r), us, (h * 6) as f64);
+        Ok(())
+    }
+
+    /// A decode step of `STEP_LAYERS` layers of random weights, wired from the generated kernels
+    /// (`forward::step`), against the CPU reference (`reference::decode_step`) at every layer
+    /// boundary and at the logits. Two cases: four steps from an empty cache (positions 0 to 3),
+    /// and two steps after a random 1000-position prefix, so attention spans every split. Each row
+    /// is the worst error over the case's steps; a dense model only (`reference::require_dense`).
+    fn decode_step(&mut self) -> Result<()> {
+        use crate::forward::{DeviceModel, Kernels, Scratch};
+        use crate::reference::{decode_step, DenseWeights, KvCache};
+        let m = &self.p.model;
+        if crate::reference::require_dense(m).is_err() {
+            return Ok(());
+        }
+        let k = Kernels::new(self.g, self.e)?;
+        let s = self.e.stream.clone();
+        let prefix = 1000.min(m.max_pos as usize - 2);
+        let cases = [("fresh".to_string(), 0usize, 4usize), (format!("prefix {prefix}"), prefix, 2)];
+        let mut rng = Rng(self.rng.next_u64() | 1);
+        let w = DenseWeights::random(m, STEP_LAYERS, cases.iter().map(|c| c.2).sum(), &mut rng);
+        let to_f64 = |v: &[u16]| v.iter().map(|&x| bf2f(x) as f64).collect::<Vec<_>>();
+        let mut row = 0;
+        for (name, start, steps) in cases {
+            let mut cache = KvCache::new(m, STEP_LAYERS, start + steps);
+            cache.fill_random(m, start, &mut rng);
+            let mut dm = DeviceModel::upload(&s, m, &w, &cache)?;
+            let mut sc = Scratch::new(&s, m, self.p.attn.splits as usize)?;
+            // [L0 attn, L0 mlp, L1 attn, ..., logits]
+            let mut errs = [0f64; 2 * STEP_LAYERS + 1];
+            for i in 0..steps {
+                let pos = start + i;
+                let r = decode_step(m, &w, &mut cache, row, pos);
+                let g = crate::forward::step(&s, &k, m, &mut dm, &mut sc, row, pos, true)?.context("trace")?;
+                for l in 0..STEP_LAYERS {
+                    errs[2 * l] = errs[2 * l].max(max_err_scaled(&to_f32(&g.after_attn[l]), &to_f64(&r.after_attn[l])));
+                    errs[2 * l + 1] = errs[2 * l + 1].max(max_err_scaled(&to_f32(&g.after_mlp[l]), &to_f64(&r.after_mlp[l])));
+                }
+                errs[2 * STEP_LAYERS] = errs[2 * STEP_LAYERS].max(max_err_scaled(&to_f32(&g.logits), &r.logits));
+                row += 1;
+            }
+            for (i, e) in errs.iter().enumerate() {
+                let at = if i == 2 * STEP_LAYERS { "logits".to_string() } else { format!("L{} {}", i / 2, if i % 2 == 0 { "attn" } else { "mlp" }) };
+                self.push("decode step", format!("{name}: {at}"), *e, None, 0.0);
+            }
+        }
+        Ok(())
+    }
+
     fn silu(&mut self) -> Result<()> {
         let Some((k, f)) = kernel(self.g, self.e, "silu_mul") else { return Ok(()) };
         let s = self.e.stream.clone();
@@ -282,7 +360,7 @@ impl Ctx<'_> {
         let copies = if grouped { (2 * slots).min(fp.experts as usize) } else { 1 };
         let step = (7..).step_by(2).find(|&st| gcd(st, copies) == 1).unwrap_or(1);
         let ids: Vec<u32> = if grouped { (0..slots).map(|i| ((step * i + 3) % copies) as u32).collect() } else { vec![] };
-        let mut frng = FpRng(self.rng.next() | 1);
+        let mut frng = FpRng(self.rng.next_u64() | 1);
         let ops = Operands::random(fp, n, kk, copies, &mut frng);
         let (w, sf) = ops.packed()?;
         // Several activation vectors, each checked against its own reference on the same workspace
@@ -377,7 +455,7 @@ impl Ctx<'_> {
         // in the last 3 x L2 bytes (`fp4::bench_sets`). Dense: enough copies to make 3 x L2.
         let experts = fp.experts as usize;
         let (banks, sets) = if experts > 0 {
-            crate::fp4::bench_sets(experts, slots, bytes_one, l2, iters, &mut crate::fp4::Rng(self.rng.next() | 1))
+            crate::fp4::bench_sets(experts, slots, bytes_one, l2, iters, &mut crate::fp4::Rng(self.rng.next_u64() | 1))
         } else {
             (0, vec![])
         };
@@ -479,7 +557,9 @@ pub fn run(p: &Plan, g: &Generated, e: &Engine, o: &Opts) -> Result<Vec<Row>> {
     c.rope().context("rope_kv_append")?;
     c.attention().context("attention")?;
     c.silu().context("silu_mul")?;
+    c.residual().context("residual_add")?;
     c.gemvs().context("gemv")?;
+    c.decode_step().context("decode step")?;
     Ok(c.rows)
 }
 
