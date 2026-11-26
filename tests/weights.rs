@@ -592,7 +592,13 @@ fn the_reported_baseline_is_the_memory_admission_checked_before_allocating() {
     let adm = admit(&user_lock(&lock), 14 * GIB, 0, || Some(avail.get()), std::time::Duration::from_secs(1)).expect("fits at admission");
     // Another process frees 4 GiB between admission and the allocation.
     avail.set(24 * GIB);
-    assert_eq!(adm.confirm(14 * GIB, 0, || Some(avail.get())).unwrap(), 24 * GIB);
+    let baseline = adm.confirm(14 * GIB, 0, || Some(avail.get())).unwrap();
+    assert_eq!(baseline, 24 * GIB);
+    // fp:08579c39429a on #22: a change after the final check doesn't move the saved baseline. It
+    // shows only in the reading taken after the copy.
+    avail.set(28 * GIB);
+    assert_eq!(baseline, 24 * GIB, "the baseline is the checked reading, not a later one");
+    assert_eq!(avail.get() - baseline, 4 * GIB, "a later reading sees the change");
 }
 
 #[test]

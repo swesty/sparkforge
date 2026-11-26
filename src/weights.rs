@@ -1181,6 +1181,8 @@ impl Admission {
     /// the baseline to report next to a figure read after the copy: a reading taken before
     /// admission can include memory another process freed while this load waited, which the
     /// difference would then misattribute to the load (codex-review fp:69a474a7ea8f on #19).
+    /// `MemAvailable` is system-wide, so a change after this reading shows only in a later one, and
+    /// the difference between two readings can include unrelated activity (fp:08579c39429a on #22).
     pub fn confirm(&self, copy_bytes: u64, overhead: u64, mem: impl Fn() -> Option<u64>) -> Result<u64> {
         ensure!(
             copy_bytes <= self.copy_bytes && overhead <= self.overhead,

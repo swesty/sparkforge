@@ -11,7 +11,7 @@ codex-review cycle 3 on swesty/sparkforge#19 (head `be6515a`, APPROVE WITH FOLLO
 
 - **Admission takes the largest phase, with row IDs counted.** `PleTable::gather_peak_bytes` is the gathered bytes twice plus 8 bytes per row. `load_plan::hybrid_overhead_bytes` is the larger of the load scratch (copy and read-back, from `host_scratch_bytes`) and, in disk mode, that gather peak. `load-weights` prints each term next to the reservation.
 - **MTP budget:** both pre-FC norm vectors are added once whenever MTP is enabled: 640 bytes on the tiny fixture ((64 + 256) x 2), 25,600 bytes on Flash Next ((2,560 + 4 x 2,560) x 2).
-- **Reported baseline:** `Admission::confirm` returns the `MemAvailable` it checked. `load-weights` prints it as "before the copy". `verify-weights` had the same pre-admission reading, labelled "at start"; it now prints the confirmed reading too.
+- **Reported baseline:** `Admission::confirm` returns the `MemAvailable` it checked. `load-weights` prints it as "before the copy". `verify-weights` had the same pre-admission reading, labelled "at start"; it now prints the confirmed reading too. Both figures are system-wide `MemAvailable` readings, so a change after the final check shows only in the second one (codex-review fp:08579c39429a on #22).
 
 **Expected GB10 effect:** none on decode, prefill or load time. Admission for `load-weights --ple disk` reserves `max(scratch, gather peak)` instead of their sum: less at the default 4,096 tokens (the 120 MiB scratch dominates), and 8 MiB more at the maximum. Checked on spark-5 from the admission line `load-weights` prints, which comes before any CUDA call.
 

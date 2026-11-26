@@ -13,8 +13,12 @@
 - **THEN** 105.40 GB (98.16 GiB) in 2,033 buffers are copied and read back matching the checkpoint
 
 #### Scenario: Memory freed while the load waits
-- **WHEN** another process frees memory between admission and the allocation
-- **THEN** the reported "before" figure includes that memory, so the before-and-after difference counts only this load
+- **WHEN** another process frees memory after the load takes admission and before admission's final check right before allocating
+- **THEN** the reported "before" figure includes that memory, because it is the reading that check took
+
+#### Scenario: Memory changed after the final check
+- **WHEN** another process frees or uses memory after admission's final check and before the copy ends
+- **THEN** the "before" figure stays the checked reading, and the change shows only in the reading with the weights resident: both are system-wide `MemAvailable` readings, so their difference can include unrelated activity
 
 ### Requirement: Hybrid loads are admitted before CUDA starts
 
