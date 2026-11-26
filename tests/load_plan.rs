@@ -345,3 +345,47 @@ fn ple_metadata_rewritten_in_place_after_planning_fails_the_load_and_the_read_ba
     let err = format!("{:#}", p.ple_table.gather(&ck, &[0], &mut [0u8; 9]).unwrap_err());
     assert!(err.contains("was modified since it was opened"), "{err}");
 }
+
+#[test]
+fn admission_reserves_the_gathers_row_ids_instead_of_the_freed_scratch() {
+    // codex-review fp:44b41fc11198 on #19. The timed disk-mode gather holds its rows twice
+    // (pinned and on the GPU) and one u64 row ID per token and head. The load's scratch is freed by
+    // then, so admission reserves the larger of the two phases. The old reservation summed the
+    // gather buffers and the scratch, which misses the row IDs whenever they outgrow the scratch:
+    // 128 MiB of IDs against 120 MiB of scratch at 1,048,576 tokens on the reference checkpoint.
+    use sparkforge::load_plan::hybrid_overhead_bytes;
+    use sparkforge::weights::{admit, HEADROOM_BYTES};
+    use std::time::Duration;
+    let (s, ck) = tiny();
+    let p = plan(&ck, &s, PleMode::Disk).unwrap();
+    let t = &p.ple_table;
+    let scratch = host_scratch_bytes(&p, &ck, 0, &samples(&p, &ck));
+    // 4,096 tokens x 4 heads x 9 bytes per row; 8 bytes of row ID per row.
+    let tokens = 4096;
+    let (rows, bytes) = t.gather_size(tokens).unwrap();
+    assert_eq!((rows, bytes), (4 * 4096, 4 * 4096 * 9));
+    let ids = rows as u64 * 8;
+    assert_eq!(t.gather_peak_bytes(tokens).unwrap(), 2 * bytes + ids);
+    assert!(ids > scratch, "this case needs the row IDs ({ids} B) to outgrow the scratch ({scratch} B)");
+    let old = 2 * bytes + scratch;
+    let peak = hybrid_overhead_bytes(&p, scratch, tokens).unwrap();
+    assert_eq!(peak, 2 * bytes + ids);
+    assert!(peak > old);
+
+    // A memory limit between the old reservation and the true gather peak is refused.
+    let lock = common::dir("gather-peak").join("admission.lock");
+    let wait = Duration::from_secs(1);
+    let between = p.bytes + old + HEADROOM_BYTES;
+    drop(admit(&lock, p.bytes, old, || Some(between), wait).expect("the old reservation fits this limit"));
+    let err = format!("{:#}", admit(&lock, p.bytes, peak, || Some(between), wait).err().expect("the gather peak does not fit"));
+    assert!(err.contains("refusing to copy"), "{err}");
+    assert!(admit(&lock, p.bytes, peak, || Some(p.bytes + peak + HEADROOM_BYTES), wait).is_ok());
+
+    // One token: the scratch stays the peak. Resident mode never gathers.
+    assert_eq!(hybrid_overhead_bytes(&p, scratch, 1).unwrap(), scratch);
+    let r = plan(&ck, &s, PleMode::Resident).unwrap();
+    assert_eq!(hybrid_overhead_bytes(&r, scratch, tokens).unwrap(), scratch);
+    // Doubling the gathered bytes can overflow even when they fit a u64 once.
+    let err = format!("{:#}", t.gather_peak_bytes(1 << 58).unwrap_err());
+    assert!(err.contains("overflows"), "{err}");
+}

@@ -22,6 +22,8 @@ pub struct DeviceWeights {
     pub linears: HashMap<String, DeviceTensor>,
     pub bytes_copied: u64,
     pub load_secs: f64,
+    /// `MemAvailable` that `Admission::confirm` checked, under the lock right before allocating.
+    pub mem_available_before: u64,
     /// `MemAvailable` sampled right after the copy, while every allocation above is live.
     pub mem_available_after: Option<u64>,
 }
@@ -33,9 +35,9 @@ pub struct DeviceWeights {
 /// admitted allocation is made, including the verification scratch allocated after the copy, so a
 /// concurrent load's guard sees all of this one's memory as used (codex-review round 3 on #13).
 pub fn upload(stream: &Arc<CudaStream>, ck: &Checkpoint, b: &Binding, admission: &Admission, verifying: bool) -> Result<DeviceWeights> {
-    admission.confirm(bytes_to_copy(ck, b), load_overhead_bytes(b, verifying), mem_available)?;
+    let mem_available_before = admission.confirm(bytes_to_copy(ck, b), load_overhead_bytes(b, verifying), mem_available)?;
     let t0 = Instant::now();
-    let mut out = DeviceWeights { linears: HashMap::new(), bytes_copied: 0, load_secs: 0.0, mem_available_after: None };
+    let mut out = DeviceWeights { linears: HashMap::new(), bytes_copied: 0, load_secs: 0.0, mem_available_before, mem_available_after: None };
     let mut buf = vec![0u8; STAGING_BYTES as usize];
     for l in &b.linears {
         let t = copy_linear(stream, ck, l, &mut buf).with_context(|| format!("copying {}", l.key()))?;
@@ -98,6 +100,8 @@ pub struct HybridWeights {
     /// One allocation per `LoadPlan` buffer, in its order.
     pub buffers: Vec<CudaSlice<u8>>,
     pub load_secs: f64,
+    /// `MemAvailable` that `Admission::confirm` checked, under the lock right before allocating.
+    pub mem_available_before: u64,
     /// `MemAvailable` right after the copy, with every buffer live.
     pub mem_available_after: Option<u64>,
     pub verified: crate::load_plan::Verified,
@@ -109,7 +113,7 @@ pub struct HybridWeights {
 /// confirmed against `MemAvailable` before the first allocation.
 /// `staging` is the host staging size (`LoadPlan::staging_bytes`), which `overhead` must include.
 pub fn load_hybrid(stream: &Arc<CudaStream>, ck: &Checkpoint, plan: &crate::load_plan::LoadPlan, admission: &Admission, overhead: u64, staging: u64) -> Result<HybridWeights> {
-    admission.confirm(plan.bytes, overhead, mem_available)?;
+    let mem_available_before = admission.confirm(plan.bytes, overhead, mem_available)?;
     let mut gpu = Gpu(stream.clone());
     let t0 = Instant::now();
     let buffers = crate::load_plan::load(&mut gpu, ck, plan, usize::try_from(staging)?)?;
@@ -118,7 +122,7 @@ pub fn load_hybrid(stream: &Arc<CudaStream>, ck: &Checkpoint, plan: &crate::load
     let mem_available_after = mem_available();
     let t1 = Instant::now();
     let verified = crate::load_plan::verify(&mut gpu, ck, plan, &buffers)?;
-    Ok(HybridWeights { buffers, load_secs, mem_available_after, verified, verify_secs: t1.elapsed().as_secs_f64() })
+    Ok(HybridWeights { buffers, load_secs, mem_available_before, mem_available_after, verified, verify_secs: t1.elapsed().as_secs_f64() })
 }
 
 /// One timed run of reading PLE rows from the checkpoint into pinned memory and copying them to

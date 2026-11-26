@@ -1176,14 +1176,20 @@ impl Admission {
     /// workload actually being run (its copied bytes and its overhead, which includes verification
     /// scratch when verifying), and that `MemAvailable` still leaves the headroom: CUDA startup
     /// between admission and upload uses memory too (codex-review of SHA-765).
-    pub fn confirm(&self, copy_bytes: u64, overhead: u64, mem: impl Fn() -> Option<u64>) -> Result<()> {
+    ///
+    /// Returns the `MemAvailable` it checked, read under the lock just before allocating. That is
+    /// the baseline to report next to a figure read after the copy: a reading taken before
+    /// admission can include memory another process freed while this load waited, which the
+    /// difference would then misattribute to the load (codex-review fp:69a474a7ea8f on #19).
+    pub fn confirm(&self, copy_bytes: u64, overhead: u64, mem: impl Fn() -> Option<u64>) -> Result<u64> {
         ensure!(
             copy_bytes <= self.copy_bytes && overhead <= self.overhead,
             "this load needs {copy_bytes} bytes copied plus {overhead} of overhead but its admission covers only {} plus {}; take admission for the binding and mode being run",
             self.copy_bytes, self.overhead
         );
         let avail = mem().context("cannot read MemAvailable from /proc/meminfo; refusing to allocate without the memory guard")?;
-        check_headroom(copy_bytes + overhead, avail)
+        check_headroom(copy_bytes + overhead, avail)?;
+        Ok(avail)
     }
 }
 

@@ -496,6 +496,8 @@ pub struct WeightReport {
     pub rows: Vec<WeightRow>,
     pub load_secs: f64,
     pub bytes_copied: u64,
+    /// `MemAvailable` that the upload's admission check read, under the lock right before allocating.
+    pub mem_available_before_load: u64,
     /// `MemAvailable` sampled by `upload` while the weights were resident. The weights are freed
     /// when `verify_weights` returns, so a sample taken by the caller would overstate headroom.
     pub mem_available_after_load: Option<u64>,
@@ -523,6 +525,7 @@ pub fn verify_weights(
         rows: vec![],
         load_secs: dw.load_secs,
         bytes_copied: dw.bytes_copied,
+        mem_available_before_load: dw.mem_available_before,
         mem_available_after_load: dw.mem_available_after,
     };
     {

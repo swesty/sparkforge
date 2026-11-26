@@ -226,7 +226,6 @@ fn main() -> Result<()> {
             let (spec, ck) = open_checkpoint(&dir)?;
             let b = sparkforge::weights::bind(&ck, &spec)?;
             let p = checkpoint_plan(&spec);
-            let avail0 = sparkforge::weights::mem_available().unwrap_or(0);
             // Admission (lock + memory guard) before any CUDA call; held until verification has
             // freed the weights and its reference scratch.
             let admission = sparkforge::weights::admit_load(&ck, &b, true)?;
@@ -234,7 +233,9 @@ fn main() -> Result<()> {
             let e = sparkforge::runtime::Engine::load(&g, &cuda_include)?;
             let rep = verify::verify_weights(&p, &g, &e, &ck, &b, seed, &admission)?;
             drop(admission);
-            println!("{} ({} layers), MemAvailable at start {:.1} GiB", p.model.arch, p.model.layers, avail0 as f64 / (1u64 << 30) as f64);
+            // The baseline is the reading admission checked right before allocating, not one taken
+            // before waiting for the lock (codex-review fp:69a474a7ea8f on #19).
+            println!("{} ({} layers), MemAvailable before the copy {:.1} GiB", p.model.arch, p.model.layers, rep.mem_available_before_load as f64 / (1u64 << 30) as f64);
             // Sampled inside the upload while the weights were resident, not here after they were freed.
             println!("loaded {:.2} GiB into GPU memory in {:.2} s; MemAvailable with the weights resident {}", rep.bytes_copied as f64 / (1u64 << 30) as f64,
                 rep.load_secs, rep.mem_available_after_load.map_or("unknown".into(), |a| format!("{:.1} GiB", a as f64 / (1u64 << 30) as f64)));
@@ -259,15 +260,19 @@ fn main() -> Result<()> {
             let lp = load_plan::plan(&ck, &spec, mode)?;
             println!("{}: {} tensors checked and planned into {} GPU buffers in {:.2} s", spec.arch, lp.check.tensors, lp.buffers.len(), t0.elapsed().as_secs_f64());
             let gather_tokens = gather_tokens as usize;
-            let gather_bytes = if mode == load_plan::PleMode::Disk { lp.ple_table.gather_size(gather_tokens)?.1 } else { 0 };
             let staging = lp.staging_bytes(&ck, weights::STAGING_BYTES);
             let scratch = load_plan::host_scratch_bytes(&lp, &ck, staging, &load_plan::samples(&lp, &ck));
-            // Gathered rows are held twice: pinned on the host and in a device buffer.
-            let overhead = gather_bytes.checked_mul(2).and_then(|g| g.checked_add(scratch))
-                .ok_or_else(|| anyhow::anyhow!("the load's host overhead overflows a byte count"))?;
-            println!("admission: {:.2} GiB of weights, {:.1} MiB of host scratch (staging {:.1} MiB), {:.1} MiB of gather buffers",
-                gib(lp.bytes), scratch as f64 / (1u64 << 20) as f64, staging as f64 / (1u64 << 20) as f64, 2.0 * gather_bytes as f64 / (1u64 << 20) as f64);
-            let avail0 = weights::mem_available();
+            // The load, its read-back and the timed gather run one after another, so admission
+            // reserves the largest of them, with the gather's row IDs counted.
+            let overhead = load_plan::hybrid_overhead_bytes(&lp, scratch, gather_tokens)?;
+            let mib = |b: u64| b as f64 / (1u64 << 20) as f64;
+            let gather = if mode == load_plan::PleMode::Disk {
+                format!(", the gather peak {:.1} MiB ({gather_tokens} tokens: rows pinned and on the GPU, plus row IDs)", mib(lp.ple_table.gather_peak_bytes(gather_tokens)?))
+            } else {
+                String::new()
+            };
+            println!("admission: {:.2} GiB of weights plus {:.1} MiB of host overhead, the largest of: load scratch {:.1} MiB (staging {:.1} MiB){gather}",
+                gib(lp.bytes), mib(overhead), mib(scratch), mib(staging));
             // Admission before any CUDA call, held until every allocation of this run is made.
             let admission = weights::admit(&weights::admission_lock()?, lp.bytes, overhead, weights::mem_available, weights::ADMISSION_WAIT)?;
             let ctx = cudarc::driver::CudaContext::new(0).map_err(|e| anyhow::anyhow!("opening GPU 0: {e}"))?;
@@ -281,8 +286,10 @@ fn main() -> Result<()> {
                 load_plan::PleMode::Resident => "resident".into(),
             });
             println!("copied {:.2} GB ({:.2} GiB) into GPU memory in {:.2} s ({:.2} GB/s)", gb, gib(lp.bytes), w.load_secs, gb / w.load_secs);
-            println!("MemAvailable: {} before, {} with the weights resident",
-                avail0.map_or("unknown".into(), |a| format!("{:.1} GiB", gib(a))), w.mem_available_after.map_or("unknown".into(), |a| format!("{:.1} GiB", gib(a))));
+            // "Before" is the reading admission checked right before allocating, not one taken
+            // before waiting for the lock (codex-review fp:69a474a7ea8f on #19).
+            println!("MemAvailable: {:.1} GiB before the copy, {} with the weights resident",
+                gib(w.mem_available_before), w.mem_available_after.map_or("unknown".into(), |a| format!("{:.1} GiB", gib(a))));
             println!("read back {} pieces of {} buffers ({:.2} MB) in {:.2} s: all match the checkpoint", w.verified.pieces, w.verified.buffers, w.verified.bytes as f64 / 1e6, w.verify_secs);
             if mode == load_plan::PleMode::Disk {
                 for (run, seed) in [(1, 0x5eedu64), (2, 0x5eed), (3, 0xfeed)] {
