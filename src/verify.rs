@@ -402,6 +402,184 @@ impl Ctx<'_> {
         Ok(())
     }
 
+    /// `attn_prefill` against f64 causal attention at prompt lengths 1, 128, 2048 and 8192 from
+    /// position 0, and 128 rows from position 1000 (a later chunk). Long prompts check sampled rows
+    /// (both sides of every tile edge, the middle and the end), every head and dimension, with
+    /// `max_err_scaled`: P is rounded to bf16 before the P.V product (FlashAttention-2), so an
+    /// output near zero carries an absolute error of that rounding. Causality is checked bitwise:
+    /// rewriting the cache past a row's position must not change that row. With `--bench`, TFLOP/s
+    /// at 2048 and 8192.
+    fn prefill_attention(&mut self) -> Result<()> {
+        let (Some(pa), Some((k, f))) = (self.p.prefill_attn.clone(), kernel(self.g, self.e, "attn_prefill")) else { return Ok(()) };
+        let s = self.e.stream.clone();
+        let m = &self.p.model;
+        let (hd, heads, kvh) = (m.head_dim as usize, m.heads as usize, m.kv_heads as usize);
+        let (group, qkv, kvd) = (heads / kvh, m.qkv_dim() as usize, kvh * hd);
+        let scale = 1.0 / (hd as f64).sqrt();
+        let scale_log2 = std::f32::consts::LOG2_E / (hd as f32).sqrt();
+        let (bm, bn) = (pa.block_m as usize, pa.block_n as usize);
+        // The planned prompt length is the case the prefill estimate uses.
+        let mut cases = vec![(0usize, 1usize), (0, 128), (0, pa.prompt_tokens as usize), (0, 2048), (0, 8192), (1000, 128)];
+        cases.dedup();
+        cases.sort();
+        cases.dedup();
+        let cap = cases.iter().map(|c| c.0 + c.1).max().unwrap_or(1);
+        let max_len = cases.iter().map(|c| c.1).max().unwrap_or(1);
+        let kc = self.rng.bf16(cap * kvd);
+        let vc = self.rng.bf16(cap * kvd);
+        let qh = self.rng.bf16(max_len * qkv);
+        let (dk, dv, dq) = (s.memcpy_stod(&kc)?, s.memcpy_stod(&vc)?, s.memcpy_stod(&qh)?);
+        let mut dout = s.alloc_zeros::<u16>(max_len * heads * hd)?;
+        let launch = |dk: &cudarc::driver::CudaSlice<u16>, dv: &cudarc::driver::CudaSlice<u16>, out: &mut cudarc::driver::CudaSlice<u16>, len: usize, start: usize| -> Result<()> {
+            let (l32, s32) = (len as i32, start as i32);
+            let grid = [heads as u32, len.div_ceil(bm) as u32, 1];
+            unsafe { s.launch_builder(f).arg(&dq).arg(dk).arg(dv).arg(out).arg(&l32).arg(&s32).arg(&scale_log2).launch(cfg(grid, k.block, k.dyn_smem))? };
+            Ok(())
+        };
+        for (start, len) in cases {
+            launch(&dk, &dv, &mut dout, len, start)?;
+            let got = s.memcpy_dtov(&dout.slice(..len * heads * hd))?;
+            let mut rows: Vec<usize> = if len <= 256 {
+                (0..len).collect()
+            } else {
+                let edges = [0, 1, bm - 1, bm, bn - 1, bn, len / 2, len - bm - 1, len - bm, len - 2, len - 1];
+                edges.into_iter().chain((0..48).map(|i| i * (len - 1) / 47)).collect()
+            };
+            rows.retain(|&r| r < len);
+            rows.sort();
+            rows.dedup();
+            // f64 reference for each sampled (row, head), rows spread over threads.
+            let reference = |r: usize| -> Vec<f64> {
+                let n = start + r + 1;
+                let mut o = vec![0f64; heads * hd];
+                for h in 0..heads {
+                    let kv = h / group;
+                    let q: Vec<f64> = (0..hd).map(|d| bf2f(qh[r * qkv + h * hd + d]) as f64).collect();
+                    let sc: Vec<f64> = (0..n).map(|t| scale * (0..hd).map(|d| q[d] * bf2f(kc[t * kvd + kv * hd + d]) as f64).sum::<f64>()).collect();
+                    let mx = sc.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+                    let p: Vec<f64> = sc.iter().map(|&x| (x - mx).exp()).collect();
+                    let z: f64 = p.iter().sum();
+                    for (t, &pt) in p.iter().enumerate() {
+                        for d in 0..hd {
+                            o[h * hd + d] += pt * bf2f(vc[t * kvd + kv * hd + d]) as f64;
+                        }
+                    }
+                    for d in 0..hd {
+                        o[h * hd + d] /= z;
+                    }
+                }
+                o
+            };
+            let refs: Vec<Vec<f64>> = std::thread::scope(|sc| {
+                let hs: Vec<_> = rows.chunks(rows.len().div_ceil(16)).map(|c| sc.spawn(move || c.iter().map(|&r| reference(r)).collect::<Vec<_>>())).collect();
+                hs.into_iter().flat_map(|h| h.join().expect("reference thread")).collect()
+            });
+            let want: Vec<f64> = refs.into_iter().flatten().collect();
+            let gotv: Vec<f32> = rows.iter().flat_map(|&r| got[r * heads * hd..(r + 1) * heads * hd].iter().map(|&v| bf2f(v))).collect();
+            let err = max_err_scaled(&gotv, &want);
+            let flop = 4.0 * (hd * heads) as f64 * (0..len).map(|r| (start + r + 1) as f64).sum::<f64>();
+            let us = if self.o.bench && start == 0 && (len >= 2048 || len == pa.prompt_tokens as usize) {
+                Some(time_us(&s, 10, |_| launch(&dk, &dv, &mut dout, len, start))?)
+            } else { None };
+            let tf = us.map_or(String::new(), |u| format!(", {:.1} TFLOP/s", flop / (u * 1e-6) / 1e12));
+            let case = format!("{len} rows from position {start}, {} sampled{tf}", rows.len());
+            self.push("attn_prefill", case, err, us, (2 * (start + len) * kvd * 2 + len * qkv * 2) as f64);
+        }
+        // Causality: rows up to `keep` must be bitwise unchanged when the cache past position `keep`
+        // is rewritten (the rows after it attend there).
+        let (len, keep) = (512.min(cap), 300.min(cap - 1));
+        launch(&dk, &dv, &mut dout, len, 0)?;
+        let before = s.memcpy_dtov(&dout.slice(..(keep + 1) * heads * hd))?;
+        let (mut k2, mut v2) = (kc.clone(), vc.clone());
+        let tail = (len - keep - 1) * kvd;
+        k2[(keep + 1) * kvd..len * kvd].copy_from_slice(&self.rng.bf16(tail));
+        v2[(keep + 1) * kvd..len * kvd].copy_from_slice(&self.rng.bf16(tail));
+        let (dk2, dv2) = (s.memcpy_stod(&k2)?, s.memcpy_stod(&v2)?);
+        launch(&dk2, &dv2, &mut dout, len, 0)?;
+        let same = s.memcpy_dtov(&dout.slice(..(keep + 1) * heads * hd))? == before;
+        self.push("attn_prefill", format!("causal: rows 0..={keep} of {len} {}", if same { "unchanged by later keys" } else { "CHANGED BY LATER KEYS" }),
+            if same { 0.0 } else { f64::INFINITY }, None, 0.0);
+        Ok(())
+    }
+
+    /// `forward::Runtime::prefill` against token-by-token decode steps (`step`), both on
+    /// `STEP_LAYERS` layers of random weights: a 100-token prompt in one chunk and in chunks of 48
+    /// (so later chunks attend to earlier ones through the cache). The KV cache of every layer and
+    /// the last position's logits must agree (`max_err_scaled`), the prefill's greedy token must be
+    /// the argmax of its logits, and the captured decode graph, replayed right after the prefill
+    /// with no host input, must decode that token at the next position as a plain step does. Every
+    /// row's result is independent of the chunk it ran in, so both chunkings give bitwise the same
+    /// logits.
+    fn prefill_step(&mut self) -> Result<()> {
+        use crate::forward::{Kernels, PrefillKernels, Runtime, UploadedWeights};
+        use crate::reference::DenseWeights;
+        let m = &self.p.model;
+        if crate::reference::require_dense(m).is_err() || PrefillKernels::new(self.p, self.g, self.e).is_err() {
+            return Ok(());
+        }
+        let s = self.e.stream.clone();
+        let gs = self.e.ctx.new_stream()?;
+        let splits = self.p.attn.splits as usize;
+        // Every embedding row: the graph replay after the prefill looks up its greedy token, which
+        // can be any vocabulary index.
+        let (prompt, rows_emb) = (100usize, m.vocab as usize);
+        let mut rng = Rng(self.rng.next_u64() | 1);
+        let w = DenseWeights::random(m, STEP_LAYERS, rows_emb, &mut rng);
+        let up = UploadedWeights::new(&s, m, &w)?;
+        // The prefill runtime reads these weights from its own stream.
+        s.synchronize()?;
+        let tokens: Vec<u32> = (0..prompt).map(|_| (rng.next_u64() % rows_emb as u64) as u32).collect();
+        let argmax = |v: &[u16]| v.iter().enumerate().fold((0usize, f32::NEG_INFINITY), |b, (i, &x)| if bf2f(x) > b.1 { (i, bf2f(x)) } else { b }).0;
+        let to_f32v = |v: &[u16]| v.iter().map(|&x| bf2f(x)).collect::<Vec<f32>>();
+        let to_f64v = |v: &[u16]| v.iter().map(|&x| bf2f(x) as f64).collect::<Vec<f64>>();
+        // The token-by-token reference: one decode step per prompt position.
+        let mut dec = Runtime::new(&s, Kernels::new(self.g, self.e)?, m, &up, splits, prompt + 1)?;
+        for (pos, &t) in tokens.iter().enumerate() {
+            dec.set(pos, t as usize)?;
+            dec.step()?;
+        }
+        let dec_logits = dec.logits()?;
+        let dec_kv: Vec<(Vec<u16>, Vec<u16>)> = (0..STEP_LAYERS).map(|l| dec.kv(l, prompt)).collect::<Result<_>>()?;
+        let mut first: Option<Vec<u16>> = None;
+        for chunk in [128usize, 48] {
+            let mut pre = Runtime::new(&gs, Kernels::new(self.g, self.e)?, m, &up, splits, prompt + 1)?;
+            pre.enable_prefill(PrefillKernels::new(self.p, self.g, self.e)?, chunk)?;
+            gs.synchronize()?;
+            pre.capture()?;
+            pre.prefill(&tokens, 0)?;
+            let logits = pre.logits()?;
+            let mut kv_err = 0f64;
+            for (l, (dk, dv)) in dec_kv.iter().enumerate() {
+                let (k, v) = pre.kv(l, prompt)?;
+                kv_err = kv_err.max(max_err_scaled(&to_f32v(&k), &to_f64v(dk))).max(max_err_scaled(&to_f32v(&v), &to_f64v(dv)));
+            }
+            let logit_err = max_err_scaled(&to_f32v(&logits), &to_f64v(&dec_logits));
+            let tok = pre.tokens(prompt - 1, prompt)?[0];
+            let greedy = tok as usize == argmax(&logits);
+            // The graph replay decodes the prefill's token at position `prompt`; a plain step from the
+            // decode runtime with that token set by the host must agree.
+            let handoff = pre.pos() == prompt && {
+                pre.step()?;
+                dec.set(prompt, tok as usize)?;
+                dec.step()?;
+                max_err_scaled(&to_f32v(&pre.logits()?), &to_f64v(&dec.logits()?)) < TOL
+            };
+            let name = format!("{prompt} tokens in chunks of {chunk}");
+            self.push("prefill step", format!("{name}: KV cache, {STEP_LAYERS} layers"), kv_err, None, 0.0);
+            self.push("prefill step", format!("{name}: logits"), logit_err, None, 0.0);
+            let same = first.get_or_insert_with(|| logits.clone()) == &logits;
+            let ok = greedy && handoff && same;
+            let what = match (greedy, handoff, same) {
+                (true, true, true) => "argmax ok, graph decodes on, chunking bitwise",
+                (false, _, _) => "ARGMAX WRONG",
+                (_, false, _) => "GRAPH HANDOFF WRONG",
+                _ => "CHUNKING CHANGES LOGITS",
+            };
+            self.push("prefill step", format!("{name}: {what}"), if ok { 0.0 } else { f64::INFINITY }, None, 0.0);
+        }
+        Ok(())
+    }
+
     fn silu(&mut self) -> Result<()> {
         let Some((k, f)) = kernel(self.g, self.e, "silu_mul") else { return Ok(()) };
         let s = self.e.stream.clone();
@@ -717,6 +895,8 @@ pub fn run(p: &Plan, g: &Generated, e: &Engine, o: &Opts) -> Result<Vec<Row>> {
     c.gemvs().context("gemv")?;
     c.gemms().context("prefill gemm")?;
     c.decode_step().context("decode step")?;
+    c.prefill_attention().context("prefill attention")?;
+    c.prefill_step().context("prefill step")?;
     Ok(c.rows)
 }
 

@@ -95,8 +95,9 @@ enum Cmd {
         #[arg(long, default_value_t = 0x5eed)]
         seed: u64,
     },
-    /// Greedy decode of a dense BF16 checkpoint, one CUDA Graph per step, with optional checks
-    /// against the CPU reference and timings at given context lengths (needs --features cuda on a Spark).
+    /// Greedy decode of a dense BF16 checkpoint: the prompt in one prefill pass (prefill GEMMs and
+    /// attention, in chunks of the planned prompt length), then one CUDA Graph per step, with
+    /// optional checks against the CPU reference and timings (needs --features cuda on a Spark).
     #[cfg(feature = "cuda")]
     Generate {
         /// Checkpoint directory containing config.json and the safetensors
@@ -107,7 +108,8 @@ enum Cmd {
         /// Tokens to generate after the prompt
         #[arg(long, default_value_t = 32)]
         steps: usize,
-        /// Compare the logits of the first N steps with the CPU reference, streamed from the checkpoint
+        /// Compare the prefill's logits and those of the next N-1 steps with the CPU reference, streamed
+        /// from the checkpoint (the reference runs the whole prompt first)
         #[arg(long, default_value_t = 0)]
         check: usize,
         /// tokenizer.json to print the prompt and the output as text
@@ -116,6 +118,9 @@ enum Cmd {
         /// Also time decode steps at these context lengths
         #[arg(long, value_delimiter = ',')]
         bench_ctx: Vec<usize>,
+        /// Also time the prefill of prompts of these lengths (the prompt repeated), from an empty cache
+        #[arg(long, value_delimiter = ',')]
+        bench_prefill: Vec<usize>,
         #[arg(long, default_value = "/usr/local/cuda/include")]
         cuda_include: String,
     },
@@ -125,10 +130,14 @@ enum Cmd {
 #[cfg(feature = "cuda")]
 const BENCH_STEPS: usize = 32;
 
+/// Prefills timed at each `--bench-prefill` length, after one warm-up, each from a cleared cache.
+#[cfg(feature = "cuda")]
+const BENCH_PREFILLS: usize = 3;
+
 #[cfg(feature = "cuda")]
 #[allow(clippy::too_many_arguments)]
-fn generate(dir: &std::path::Path, prompt: &[u32], steps: usize, check: usize, tokenizer: Option<&std::path::Path>, bench_ctx: &[usize], cuda_include: &str) -> Result<()> {
-    use sparkforge::forward::{runtime_bytes, Kernels, Runtime};
+fn generate(dir: &std::path::Path, prompt: &[u32], steps: usize, check: usize, tokenizer: Option<&std::path::Path>, bench_ctx: &[usize], bench_prefill: &[usize], cuda_include: &str) -> Result<()> {
+    use sparkforge::forward::{prefill_bytes, runtime_bytes, Kernels, PrefillKernels, Runtime};
     use sparkforge::reference::{decode_step, CheckpointWeights, KvCache};
     use sparkforge::verify::{bf2f, max_err_scaled, TOL};
     let (spec, ck) = open_checkpoint(dir)?;
@@ -140,14 +149,18 @@ fn generate(dir: &std::path::Path, prompt: &[u32], steps: usize, check: usize, t
     let dec = tokenizer.map(sparkforge::tokenizer::Decoder::from_file).transpose()?;
     anyhow::ensure!(!prompt.is_empty() && steps > 0, "need a prompt and at least one step");
     anyhow::ensure!(prompt.iter().all(|&t| t < m.vocab), "a prompt token is past the vocabulary of {}", m.vocab);
-    // The prompt's last step already predicts the first output token, so `steps` tokens take
-    // prompt + steps - 1 replays, at positions 0..prompt + steps - 1.
+    anyhow::ensure!(bench_prefill.iter().all(|&l| l >= 1), "a prefill length of 0");
+    // The prefill predicts the first output token, so `steps` tokens take steps - 1 graph replays,
+    // at positions prompt..prompt + steps - 1.
     let replays = prompt.len() + steps - 1;
-    let bench_cap = bench_ctx.iter().map(|&c| c + 2 + BENCH_STEPS).max().unwrap_or(0);
+    let bench_cap = bench_ctx.iter().map(|&c| c + 2 + BENCH_STEPS).chain(bench_prefill.iter().copied()).max().unwrap_or(0);
     let capacity = replays.max(bench_cap);
     anyhow::ensure!(capacity <= m.max_pos as usize, "{capacity} positions exceed max_position_embeddings {}", m.max_pos);
     let splits = p.attn.splits as usize;
-    let rbytes = runtime_bytes(m, splits, capacity);
+    // Prefill chunks of the planned prompt length (the GEMM tiles' M), or less for shorter prompts.
+    let planned = p.gemm.iter().find(|t| t.linear == "qkv_proj").map_or(2048, |t| t.m as usize);
+    let chunk = planned.min(bench_prefill.iter().copied().chain([prompt.len()]).max().unwrap_or(1));
+    let rbytes = runtime_bytes(m, splits, capacity) + prefill_bytes(m, chunk);
     // Before any CUDA call: every tensor plus the KV caches and activations.
     let admission = sparkforge::weights::admit_runtime(&ck, &b, rbytes)?;
     let e = sparkforge::runtime::Engine::load(&g, cuda_include)?;
@@ -156,6 +169,7 @@ fn generate(dir: &std::path::Path, prompt: &[u32], steps: usize, check: usize, t
     let s = e.ctx.new_stream()?;
     let dd = sparkforge::device_weights::upload_dense(&s, &ck, &b, m, &admission, rbytes)?;
     let mut rt = Runtime::new(&s, Kernels::new(&g, &e)?, m, &dd, splits, capacity)?;
+    rt.enable_prefill(PrefillKernels::new(&p, &g, &e)?, chunk)?;
     s.synchronize()?;
     let mem_after = sparkforge::weights::mem_available();
     drop(admission);
@@ -166,44 +180,46 @@ fn generate(dir: &std::path::Path, prompt: &[u32], steps: usize, check: usize, t
     if let Some(d) = &dec {
         println!("prompt ({} tokens): {:?}", prompt.len(), d.decode(prompt));
     }
-    // Prompt, by repeated decode steps; the first `check` steps (prompt then generated) against
-    // the reference, which streams the weights from the checkpoint.
+    // The CPU reference streams the weights from the checkpoint; it runs every prompt position to
+    // build its KV cache, and its logits are compared with the prefill's and then with the next
+    // `check - 1` steps'.
     let cw = CheckpointWeights { ck: &ck, b: &b, m };
-    let check = check.min(replays);
-    let mut host_cache = KvCache::new(m, m.layers as usize, check.max(1));
+    let check = check.min(steps);
+    let mut host_cache = KvCache::new(m, m.layers as usize, if check > 0 { prompt.len() + check } else { 1 });
     let (mut worst, mut agree) = (0f64, 0usize);
-    // Runs the step at `pos` for `token` on the CPU and compares it with the GPU's logits and
-    // greedy token from that step.
-    let mut compare = |rt: &Runtime, host_cache: &mut KvCache, pos: usize, token: u32| -> Result<()> {
+    // Compares the GPU's logits and greedy token from the step at `pos` with the reference's
+    // logits `r` there.
+    let mut compare = |rt: &Runtime, pos: usize, r: &[f64]| -> Result<()> {
         let got: Vec<f32> = rt.logits()?.iter().map(|&v| bf2f(v)).collect();
-        let r = decode_step(m, &cw, host_cache, token as usize, pos)?;
-        let err = max_err_scaled(&got, &r.logits);
-        let ref_top = r.logits.iter().enumerate().fold((0, f64::NEG_INFINITY), |a, (i, &v)| if v > a.1 { (i, v) } else { a }).0;
+        let err = max_err_scaled(&got, r);
+        let ref_top = r.iter().enumerate().fold((0, f64::NEG_INFINITY), |a, (i, &v)| if v > a.1 { (i, v) } else { a }).0;
         let gpu_top = rt.tokens(pos, pos + 1)?[0] as usize;
         agree += (gpu_top == ref_top) as usize;
         worst = worst.max(err);
-        println!("check step {pos}: logits error {err:.2e} (tolerance {TOL:.4}), greedy token {gpu_top}, reference argmax {ref_top}");
+        println!("check position {pos}: logits error {err:.2e} (tolerance {TOL:.4}), greedy token {gpu_top}, reference argmax {ref_top}");
         Ok(())
     };
-    // The prompt, by repeated decode steps.
+    // The prompt in one prefill pass; it ends with the first output token's argmax.
     let t_prompt = std::time::Instant::now();
-    for (pos, &token) in prompt.iter().enumerate() {
-        rt.set(pos, token as usize)?;
-        rt.step()?;
-        if pos < check {
-            compare(&rt, &mut host_cache, pos, token)?;
-        }
-    }
+    rt.prefill(prompt, 0)?;
     s.synchronize()?;
-    let prompt_secs = t_prompt.elapsed().as_secs_f64();
+    let ttft = t_prompt.elapsed().as_secs_f64();
+    let first = prompt.len();
+    if check > 0 {
+        let mut last = vec![];
+        for (pos, &token) in prompt.iter().enumerate() {
+            last = decode_step(m, &cw, &mut host_cache, token as usize, pos)?.logits;
+        }
+        compare(&rt, first - 1, &last)?;
+    }
     // Generation: the graph carries the token and position from step to step on the device. Steps
     // still to be checked run first, one at a time.
-    let first = prompt.len();
     let mut pos = first;
-    while pos < replays && pos < check {
+    while pos < replays && pos < first - 1 + check {
         let token = rt.tokens(pos - 1, pos)?[0];
         rt.step()?;
-        compare(&rt, &mut host_cache, pos, token)?;
+        let r = decode_step(m, &cw, &mut host_cache, token as usize, pos)?;
+        compare(&rt, pos, &r.logits)?;
         pos += 1;
     }
     let timed = replays - pos;
@@ -213,11 +229,11 @@ fn generate(dir: &std::path::Path, prompt: &[u32], steps: usize, check: usize, t
     }
     s.synchronize()?;
     let gen_secs = t0.elapsed().as_secs_f64();
-    // The token predicted at position p is out[p]: the prompt's last step gives the first one.
+    // The token predicted at position p is out[p]: the prefill gives the first one.
     let out = rt.tokens(first - 1, replays)?;
-    println!("prompt: {} steps in {:.2} s{}", first, prompt_secs, if check > 0 { " (including reference checks)" } else { "" });
+    println!("prefill: {first} tokens in chunks of {chunk}, {:.1} ms to the first token ({:.0} tok/s)", ttft * 1e3, first as f64 / ttft);
     if timed > 0 {
-        println!("generated {timed} tokens in {:.3} s: {:.2} ms/token, {:.1} tok/s (graph replays at positions {pos}..{replays}; the first output token came from the prompt's last step)",
+        println!("generated {timed} tokens in {:.3} s: {:.2} ms/token, {:.1} tok/s (graph replays at positions {pos}..{replays}; the first output token came from the prefill)",
             gen_secs, gen_secs * 1e3 / timed as f64, timed as f64 / gen_secs);
     }
     println!("output ids: {out:?}");
@@ -225,7 +241,22 @@ fn generate(dir: &std::path::Path, prompt: &[u32], steps: usize, check: usize, t
         println!("output: {:?}", d.decode(&out));
     }
     if check > 0 {
-        println!("checked {check} step(s) against the CPU reference: worst logits error {worst:.2e}, greedy token matches the reference argmax in {agree}/{check}");
+        println!("checked {check} position(s) against the CPU reference: worst logits error {worst:.2e}, greedy token matches the reference argmax in {agree}/{check}");
+    }
+    // Prefill timing: the prompt repeated to each length, from a zeroed cache, to the first token.
+    for &l in bench_prefill {
+        let toks: Vec<u32> = prompt.iter().copied().cycle().take(l).collect();
+        let mut run = || -> Result<f64> {
+            rt.clear_cache()?;
+            s.synchronize()?;
+            let t = std::time::Instant::now();
+            rt.prefill(&toks, 0)?;
+            s.synchronize()?;
+            Ok(t.elapsed().as_secs_f64())
+        };
+        run()?;
+        let secs = (0..BENCH_PREFILLS).map(|_| run()).sum::<Result<f64>>()? / BENCH_PREFILLS as f64;
+        println!("prefill {l} tokens: {:.1} ms to the first token, {:.0} tok/s (chunks of {chunk}, mean of {BENCH_PREFILLS} after a warm-up)", secs * 1e3, l as f64 / secs);
     }
     // Timing at a context length: the attention span is what matters, not the values in it, so
     // each measurement starts from a zeroed cache (a synthetic prefix) and the same input token,
@@ -456,8 +487,8 @@ fn main() -> Result<()> {
             drop(admission);
         }
         #[cfg(feature = "cuda")]
-        Cmd::Generate { dir, tokens, steps, check, tokenizer, bench_ctx, cuda_include } => {
-            generate(&dir, &tokens, steps, check, tokenizer.as_deref(), &bench_ctx, &cuda_include)?;
+        Cmd::Generate { dir, tokens, steps, check, tokenizer, bench_ctx, bench_prefill, cuda_include } => {
+            generate(&dir, &tokens, steps, check, tokenizer.as_deref(), &bench_ctx, &bench_prefill, &cuda_include)?;
         }
         #[cfg(feature = "cuda")]
         Cmd::Verify { c, cuda_include, bench, seed } => {
@@ -485,7 +516,7 @@ fn main() -> Result<()> {
                     p.budget.ctx, t / 1e3, 1e6 / t, p.budget.decode_tok_s_ceiling);
             }
             match sparkforge::estimate::prefill_estimate_us(&p, &rows) {
-                Ok((t, tokens)) => println!("prefill, sum of isolated GEMM times for a {tokens}-token prompt: {:.1} ms -> {:.0} tok/s (GEMMs and the last position's lm_head only; attention, norms, RoPE and activations not included)",
+                Ok((t, tokens)) => println!("prefill, sum of isolated GEMM and attention times for a {tokens}-token prompt: {:.1} ms -> {:.0} tok/s (norms, RoPE and activations not included)",
                     t / 1e3, tokens as f64 * 1e6 / t),
                 Err(e) if bench => println!("prefill estimate skipped: {e}"),
                 Err(_) => {}
