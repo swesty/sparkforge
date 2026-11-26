@@ -89,11 +89,12 @@ constexpr int HD = @HD@, HEADS = @HEADS@, KVH = @KVH@;
 __constant__ float INV_FREQ[HD / 2] = {@INV_FREQ@};
 }
 // Decode step, one token: rotates q and k in the fused qkv buffer (NeoX half-split layout)
-// and appends k/v into the cache at `pos`. Grid = HEADS + 2*KVH, block = HD/2.
+// and appends k/v into the cache at the position `*pos_p`, read from device memory so one
+// captured CUDA Graph serves every step. Grid = HEADS + 2*KVH, block = HD/2.
 extern "C" __global__ void __launch_bounds__(rope_ns::HD / 2)
-rope_kv_append(bf16* __restrict__ qkv, bf16* __restrict__ k_cache, bf16* __restrict__ v_cache, int pos) {
+rope_kv_append(bf16* __restrict__ qkv, bf16* __restrict__ k_cache, bf16* __restrict__ v_cache, const int* __restrict__ pos_p) {
   using namespace rope_ns;
-  const int h = blockIdx.x, i = threadIdx.x;
+  const int h = blockIdx.x, i = threadIdx.x, pos = *pos_p;
   bf16* base = qkv + (size_t)h * HD;
   if (h < HEADS + KVH) {
     // The angle is formed in f32 (as HF does), but sin/cos must be precise: under --use_fast_math
@@ -126,11 +127,13 @@ static_assert(HD % 32 == 0, "head_dim must be a multiple of 32");
 extern "C" __global__ void __launch_bounds__(attn_ns::WARPS * 32, 2)
 attn_decode_split(const bf16* __restrict__ q, const bf16* __restrict__ k_cache,
                   const bf16* __restrict__ v_cache, float* __restrict__ part_ml,
-                  float* __restrict__ part_acc, int seq_len, float scale) {
+                  float* __restrict__ part_acc, const int* __restrict__ pos_p, float scale) {
   using namespace attn_ns;
   extern __shared__ float sm[];  // [WARPS][GROUP][HD + 2]
   const int kvh = blockIdx.x, split = blockIdx.y;
   const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+  // Attends over positions 0..*pos_p, the token just appended at *pos_p included.
+  const int seq_len = *pos_p + 1;
   const int chunk = (seq_len + SPLITS - 1) / SPLITS;
   const int t0 = split * chunk, t1 = min(seq_len, t0 + chunk);
   float qv[GROUP][DPL], acc[GROUP][DPL], m[GROUP], l[GROUP];
@@ -222,6 +225,50 @@ residual_add(bf16* __restrict__ h, const bf16* __restrict__ d) {
 #pragma unroll
   for (int j = 0; j < 8; ++j) o[j] = __float2bfloat16(a[j] + b[j]);
   reinterpret_cast<uint4*>(h)[v] = r;
+}
+"#;
+
+const EMBED_ARGMAX: &str = r#"
+namespace token_ns { constexpr int HIDDEN = @HIDDEN@, VOCAB = @VOCAB@, THREADS = 1024; static_assert(HIDDEN % 8 == 0, ""); }
+// x = table[*token], the row read from device memory. One thread per 8 elements.
+extern "C" __global__ void __launch_bounds__(256)
+embed_gather(const bf16* __restrict__ table, const int* __restrict__ token, bf16* __restrict__ x) {
+  using namespace token_ns;
+  const int v = blockIdx.x * 256 + threadIdx.x;
+  if (v >= HIDDEN / 8) return;
+  reinterpret_cast<uint4*>(x)[v] = reinterpret_cast<const uint4*>(table + (size_t)*token * HIDDEN)[v];
+}
+// Greedy step end, one block: token = argmax(logits) (lowest index on ties, NaN never wins),
+// out[*pos] = token, then *pos += 1, so the next replay of the step graph decodes that token at the
+// next position with no host involvement.
+extern "C" __global__ void __launch_bounds__(token_ns::THREADS)
+argmax_advance(const bf16* __restrict__ logits, int* __restrict__ token, int* __restrict__ out, int* __restrict__ pos) {
+  using namespace token_ns;
+  float best = NEG_INF; int idx = VOCAB;
+  for (int i = threadIdx.x; i < VOCAB; i += THREADS) {
+    const float v = __bfloat162float(logits[i]);
+    if (v > best) { best = v; idx = i; }
+  }
+  __shared__ float sv[THREADS / 32]; __shared__ int si[THREADS / 32];
+#pragma unroll
+  for (int o = 16; o > 0; o >>= 1) {
+    const float ov = __shfl_xor_sync(0xffffffffu, best, o); const int oi = __shfl_xor_sync(0xffffffffu, idx, o);
+    if (ov > best || (ov == best && oi < idx)) { best = ov; idx = oi; }
+  }
+  if ((threadIdx.x & 31) == 0) { sv[threadIdx.x >> 5] = best; si[threadIdx.x >> 5] = idx; }
+  __syncthreads();
+  if (threadIdx.x < 32) {
+    best = sv[threadIdx.x]; idx = si[threadIdx.x];
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) {
+      const float ov = __shfl_xor_sync(0xffffffffu, best, o); const int oi = __shfl_xor_sync(0xffffffffu, idx, o);
+      if (ov > best || (ov == best && oi < idx)) { best = ov; idx = oi; }
+    }
+    if (threadIdx.x == 0) {
+      const int p = *pos, t = idx < VOCAB ? idx : 0;
+      *token = t; out[p] = t; *pos = p + 1;
+    }
+  }
 }
 "#;
 
@@ -548,15 +595,19 @@ pub fn generate(p: &Plan) -> Generated {
     kernels.push(KernelEntry { entry: "rmsnorm".into(), file: "model.cu".into(), grid: [1, 1, 1], block: p.norm.threads, dyn_smem: 0, status: "generated", args: vec!["x", "w", "y", "eps"] });
 
     src += &fill(ROPE_KV, &[("HD", m.head_dim.to_string()), ("HEADS", m.heads.to_string()), ("KVH", m.kv_heads.to_string()), ("INV_FREQ", rope_inv_freq(m).iter().map(|v| format!("{v:e}f")).collect::<Vec<_>>().join(", "))]);
-    kernels.push(KernelEntry { entry: "rope_kv_append".into(), file: "model.cu".into(), grid: [m.heads + 2 * m.kv_heads, 1, 1], block: m.head_dim / 2, dyn_smem: 0, status: "generated", args: vec!["qkv", "k_cache", "v_cache", "pos"] });
+    kernels.push(KernelEntry { entry: "rope_kv_append".into(), file: "model.cu".into(), grid: [m.heads + 2 * m.kv_heads, 1, 1], block: m.head_dim / 2, dyn_smem: 0, status: "generated", args: vec!["qkv", "k_cache", "v_cache", "pos_p"] });
 
     let a = &p.attn;
     src += &fill(ATTN, &[("HD", a.head_dim.to_string()), ("KVH", a.kv_heads.to_string()), ("GROUP", a.group.to_string()), ("WARPS", a.warps.to_string()), ("SPLITS", a.splits.to_string())]);
-    kernels.push(KernelEntry { entry: "attn_decode_split".into(), file: "model.cu".into(), grid: [a.grid[0], a.grid[1], 1], block: a.warps * 32, dyn_smem: a.smem_bytes, status: "generated", args: vec!["q", "k_cache", "v_cache", "part_ml", "part_acc", "seq_len", "scale"] });
+    kernels.push(KernelEntry { entry: "attn_decode_split".into(), file: "model.cu".into(), grid: [a.grid[0], a.grid[1], 1], block: a.warps * 32, dyn_smem: a.smem_bytes, status: "generated", args: vec!["q", "k_cache", "v_cache", "part_ml", "part_acc", "pos_p", "scale"] });
     kernels.push(KernelEntry { entry: "attn_decode_combine".into(), file: "model.cu".into(), grid: [m.heads, 1, 1], block: m.head_dim, dyn_smem: 0, status: "generated", args: vec!["part_ml", "part_acc", "out"] });
 
     src += &fill(RESIDUAL_ADD, &[("HIDDEN", m.hidden.to_string())]);
     kernels.push(KernelEntry { entry: "residual_add".into(), file: "model.cu".into(), grid: [(m.hidden / 8).div_ceil(256), 1, 1], block: 256, dyn_smem: 0, status: "generated", args: vec!["h", "d"] });
+
+    src += &fill(EMBED_ARGMAX, &[("HIDDEN", m.hidden.to_string()), ("VOCAB", m.vocab.to_string())]);
+    kernels.push(KernelEntry { entry: "embed_gather".into(), file: "model.cu".into(), grid: [(m.hidden / 8).div_ceil(256), 1, 1], block: 256, dyn_smem: 0, status: "generated", args: vec!["table", "token", "x"] });
+    kernels.push(KernelEntry { entry: "argmax_advance".into(), file: "model.cu".into(), grid: [1, 1, 1], block: 1024, dyn_smem: 0, status: "generated", args: vec!["logits", "token", "out", "pos"] });
 
     let inter = m.moe.as_ref().map_or(m.intermediate, |e| e.expert_intermediate);
     src += &fill(SILU_MUL, &[("INTER", inter.to_string())]);

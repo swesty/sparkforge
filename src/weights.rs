@@ -1379,6 +1379,19 @@ pub fn bytes_to_copy(ck: &Checkpoint, b: &Binding) -> u64 {
     b.linears.iter().flat_map(|l| l.parts.iter()).map(|p| ck.tensors[p].len()).sum()
 }
 
+/// Bytes the decode runtime copies: every bound linear plus every other tensor it reads (norms and
+/// the embedding).
+pub fn dense_bytes(ck: &Checkpoint, b: &Binding) -> u64 {
+    bytes_to_copy(ck, b) + b.others.iter().filter_map(|n| ck.tensors.get(n)).map(|t| t.len()).sum::<u64>()
+}
+
+/// Admission for the decode runtime (`sparkforge generate`), taken before any CUDA call: every
+/// tensor it copies (`dense_bytes`) plus the staging buffer and `runtime_bytes` of KV caches,
+/// activations and token state. Hold it until the runtime's allocations are made.
+pub fn admit_runtime(ck: &Checkpoint, b: &Binding, runtime_bytes: u64) -> Result<Admission> {
+    admit(&admission_lock()?, dense_bytes(ck, b), STAGING_BYTES + runtime_bytes, mem_available, ADMISSION_WAIT)
+}
+
 /// Admission for loading `b`, taken on the host before any CUDA call: the lock at `lock` and the
 /// memory guard for the copied bytes plus the load's overhead. Hold the result until the upload has made
 /// and filled every allocation; the upload confirms it against what it actually copies.

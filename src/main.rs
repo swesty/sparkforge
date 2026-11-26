@@ -95,6 +95,153 @@ enum Cmd {
         #[arg(long, default_value_t = 0x5eed)]
         seed: u64,
     },
+    /// Greedy decode of a dense BF16 checkpoint, one CUDA Graph per step, with optional checks
+    /// against the CPU reference and timings at given context lengths (needs --features cuda on a Spark).
+    #[cfg(feature = "cuda")]
+    Generate {
+        /// Checkpoint directory containing config.json and the safetensors
+        dir: PathBuf,
+        /// Prompt as comma-separated token ids (the prompt is pre-tokenized)
+        #[arg(long, value_delimiter = ',', required = true)]
+        tokens: Vec<u32>,
+        /// Tokens to generate after the prompt
+        #[arg(long, default_value_t = 32)]
+        steps: usize,
+        /// Compare the logits of the first N steps with the CPU reference, streamed from the checkpoint
+        #[arg(long, default_value_t = 0)]
+        check: usize,
+        /// tokenizer.json to print the prompt and the output as text
+        #[arg(long)]
+        tokenizer: Option<PathBuf>,
+        /// Also time decode steps at these context lengths
+        #[arg(long, value_delimiter = ',')]
+        bench_ctx: Vec<usize>,
+        #[arg(long, default_value = "/usr/local/cuda/include")]
+        cuda_include: String,
+    },
+}
+
+/// Decode steps timed at each `--bench-ctx` length, after 2 warm-up steps.
+#[cfg(feature = "cuda")]
+const BENCH_STEPS: usize = 32;
+
+#[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
+fn generate(dir: &std::path::Path, prompt: &[u32], steps: usize, check: usize, tokenizer: Option<&std::path::Path>, bench_ctx: &[usize], cuda_include: &str) -> Result<()> {
+    use sparkforge::forward::{runtime_bytes, Kernels, Runtime};
+    use sparkforge::reference::{decode_step, CheckpointWeights, KvCache};
+    use sparkforge::verify::{bf2f, max_err_scaled, TOL};
+    let (spec, ck) = open_checkpoint(dir)?;
+    sparkforge::reference::require_dense(&spec)?;
+    let p = checkpoint_plan(&spec);
+    let m = &p.model;
+    let g = codegen::generate(&p);
+    let b = sparkforge::weights::bind(&ck, m)?;
+    let dec = tokenizer.map(sparkforge::tokenizer::Decoder::from_file).transpose()?;
+    anyhow::ensure!(!prompt.is_empty() && steps > 0, "need a prompt and at least one step");
+    anyhow::ensure!(prompt.iter().all(|&t| t < m.vocab), "a prompt token is past the vocabulary of {}", m.vocab);
+    let bench_cap = bench_ctx.iter().map(|&c| c + 2 + BENCH_STEPS).max().unwrap_or(0);
+    let capacity = (prompt.len() + steps).max(bench_cap);
+    anyhow::ensure!(capacity <= m.max_pos as usize, "{capacity} positions exceed max_position_embeddings {}", m.max_pos);
+    let splits = p.attn.splits as usize;
+    let rbytes = runtime_bytes(m, splits, capacity);
+    // Before any CUDA call: every tensor plus the KV caches and activations.
+    let admission = sparkforge::weights::admit_runtime(&ck, &b, rbytes)?;
+    let e = sparkforge::runtime::Engine::load(&g, cuda_include)?;
+    unsafe { e.ctx.disable_event_tracking() };
+    // The legacy default stream cannot be captured into a graph.
+    let s = e.ctx.new_stream()?;
+    let dd = sparkforge::device_weights::upload_dense(&s, &ck, &b, m, &admission, rbytes)?;
+    let mut rt = Runtime::new(&s, Kernels::new(&g, &e)?, m, &dd.ptrs, splits, capacity)?;
+    s.synchronize()?;
+    let mem_after = sparkforge::weights::mem_available();
+    drop(admission);
+    println!("{}: {} layers, loaded {:.2} GiB in {:.1} s; KV cache {} positions ({:.2} GiB); MemAvailable {:.1} GiB before, {} after",
+        m.arch, m.layers, gib(dd.bytes_copied), dd.load_secs, capacity, gib(2 * m.layers as u64 * capacity as u64 * m.kv_dim() as u64 * 2),
+        gib(dd.mem_available_before), mem_after.map_or("-".into(), |v| format!("{:.1} GiB", gib(v))));
+    rt.capture()?;
+    if let Some(d) = &dec {
+        println!("prompt ({} tokens): {:?}", prompt.len(), d.decode(prompt));
+    }
+    // Prompt, by repeated decode steps; the first `check` steps (prompt then generated) against
+    // the reference, which streams the weights from the checkpoint.
+    let cw = CheckpointWeights { ck: &ck, b: &b, m };
+    let mut host_cache = KvCache::new(m, m.layers as usize, check.min(capacity).max(1));
+    let (mut worst, mut agree) = (0f64, 0usize);
+    // Runs the step at `pos` for `token` on the CPU and compares it with the GPU's logits and
+    // greedy token from that step.
+    let mut compare = |rt: &Runtime, host_cache: &mut KvCache, pos: usize, token: u32| -> Result<()> {
+        let got: Vec<f32> = rt.logits()?.iter().map(|&v| bf2f(v)).collect();
+        let r = decode_step(m, &cw, host_cache, token as usize, pos)?;
+        let err = max_err_scaled(&got, &r.logits);
+        let ref_top = r.logits.iter().enumerate().fold((0, f64::NEG_INFINITY), |a, (i, &v)| if v > a.1 { (i, v) } else { a }).0;
+        let gpu_top = rt.tokens(pos, pos + 1)?[0] as usize;
+        agree += (gpu_top == ref_top) as usize;
+        worst = worst.max(err);
+        println!("check step {pos}: logits error {err:.2e} (tolerance {TOL:.4}), greedy token {gpu_top}, reference argmax {ref_top}");
+        Ok(())
+    };
+    // The prompt, by repeated decode steps.
+    let t_prompt = std::time::Instant::now();
+    for (pos, &token) in prompt.iter().enumerate() {
+        rt.set(pos, token as usize)?;
+        rt.step()?;
+        if pos < check {
+            compare(&rt, &mut host_cache, pos, token)?;
+        }
+    }
+    s.synchronize()?;
+    let prompt_secs = t_prompt.elapsed().as_secs_f64();
+    // Generation: the graph carries the token and position from step to step on the device. Steps
+    // still to be checked run first, one at a time.
+    let first = prompt.len();
+    let mut checked = 0;
+    while first + checked < check.min(first + steps) {
+        let pos = first + checked;
+        let token = rt.tokens(pos - 1, pos)?[0];
+        rt.step()?;
+        compare(&rt, &mut host_cache, pos, token)?;
+        checked += 1;
+    }
+    let timed = steps - checked;
+    let t0 = std::time::Instant::now();
+    for _ in 0..timed {
+        rt.step()?;
+    }
+    s.synchronize()?;
+    let gen_secs = t0.elapsed().as_secs_f64();
+    let out = rt.tokens(first - 1, first - 1 + steps)?;
+    println!("prompt: {} steps in {:.2} s{}", first, prompt_secs, if check > 0 { " (including reference checks)" } else { "" });
+    if timed > 0 {
+        println!("generated {timed} tokens in {:.3} s: {:.2} ms/token, {:.1} tok/s (graph replay, positions {}..{})",
+            gen_secs, gen_secs * 1e3 / timed as f64, timed as f64 / gen_secs, first + checked, first + steps);
+    }
+    println!("output ids: {out:?}");
+    if let Some(d) = &dec {
+        println!("output: {:?}", d.decode(&out));
+    }
+    if check > 0 {
+        let n = check.min(first + steps);
+        println!("checked {n} step(s) against the CPU reference: worst logits error {worst:.2e}, greedy token matches the reference argmax in {agree}/{n}");
+    }
+    for &c in bench_ctx {
+        anyhow::ensure!(c >= 1, "a context length of 0");
+        rt.set(c, out[0] as usize)?;
+        rt.step()?;
+        rt.step()?;
+        s.synchronize()?;
+        let t0 = std::time::Instant::now();
+        for _ in 0..BENCH_STEPS {
+            rt.step()?;
+        }
+        s.synchronize()?;
+        let ms = t0.elapsed().as_secs_f64() * 1e3 / BENCH_STEPS as f64;
+        let ceiling = plan::build(&spec, &GB10, &plan::PlanOpts { prefill_tokens: 2048, ctx: c as u32 }).budget.decode_tok_s_ceiling;
+        println!("ctx {c}: {ms:.2} ms/token, {:.1} tok/s (planner ceiling {ceiling:.1}), {BENCH_STEPS} graph replays at positions {}..{}",
+            1e3 / ms, c + 2, c + 2 + BENCH_STEPS);
+    }
+    anyhow::ensure!(worst < TOL, "logits differ from the CPU reference by {worst:.2e}, above tolerance {TOL:.4}");
+    Ok(())
 }
 
 #[derive(clap::Args)]
@@ -300,6 +447,10 @@ fn main() -> Result<()> {
             }
             drop(w);
             drop(admission);
+        }
+        #[cfg(feature = "cuda")]
+        Cmd::Generate { dir, tokens, steps, check, tokenizer, bench_ctx, cuda_include } => {
+            generate(&dir, &tokens, steps, check, tokenizer.as_deref(), &bench_ctx, &cuda_include)?;
         }
         #[cfg(feature = "cuda")]
         Cmd::Verify { c, cuda_include, bench, seed } => {

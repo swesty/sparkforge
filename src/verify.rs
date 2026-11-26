@@ -167,7 +167,8 @@ impl Ctx<'_> {
             let slots = (pos + 1) * kvh * hd;
             let mut kc = s.alloc_zeros::<u16>(slots)?;
             let mut vc = s.alloc_zeros::<u16>(slots)?;
-            let p32 = pos as i32;
+            // The kernel reads the position from device memory (one graph serves every step).
+            let p32 = s.memcpy_stod(&[pos as i32])?;
             unsafe {
                 s.launch_builder(f).arg(&mut dq).arg(&mut kc).arg(&mut vc).arg(&p32)
                     .launch(cfg(k.grid, k.block, 0))?
@@ -222,7 +223,8 @@ impl Ctx<'_> {
         lens.retain(|&l| l <= ctx);
         lens.dedup();
         for len in lens {
-            let l32 = len as i32;
+            // seq_len = *pos + 1: the kernel attends over positions 0..=pos.
+            let l32 = s.memcpy_stod(&[len as i32 - 1])?;
             let run = |ml: &mut cudarc::driver::CudaSlice<f32>, acc: &mut cudarc::driver::CudaSlice<f32>, out: &mut cudarc::driver::CudaSlice<u16>| -> Result<()> {
                 unsafe {
                     s.launch_builder(fs).arg(&dq).arg(&dk).arg(&dv).arg(&mut *ml).arg(&mut *acc).arg(&l32).arg(&scale)
@@ -276,48 +278,106 @@ impl Ctx<'_> {
         Ok(())
     }
 
+    /// `embed_gather` copies the row its device-side token names, bitwise; `argmax_advance` picks
+    /// the greatest logit (lowest index on ties, NaN never wins), records it at the position and
+    /// increments the position.
+    fn token_kernels(&mut self) -> Result<()> {
+        let (Some((ke, fe)), Some((ka, fa))) = (kernel(self.g, self.e, "embed_gather"), kernel(self.g, self.e, "argmax_advance")) else { return Ok(()) };
+        let s = self.e.stream.clone();
+        let (h, vocab) = (self.p.model.hidden as usize, self.p.model.vocab as usize);
+        let rows = 3;
+        let table = self.rng.bf16(rows * h);
+        let dt = s.memcpy_stod(&table)?;
+        let mut dx = s.alloc_zeros::<u16>(h)?;
+        let mut same = true;
+        for row in 0..rows {
+            let tok = s.memcpy_stod(&[row as i32])?;
+            unsafe { s.launch_builder(fe).arg(&dt).arg(&tok).arg(&mut dx).launch(cfg(ke.grid, ke.block, 0))? };
+            same &= s.memcpy_dtov(&dx)? == table[row * h..(row + 1) * h];
+        }
+        self.push("embed_gather", format!("{rows} rows x {h}, {}", if same { "bitwise" } else { "ROW DIFFERS" }), if same { 0.0 } else { f64::INFINITY }, None, 0.0);
+        // Logits in [-1, 1) with the maximum planted twice (the lower index must win) and NaNs placed
+        // before it, at two positions of a 4-slot output.
+        let mut ok = true;
+        for (case, pos) in [(0usize, 0i32), (1, 2)] {
+            let mut lg = self.rng.bf16(vocab);
+            let (a, b) = if case == 0 { (vocab / 3, vocab - 1) } else { (17, 18) };
+            lg[a] = f2bf(4.0);
+            lg[b] = f2bf(4.0);
+            lg[0] = 0x7fc0;
+            lg[a / 2] = 0x7fc0;
+            let dl = s.memcpy_stod(&lg)?;
+            let mut tok = s.alloc_zeros::<i32>(1)?;
+            let mut out = s.memcpy_stod(&[-1i32; 4])?;
+            let mut dp = s.memcpy_stod(&[pos])?;
+            unsafe { s.launch_builder(fa).arg(&dl).arg(&mut tok).arg(&mut out).arg(&mut dp).launch(cfg(ka.grid, ka.block, 0))? };
+            let (t, o, p) = (s.memcpy_dtov(&tok)?[0], s.memcpy_dtov(&out)?, s.memcpy_dtov(&dp)?[0]);
+            ok &= t == a as i32 && o[pos as usize] == a as i32 && p == pos + 1 && o.iter().enumerate().all(|(i, &v)| i == pos as usize || v == -1);
+        }
+        self.push("argmax_advance", format!("vocab {vocab}, ties, NaN: {}", if ok { "ok" } else { "WRONG" }), if ok { 0.0 } else { f64::INFINITY }, None, 0.0);
+        Ok(())
+    }
+
     /// A decode step of `STEP_LAYERS` layers of random weights, wired from the generated kernels
-    /// (`forward::step`), against the CPU reference (`reference::decode_step`) at every layer
+    /// (`forward::Runtime`), against the CPU reference (`reference::decode_step`) at every layer
     /// boundary and at the logits. Two cases: four steps from an empty cache (positions 0 to 3),
     /// and two steps after a random 1000-position prefix, so attention spans every split. Each row
-    /// is the worst error over the case's steps; a dense model only (`reference::require_dense`).
+    /// is the worst error over the case's steps. The same steps replayed from a captured CUDA Graph
+    /// must give bitwise the same logits, and the greedy token must be their argmax. A dense model
+    /// only (`reference::require_dense`).
     fn decode_step(&mut self) -> Result<()> {
-        use crate::forward::{DeviceModel, Kernels, Scratch};
+        use crate::forward::{Kernels, Runtime, UploadedWeights};
         use crate::reference::{decode_step, DenseWeights, KvCache};
         let m = &self.p.model;
         if crate::reference::require_dense(m).is_err() {
             return Ok(());
         }
-        let k = Kernels::new(self.g, self.e)?;
         let s = self.e.stream.clone();
+        // The default stream cannot be captured; the graph runs on its own stream.
+        let gs = self.e.ctx.new_stream()?;
+        let splits = self.p.attn.splits as usize;
         let prefix = 1000.min(m.max_pos as usize - 2);
         let cases = [("fresh".to_string(), 0usize, 4usize), (format!("prefix {prefix}"), prefix, 2)];
         let mut rng = Rng(self.rng.next_u64() | 1);
         let w = DenseWeights::random(m, STEP_LAYERS, cases.iter().map(|c| c.2).sum(), &mut rng);
+        let up = UploadedWeights::new(&s, m, &w)?;
+        s.synchronize()?;
         let to_f64 = |v: &[u16]| v.iter().map(|&x| bf2f(x) as f64).collect::<Vec<_>>();
+        let argmax = |v: &[u16]| v.iter().enumerate().fold((0usize, f32::NEG_INFINITY), |b, (i, &x)| if bf2f(x) > b.1 { (i, bf2f(x)) } else { b }).0;
         let mut row = 0;
         for (name, start, steps) in cases {
             let mut cache = KvCache::new(m, STEP_LAYERS, start + steps);
             cache.fill_random(m, start, &mut rng);
-            let mut dm = DeviceModel::upload(&s, m, &w, &cache)?;
-            let mut sc = Scratch::new(&s, m, self.p.attn.splits as usize)?;
+            let mut plain = Runtime::from_host(&s, Kernels::new(self.g, self.e)?, m, &up.ptrs, splits, &cache)?;
+            let mut graph = Runtime::from_host(&gs, Kernels::new(self.g, self.e)?, m, &up.ptrs, splits, &cache)?;
+            gs.synchronize()?;
+            graph.capture()?;
             // [L0 attn, L0 mlp, L1 attn, ..., logits]
             let mut errs = [0f64; 2 * STEP_LAYERS + 1];
+            let (mut replay, mut greedy) = (true, true);
             for i in 0..steps {
                 let pos = start + i;
-                let r = decode_step(m, &w, &mut cache, row, pos);
-                let g = crate::forward::step(&s, &k, m, &mut dm, &mut sc, row, pos, true)?.context("trace")?;
+                let r = decode_step(m, &w, &mut cache, row, pos)?;
+                plain.set(pos, row)?;
+                let g = plain.step_traced()?;
                 for l in 0..STEP_LAYERS {
                     errs[2 * l] = errs[2 * l].max(max_err_scaled(&to_f32(&g.after_attn[l]), &to_f64(&r.after_attn[l])));
                     errs[2 * l + 1] = errs[2 * l + 1].max(max_err_scaled(&to_f32(&g.after_mlp[l]), &to_f64(&r.after_mlp[l])));
                 }
                 errs[2 * STEP_LAYERS] = errs[2 * STEP_LAYERS].max(max_err_scaled(&to_f32(&g.logits), &r.logits));
+                graph.set(pos, row)?;
+                graph.step()?;
+                replay &= graph.logits()? == g.logits;
+                greedy &= plain.tokens(pos, pos + 1)?[0] as usize == argmax(&g.logits) && graph.tokens(pos, pos + 1)?[0] as usize == argmax(&g.logits);
                 row += 1;
             }
             for (i, e) in errs.iter().enumerate() {
                 let at = if i == 2 * STEP_LAYERS { "logits".to_string() } else { format!("L{} {}", i / 2, if i % 2 == 0 { "attn" } else { "mlp" }) };
                 self.push("decode step", format!("{name}: {at}"), *e, None, 0.0);
             }
+            let ok = replay && greedy;
+            let what = match (replay, greedy) { (true, true) => "graph bitwise, argmax ok", (false, _) => "GRAPH DIFFERS", (_, false) => "ARGMAX WRONG" };
+            self.push("decode step", format!("{name}: {what}"), if ok { 0.0 } else { f64::INFINITY }, None, 0.0);
         }
         Ok(())
     }
@@ -558,6 +618,7 @@ pub fn run(p: &Plan, g: &Generated, e: &Engine, o: &Opts) -> Result<Vec<Row>> {
     c.attention().context("attention")?;
     c.silu().context("silu_mul")?;
     c.residual().context("residual_add")?;
+    c.token_kernels().context("embed_gather and argmax_advance")?;
     c.gemvs().context("gemv")?;
     c.decode_step().context("decode step")?;
     Ok(c.rows)
