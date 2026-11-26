@@ -249,7 +249,7 @@ sparkforge assumes one account runs it per node.
 
 #### Scenario: Upgrade from a loader before SHA-765
 - **WHEN** sparkforge is upgraded from any earlier version, including one that locked in `/run/user/<uid>`, `$XDG_RUNTIME_DIR`, the temp directory or `/run/sparkforge`
-- **THEN** dispatch from every launcher (a script or scheduled job) is paused, every invocation of the old binary, pending or running, is drained or cancelled, since an earlier version may hold a lock this one doesn't take, launchers are switched to the new binary, and no old binary is left runnable (a rollback copy is kept non-executable or off the node, and a rollback drains the new loader first) before loads resume
+- **THEN** the switch follows "Loader version switches follow one cutover rule", since an earlier version may hold a lock this one doesn't take
 
 #### Scenario: State directory deleted during a load
 - **WHEN** the account deletes the lock file or `~/.local/state/sparkforge` while a load is admitted
@@ -422,3 +422,22 @@ After the copy, every buffer up to 64 MiB SHALL be read back whole. Each larger 
 #### Scenario: Sampling large buffers
 - **WHEN** the thresholds are 1 KiB
 - **THEN** an expert buffer is read back at experts 0 and 3 only, and the 16 KiB embedding at its first and last KiB
+
+### Requirement: Loader version switches follow one cutover rule
+
+Switching a node's sparkforge version, as an upgrade or a rollback, SHALL first disable every way
+to start the outgoing version, and SHALL make the incoming version runnable only after every
+invocation of the outgoing one has exited. Two versions that lock different files can both be
+admitted before either allocates.
+
+#### Scenario: Disable before waiting
+- **WHEN** a node switches sparkforge versions in either direction
+- **THEN** the outgoing version is disabled first: every launcher (a script or scheduled job) stops dispatching it, its pending invocations are cancelled, and no copy of it is left runnable on the node, counting installed binaries and build outputs (a kept copy is non-executable or off the node); then the switch waits until no invocation of it is running; until that wait ends the incoming version isn't runnable either and nothing is run from a source checkout, since a checkout can build either version; only then is the incoming version made runnable and its launchers resumed
+
+#### Scenario: Start during the cutover window
+- **WHEN** the outgoing binary is started by hand after its launchers stop but before it is made non-executable
+- **THEN** that run is one of the invocations the switch waits for, since the wait begins only after every copy is disabled and removing execute permission doesn't stop a running process, so no incoming-version load starts while it runs
+
+#### Scenario: Rollback
+- **WHEN** a node rolls back to the version it ran before
+- **THEN** the same rule applies with the roles swapped: the newer version's launchers stop, its pending invocations are cancelled and its copies are disabled, and the switch waits for its running invocations to exit before the older copy is made runnable again and its launchers resume
