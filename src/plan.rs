@@ -85,11 +85,22 @@ pub struct GemmTile {
     pub bk: u32,
     pub stages: u32,
     pub warps: u32,
+    /// Columns per warp: 64 on 256-wide tiles (each A fragment feeds 8 mma.sync), else 32. Every
+    /// warp covers 64 rows.
+    pub warp_n: u32,
     pub smem_bytes: u32,
     pub ctas_per_sm: u32,
     pub wave_efficiency: f64,
     pub score: f64,
+    /// N tiles per L2 group; inside a group consecutive CTAs walk N, then the next M tile. 1 means
+    /// CTAs walk M down one weight tile at a time: chosen when the whole activation matrix fits
+    /// in L2, so each weight tile streams from DRAM once while A stays in L2.
+    pub group_n: u32,
 }
+
+/// Shared-memory row pad of the prefill GEMM, in bf16 elements: 16 bytes, so `ldmatrix` reads of 8
+/// rows land in 8 distinct 4-bank groups at both 32- and 64-wide K tiles.
+pub const GEMM_ROW_PAD: u32 = 8;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct AttnPlan {
@@ -707,16 +718,21 @@ fn plan_gemm(l: &Linear, m: u32, t: &Target) -> GemmTile {
         for &bn in &[64u32, 128, 256] {
             for &bk in &[32u32, 64] {
                 for &stages in &[2u32, 3, 4] {
-                    // bf16 A and B tiles, multi-buffered (cp.async / TMA pipeline).
-                    let smem = stages * (bm + bn) * bk * 2;
+                    // bf16 A and B tiles, multi-buffered (cp.async pipeline), rows padded by 16 bytes.
+                    let smem = stages * (bm + bn) * (bk + GEMM_ROW_PAD) * 2;
                     if smem > t.smem_per_block_optin { continue; }
-                    let warps = (bm / 64).max(1) * (bn / 32); // warp tile 64x32
+                    // Warp tile 64 x warp_n: 64x64 on 256-wide tiles (measured 64-70 TFLOP/s on
+                    // GB10 at 128x256x32, against 54-58 for 64x32 warps at 128x128x32).
+                    let warp_n = if bn >= 256 { 64 } else { 32 };
+                    let warps = (bm / 64).max(1) * (bn / warp_n);
                     let threads = warps * 32;
                     if threads > t.max_threads_per_block { continue; }
-                    // accumulators: 64*32 fp32 per warp = 64 regs/thread; leave headroom
+                    // Accumulators: 64 x warp_n f32 per warp, 64 or 128 registers per thread; budget
+                    // 168, or the full 255 for the wide warp tile.
+                    let regs = if warp_n == 64 { 255 } else { 168 };
                     let ctas_by_smem = t.smem_per_sm / smem.max(1);
                     let ctas_by_thr = t.max_threads_per_sm / threads;
-                    let ctas_by_reg = t.regs_per_sm / (threads * 168);
+                    let ctas_by_reg = t.regs_per_sm / (threads * regs);
                     let ctas = ctas_by_smem.min(ctas_by_thr).min(ctas_by_reg);
                     if ctas == 0 { continue; }
                     if l.k % bk != 0 { continue; }
@@ -726,12 +742,14 @@ fn plan_gemm(l: &Linear, m: u32, t: &Target) -> GemmTile {
                     let wave_eff = tiles as f64 / (waves * slots) as f64;
                     let pad_eff = (m as f64 * l.n as f64) / ((ceil_div(m, bm) * bm) as f64 * (ceil_div(l.n, bn) * bn) as f64);
                     // arithmetic intensity of the tile (FLOP per byte loaded from DRAM/L2)
-                    let ai = (bm * bn) as f64 / (bm + bn) as f64 / 64.0;
+                    // capped at a 128x256 tile's 4/3: past it, a tile only costs occupancy
+                    let ai = ((bm * bn) as f64 / (bm + bn) as f64 / 64.0).min(4.0 / 3.0);
                     let pipe = if stages >= 3 { 1.0 } else { 0.85 };
-                    let score = wave_eff * pad_eff * ai.min(1.0) * pipe * (ctas.min(2) as f64 / 2.0).sqrt();
+                    let score = wave_eff * pad_eff * ai * pipe * (ctas.min(2) as f64 / 2.0).sqrt();
                     let cand = GemmTile {
-                        linear: l.name.clone(), m, n: l.n, k: l.k, bm, bn, bk, stages, warps,
+                        linear: l.name.clone(), m, n: l.n, k: l.k, bm, bn, bk, stages, warps, warp_n,
                         smem_bytes: smem, ctas_per_sm: ctas, wave_efficiency: wave_eff, score,
+                        group_n: if (m as f64) * (l.k as f64) * 2.0 <= t.l2_bytes as f64 * 0.75 { 1 } else { l2_group_n(l.n / bn, slots, bm, bn, l.k, t) },
                     };
                     if best.as_ref().map_or(true, |b| cand.score > b.score) { best = Some(cand); }
                 }
@@ -739,6 +757,19 @@ fn plan_gemm(l: &Linear, m: u32, t: &Target) -> GemmTile {
         }
     }
     best.expect("no legal GEMM tile for this shape")
+}
+
+/// For an activation matrix larger than L2: the most N tiles per L2 group such that one wave's
+/// working set, the group's weight tiles plus
+/// the A tiles of the `slots` CTAs spread over them, fits in three quarters of L2; when no group
+/// fits (a long K), the group with the smallest working set. Computed from the target's SM count
+/// and L2 size, never a fixed SM count.
+fn l2_group_n(n_tiles: u32, slots: u32, bm: u32, bn: u32, k: u32, t: &Target) -> u32 {
+    let budget = t.l2_bytes as f64 * 0.75;
+    let set = |g: u32| (g as f64 * bn as f64 + ceil_div(slots, g) as f64 * bm as f64) * k as f64 * 2.0;
+    let gs = 1..=n_tiles.max(1);
+    gs.clone().filter(|&g| set(g) <= budget).max()
+        .unwrap_or_else(|| gs.min_by(|&a, &b| set(a).total_cmp(&set(b))).unwrap_or(1))
 }
 
 fn plan_attn(m: &ModelSpec, t: &Target, ctx: u32) -> AttnPlan {
@@ -854,7 +885,9 @@ pub fn build(m: &ModelSpec, t: &Target, o: &PlanOpts) -> Plan {
         notes.push("prefill GEMM tiles are not planned for this model yet (MXFP8 and NVFP4 prefill arrive with milestone M7)".into());
     } else {
         gemm = ls.iter().filter(|l| l.copies == 1).map(|l| plan_gemm(l, o.prefill_tokens, t)).collect();
-        gemm.push(plan_gemm(&lm, o.prefill_tokens, t));
+        // Prefill needs logits for the last prompt position only: that is the decode GEMV, not a
+        // prompt-by-vocabulary GEMM.
+        notes.push(format!("prefill: lm_head runs once, for the last prompt position, with gemv_lm_head (a {}x{} GEMM is not planned)", o.prefill_tokens, lm.n));
         if let Some(e) = &m.moe {
             // Average tokens per expert during prefill drives the grouped-GEMM tile choice.
             let per_expert = (o.prefill_tokens as u64 * e.experts_per_tok as u64 / e.num_experts as u64).max(1) as u32;

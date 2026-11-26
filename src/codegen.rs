@@ -293,6 +293,109 @@ silu_mul(const bf16* __restrict__ gate_up, bf16* __restrict__ out) {
 }
 "#;
 
+const GEMM: &str = r#"
+namespace @NS@ {
+// C[M][N] = A[M][K] . W[N][K]^T in bf16 with f32 accumulation. N, K and the tile are compile-time;
+// M (the prompt length) is a launch argument, with rows past M zero-filled on load and not stored.
+constexpr int N = @N@, K = @K@, BM = @BM@, BN = @BN@, BK = @BK@, STAGES = @STAGES@, GROUP_N = @GROUP_N@;
+constexpr int WM = 64, WN = @WN@;                     // warp tile: 4 x WN/8 mma.sync m16n8k16
+constexpr int WARPS_N = BN / WN, THREADS = (BM / WM) * WARPS_N * 32;
+constexpr int LDS = BK + @PAD@;                       // smem row stride (bf16): 16-byte pad
+constexpr int A_STAGE = BM * LDS, B_STAGE = BN * LDS;
+constexpr int NT_N = N / BN, KT = K / BK, CHUNKS = BK / 8, MI = WM / 16, NI = WN / 8;
+static_assert(N % BN == 0 && K % BK == 0 && BK % 16 == 0 && BM % WM == 0 && BN % WN == 0, "gemm shape");
+static_assert(STAGES >= 2 && KT >= 1, "gemm pipeline");
+}
+extern "C" __global__ void __launch_bounds__(@NS@::THREADS)
+@ENTRY@(const bf16* __restrict__ A, const bf16* __restrict__ W, bf16* __restrict__ C, int M) {
+  using namespace @NS@;
+  extern __shared__ __align__(16) unsigned char smem_raw[];
+  bf16* const sA = reinterpret_cast<bf16*>(smem_raw);
+  bf16* const sB = sA + STAGES * A_STAGE;
+  // Tile order: groups of GROUP_N N tiles; inside a group N varies fastest, so consecutive CTAs
+  // share an A tile and the group's W tiles stay in L2 while every M tile reuses them.
+  const int nt_m = (M + BM - 1) / BM;
+  const int per_group = GROUP_N * nt_m, group = blockIdx.x / per_group, first_n = group * GROUP_N;
+  const int gsize = min(NT_N - first_n, GROUP_N), in_group = blockIdx.x - group * per_group;
+  const int tn = first_n + in_group % gsize, tm = in_group / gsize;
+  if (tm >= nt_m) return;
+  const int m0 = tm * BM, n0 = tn * BN;
+  const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
+  const int wm = warp / WARPS_N, wn = warp % WARPS_N;
+  auto load = [&](int stage, int kt) {
+    const int k0 = kt * BK;
+    bf16* a = sA + stage * A_STAGE;
+    bf16* b = sB + stage * B_STAGE;
+    for (int i = tid; i < BM * CHUNKS; i += THREADS) {
+      const int r = i / CHUNKS, c = i % CHUNKS, gr = m0 + r;
+      const bf16* src = A + (size_t)min(gr, M - 1) * K + k0 + c * 8;
+      const unsigned dst = (unsigned)__cvta_generic_to_shared(a + r * LDS + c * 8);
+      asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;" :: "r"(dst), "l"(src), "r"(gr < M ? 16 : 0));
+    }
+    for (int i = tid; i < BN * CHUNKS; i += THREADS) {
+      const int r = i / CHUNKS, c = i % CHUNKS;
+      const unsigned dst = (unsigned)__cvta_generic_to_shared(b + r * LDS + c * 8);
+      asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" :: "r"(dst), "l"(W + (size_t)(n0 + r) * K + k0 + c * 8));
+    }
+  };
+  float acc[MI][NI][4];
+#pragma unroll
+  for (int i = 0; i < MI; ++i)
+#pragma unroll
+    for (int j = 0; j < NI; ++j)
+#pragma unroll
+      for (int e = 0; e < 4; ++e) acc[i][j][e] = 0.f;
+#pragma unroll
+  for (int s = 0; s < STAGES - 1; ++s) {
+    if (s < KT) load(s, s);
+    asm volatile("cp.async.commit_group;");
+  }
+  for (int kt = 0; kt < KT; ++kt) {
+    asm volatile("cp.async.wait_group %0;" :: "n"(STAGES - 2));
+    __syncthreads();  // tile kt is resident, and every warp is done with the stage refilled below
+    if (kt + STAGES - 1 < KT) load((kt + STAGES - 1) % STAGES, kt + STAGES - 1);
+    asm volatile("cp.async.commit_group;");
+    const bf16* a = sA + (kt % STAGES) * A_STAGE;
+    const bf16* b = sB + (kt % STAGES) * B_STAGE;
+#pragma unroll
+    for (int kk = 0; kk < BK; kk += 16) {
+      unsigned af[MI][4], bf[NI][2];
+#pragma unroll
+      for (int i = 0; i < MI; ++i) {
+        const unsigned p = (unsigned)__cvta_generic_to_shared(a + (wm * WM + i * 16 + (lane & 15)) * LDS + kk + (lane >> 4) * 8);
+        asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];"
+                     : "=r"(af[i][0]), "=r"(af[i][1]), "=r"(af[i][2]), "=r"(af[i][3]) : "r"(p));
+      }
+#pragma unroll
+      for (int j = 0; j < NI; j += 2) {
+        const unsigned p = (unsigned)__cvta_generic_to_shared(
+            b + (wn * WN + j * 8 + (lane & 7) + ((lane >> 4) << 3)) * LDS + kk + ((lane >> 3) & 1) * 8);
+        asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];"
+                     : "=r"(bf[j][0]), "=r"(bf[j][1]), "=r"(bf[j + 1][0]), "=r"(bf[j + 1][1]) : "r"(p));
+      }
+#pragma unroll
+      for (int i = 0; i < MI; ++i)
+#pragma unroll
+        for (int j = 0; j < NI; ++j)
+          asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+                       : "+f"(acc[i][j][0]), "+f"(acc[i][j][1]), "+f"(acc[i][j][2]), "+f"(acc[i][j][3])
+                       : "r"(af[i][0]), "r"(af[i][1]), "r"(af[i][2]), "r"(af[i][3]), "r"(bf[j][0]), "r"(bf[j][1]));
+    }
+  }
+  asm volatile("cp.async.wait_group 0;");
+#pragma unroll
+  for (int i = 0; i < MI; ++i) {
+    const int r = m0 + wm * WM + i * 16 + (lane >> 2);
+#pragma unroll
+    for (int j = 0; j < NI; ++j) {
+      const int c = n0 + wn * WN + j * 8 + (lane & 3) * 2;
+      if (r < M) *reinterpret_cast<__nv_bfloat162*>(C + (size_t)r * N + c) = __floats2bfloat162_rn(acc[i][j][0], acc[i][j][1]);
+      if (r + 8 < M) *reinterpret_cast<__nv_bfloat162*>(C + (size_t)(r + 8) * N + c) = __floats2bfloat162_rn(acc[i][j][2], acc[i][j][3]);
+    }
+  }
+}
+"#;
+
 const GEMV: &str = r#"
 namespace @NS@ {
 constexpr int N = @N@, K = @K@, WARPS = @WARPS@, RPW = @RPW@;
@@ -638,10 +741,24 @@ pub fn generate(p: &Plan) -> Generated {
         kernels.push(KernelEntry { entry, file: "model.cu".into(), grid: [g.grid, 1, 1], block: g.warps_per_block * 32, dyn_smem: g.smem_bytes, status: if generated { "generated" } else { "planned" }, args: vec!["W", "x", "y"] });
     }
 
-    let mut tiles = String::from("// Prefill GEMM tile configs chosen by the planner (mma.sync m16n8k16 bf16, cp.async/TMA pipeline).\n#pragma once\n");
+    let mut tiles = String::from("// Prefill GEMM tile configs chosen by the planner (mma.sync m16n8k16 bf16, cp.async pipeline).\n#pragma once\n");
     for t in &p.gemm {
-        tiles += &format!("struct Tile_{} {{ static constexpr int M = {}, N = {}, K = {}, BM = {}, BN = {}, BK = {}, STAGES = {}, WARPS = {}, SMEM = {}; }};\n", t.linear, t.m, t.n, t.k, t.bm, t.bn, t.bk, t.stages, t.warps, t.smem_bytes);
-        kernels.push(KernelEntry { entry: format!("gemm_{}", t.linear), file: "gemm_tiles.cuh".into(), grid: [t.n.div_ceil(t.bn), t.m.div_ceil(t.bm), 1], block: t.warps * 32, dyn_smem: t.smem_bytes, status: "planned", args: vec!["A", "W", "C"] });
+        tiles += &format!("struct Tile_{} {{ static constexpr int M = {}, N = {}, K = {}, BM = {}, BN = {}, BK = {}, STAGES = {}, WARPS = {}, WARP_N = {}, SMEM = {}, GROUP_N = {}; }};\n", t.linear, t.m, t.n, t.k, t.bm, t.bn, t.bk, t.stages, t.warps, t.warp_n, t.smem_bytes, t.group_n);
+        // BF16 weights only, and a shape the tile divides: NVFP4 and MXFP8 prefill have their own
+        // kernels (planned), so model.cu never holds a GEMM for the wrong format.
+        let bf16 = p.linears.iter().find(|l| l.name == t.linear).is_some_and(|l| matches!(l.format, crate::config::WeightFormat::Bf16));
+        let generated = bf16 && t.n % t.bn == 0 && t.k % t.bk == 0 && t.bm % 64 == 0 && t.bn % t.warp_n == 0 && t.warps == (t.bm / 64) * (t.bn / t.warp_n);
+        let entry = format!("gemm_{}", t.linear);
+        if generated {
+            src += &fill(GEMM, &[("NS", format!("{entry}_ns")), ("ENTRY", entry.clone()), ("N", t.n.to_string()), ("K", t.k.to_string()),
+                ("BM", t.bm.to_string()), ("BN", t.bn.to_string()), ("BK", t.bk.to_string()), ("STAGES", t.stages.to_string()),
+                ("GROUP_N", t.group_n.to_string()), ("PAD", crate::plan::GEMM_ROW_PAD.to_string()), ("WN", t.warp_n.to_string())]);
+        }
+        kernels.push(KernelEntry {
+            entry, file: if generated { "model.cu" } else { "gemm_tiles.cuh" }.into(),
+            grid: [t.m.div_ceil(t.bm) * t.n.div_ceil(t.bn), 1, 1], block: t.warps * 32, dyn_smem: t.smem_bytes,
+            status: if generated { "generated" } else { "planned" }, args: vec!["A", "W", "C", "M"],
+        });
     }
 
     let mut h = Sha256::new();

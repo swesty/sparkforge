@@ -575,6 +575,65 @@ impl Ctx<'_> {
         }
     }
 
+    /// Every generated prefill GEMM against an f64 reference, at the planned M and at a ragged M
+    /// (37 rows fewer), on 8 sampled rows across all columns and on every row across 16 sampled
+    /// columns, so each warp and lane mapping is covered; rows past M must stay untouched. With
+    /// `--bench`, TFLOP/s at the planned M.
+    fn gemms(&mut self) -> Result<()> {
+        let s = self.e.stream.clone();
+        for t in self.p.gemm.clone() {
+            let entry = format!("gemm_{}", t.linear);
+            let Some((k, f)) = kernel(self.g, self.e, &entry) else { continue };
+            let (m, n, kk, bm, bn) = (t.m as usize, t.n as usize, t.k as usize, t.bm as usize, t.bn as usize);
+            let a = self.rng.bf16(m * kk);
+            let w = self.rng.bf16(n * kk);
+            let (da, dw) = (s.memcpy_stod(&a)?, s.memcpy_stod(&w)?);
+            let mut err = 0f64;
+            let mut untouched = true;
+            for mr in [m, m.saturating_sub(37).max(1)] {
+                let mut dc = s.memcpy_stod(&vec![0xffffu16; m * n])?;
+                let grid = (mr.div_ceil(bm) * (n / bn)) as u32;
+                let m32 = mr as i32;
+                unsafe { s.launch_builder(f).arg(&da).arg(&dw).arg(&mut dc).arg(&m32).launch(cfg([grid, 1, 1], k.block, k.dyn_smem))? };
+                let c = s.memcpy_dtov(&dc)?;
+                untouched &= c[mr * n..].iter().all(|&v| v == 0xffff);
+                let mut rows: Vec<usize> = vec![0, 1, bm - 1, bm, mr / 2, mr.saturating_sub(bm), mr.saturating_sub(2), mr - 1];
+                rows.retain(|&r| r < mr);
+                rows.sort();
+                rows.dedup();
+                let mut cols: Vec<usize> = (0..16).map(|i| i * (n - 1) / 15).chain([bn - 1, bn.min(n - 1)]).collect();
+                cols.sort();
+                cols.dedup();
+                let dot = |r: usize, j: usize| -> f64 { (0..kk).map(|x| bf2f(a[r * kk + x]) as f64 * bf2f(w[j * kk + x]) as f64).sum() };
+                for &r in &rows {
+                    let want: Vec<f64> = gemm_row(&a[r * kk..(r + 1) * kk], &w, n);
+                    err = err.max(max_err(&to_f32(&c[r * n..(r + 1) * n]), &want));
+                }
+                for &j in &cols {
+                    let want: Vec<f64> = (0..mr).map(|r| dot(r, j)).collect();
+                    let got: Vec<f32> = (0..mr).map(|r| bf2f(c[r * n + j])).collect();
+                    err = err.max(max_err(&got, &want));
+                }
+            }
+            if !untouched {
+                err = f64::INFINITY;
+            }
+            let flop = 2.0 * (m * n * kk) as f64;
+            let us = if self.o.bench {
+                let mut dc = s.alloc_zeros::<u16>(m * n)?;
+                let m32 = m as i32;
+                Some(time_us(&s, 20, |_| {
+                    unsafe { s.launch_builder(f).arg(&da).arg(&dw).arg(&mut dc).arg(&m32).launch(cfg(k.grid, k.block, k.dyn_smem))? };
+                    Ok(())
+                })?)
+            } else { None };
+            let tf = us.map_or(String::new(), |u| format!(", {:.1} TFLOP/s", flop / (u * 1e-6) / 1e12));
+            let case = format!("{m}x{n}x{kk}{}{tf}", if untouched { "" } else { ", ROWS PAST M WRITTEN" });
+            self.push(&entry, case, err, us, ((m * kk + n * kk + m * n) * 2) as f64);
+        }
+        Ok(())
+    }
+
     fn gemvs(&mut self) -> Result<()> {
         let s = self.e.stream.clone();
         let l2 = self.p.target.l2_bytes as usize;
@@ -627,6 +686,11 @@ impl Ctx<'_> {
     }
 }
 
+/// One row of `x . W^T` in f64 for row-major `W` of `n` rows, split across threads.
+fn gemm_row(x: &[u16], w: &[u16], n: usize) -> Vec<f64> {
+    crate::reference::gemv(w, n, x)
+}
+
 /// Runs every check; returns the result rows. Callers decide pass/fail with `TOL`.
 pub fn run(p: &Plan, g: &Generated, e: &Engine, o: &Opts) -> Result<Vec<Row>> {
     crate::codegen::require_generated(g, &p.model.arch)?;
@@ -640,6 +704,7 @@ pub fn run(p: &Plan, g: &Generated, e: &Engine, o: &Opts) -> Result<Vec<Row>> {
     c.residual().context("residual_add")?;
     c.token_kernels().context("embed_gather and argmax_advance")?;
     c.gemvs().context("gemv")?;
+    c.gemms().context("prefill gemm")?;
     c.decode_step().context("decode step")?;
     Ok(c.rows)
 }

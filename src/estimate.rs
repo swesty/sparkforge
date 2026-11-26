@@ -45,3 +45,25 @@ pub fn token_estimate_us(p: &Plan, rows: &[Row]) -> Option<f64> {
     }
     Some(p.model.layers as f64 * layer + g("rmsnorm")? + g("gemv_lm_head")?)
 }
+
+/// Prefill time for the planned prompt length from isolated GEMM times: per layer the q/k/v,
+/// o_proj and MLP GEMMs (for MoE, the router plus one expert GEMM pair per expert at the planned
+/// tokens per expert), then `gemv_lm_head` once for the last position. Attention, norms, RoPE and
+/// activations are not included. Returns (microseconds, prompt tokens), or None if a GEMM the
+/// prompt needs was not generated or not timed.
+pub fn prefill_estimate_us(p: &Plan, rows: &[Row]) -> Option<(f64, u32)> {
+    let t: HashMap<&str, f64> = rows.iter().filter_map(|r| Some((r.kernel.as_str(), r.us?))).collect();
+    let g = |k: &str| t.get(k).copied();
+    let tokens = p.gemm.iter().find(|t| t.linear == "qkv_proj")?.m;
+    let mut layer = g("gemm_qkv_proj")? + g("gemm_o_proj")?;
+    match &p.model.moe {
+        None => layer += g("gemm_gate_up_proj")? + g("gemm_down_proj")?,
+        Some(e) => {
+            layer += g("gemm_router")? + e.num_experts as f64 * (g("gemm_expert_gate_up")? + g("gemm_expert_down")?);
+            if e.shared_experts > 0 {
+                return None;
+            }
+        }
+    }
+    Some((p.model.layers as f64 * layer + g("gemv_lm_head")?, tokens))
+}

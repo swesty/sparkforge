@@ -134,14 +134,16 @@
       "n": 6144,
       "k": 4096,
       "bm": 128,
-      "bn": 128,
+      "bn": 256,
       "bk": 32,
       "stages": 3,
       "warps": 8,
-      "smem_bytes": 49152,
+      "warp_n": 64,
+      "smem_bytes": 92160,
       "ctas_per_sm": 1,
       "wave_efficiency": 1.0,
-      "score": 0.7071067811865476
+      "score": 0.9428090415820634,
+      "group_n": 1
     },
     {
       "linear": "o_proj",
@@ -149,14 +151,16 @@
       "n": 4096,
       "k": 4096,
       "bm": 128,
-      "bn": 128,
+      "bn": 256,
       "bk": 32,
       "stages": 3,
       "warps": 8,
-      "smem_bytes": 49152,
+      "warp_n": 64,
+      "smem_bytes": 92160,
       "ctas_per_sm": 1,
-      "wave_efficiency": 0.9696969696969697,
-      "score": 0.6856793029687734
+      "wave_efficiency": 0.8888888888888888,
+      "score": 0.8380524814062785,
+      "group_n": 1
     },
     {
       "linear": "gate_up_proj",
@@ -164,14 +168,16 @@
       "n": 28672,
       "k": 4096,
       "bm": 128,
-      "bn": 128,
+      "bn": 256,
       "bk": 32,
       "stages": 3,
       "warps": 8,
-      "smem_bytes": 49152,
+      "warp_n": 64,
+      "smem_bytes": 92160,
       "ctas_per_sm": 1,
-      "wave_efficiency": 0.9955555555555555,
-      "score": 0.703964084381274
+      "wave_efficiency": 0.9824561403508771,
+      "score": 0.9262685320806237,
+      "group_n": 1
     },
     {
       "linear": "down_proj",
@@ -179,29 +185,16 @@
       "n": 4096,
       "k": 14336,
       "bm": 128,
-      "bn": 128,
+      "bn": 256,
       "bk": 32,
       "stages": 3,
       "warps": 8,
-      "smem_bytes": 49152,
+      "warp_n": 64,
+      "smem_bytes": 92160,
       "ctas_per_sm": 1,
-      "wave_efficiency": 0.9696969696969697,
-      "score": 0.6856793029687734
-    },
-    {
-      "linear": "lm_head",
-      "m": 2048,
-      "n": 128256,
-      "k": 4096,
-      "bm": 128,
-      "bn": 128,
-      "bk": 32,
-      "stages": 3,
-      "warps": 8,
-      "smem_bytes": 49152,
-      "ctas_per_sm": 1,
-      "wave_efficiency": 1.0,
-      "score": 0.7071067811865476
+      "wave_efficiency": 0.8888888888888888,
+      "score": 0.8380524814062785,
+      "group_n": 4
     }
   ],
   "attn": {
@@ -232,5 +225,7 @@
     "decode_bytes_per_token_gb": 19.30428416,
     "decode_tok_s_ceiling": 12.173463571725625
   },
-  "notes": []
+  "notes": [
+    "prefill: lm_head runs once, for the last prompt position, with gemv_lm_head (a 2048x128256 GEMM is not planned)"
+  ]
 }
