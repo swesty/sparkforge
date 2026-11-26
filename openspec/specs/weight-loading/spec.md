@@ -249,7 +249,7 @@ sparkforge assumes one account runs it per node.
 
 #### Scenario: Upgrade from a loader before SHA-765
 - **WHEN** sparkforge is upgraded from any earlier version, including one that locked in `/run/user/<uid>`, `$XDG_RUNTIME_DIR`, the temp directory or `/run/sparkforge`
-- **THEN** running loads are drained first, since an earlier version may hold a lock this one doesn't take, and any launcher (a script or scheduled job) is switched to the new binary before loads resume
+- **THEN** dispatch from every launcher (a script or scheduled job) is paused, every invocation of the old binary, pending or running, is drained or cancelled, since an earlier version may hold a lock this one doesn't take, and launchers are switched to the new binary before loads resume
 
 #### Scenario: State directory deleted during a load
 - **WHEN** the account deletes the lock file or `~/.local/state/sparkforge` while a load is admitted

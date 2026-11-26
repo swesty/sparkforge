@@ -11,7 +11,7 @@ codex-review cycle 3 of 3 on swesty/sparkforge#16 approved it with three follow-
 
 - **Deterministic deadline test:** the test's clock starts at the first pause call, which always follows admission's deadline computation, and waits past `wait` from there. With an injected 30 ms delay before `admit_with`, the old test fails and the new one passes. The new test passes 5 of 5 runs with the late-acquisition check and fails 5 of 5 with the check disabled.
 - **Scope:** every sparkforge process on a node must see the same `~/.local/state/sparkforge`. sparkforge runs on the host as `spark`, and only vLLM runs in containers. Stated in `admission_lock_in`'s docs and a new spec scenario.
-- **Drain rule:** the upgrade scenario also switches any launcher to the new binary before loads resume. No scheduled sparkforge jobs exist today.
+- **Drain rule:** before loads resume, the upgrade pauses dispatch from every launcher, drains or cancels every old-binary invocation (pending ones included, since repointing a launcher doesn't rebind a command it has already dispatched; codex-review fp:86bffa01ccfd on #21), then switches launchers to the new binary. No scheduled sparkforge jobs exist today.
 
 **Expected GB10 effect:** none. No kernel, load path or admission decision changes; one test and two scope statements do.
 
