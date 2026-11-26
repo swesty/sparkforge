@@ -173,9 +173,15 @@ in f32 and rounding to bf16.
 ### Requirement: The token is looked up and chosen on the device
 
 `embed_gather` SHALL copy the embedding row named by a token id in device memory. `argmax_advance`
-SHALL write the index of the greatest logit (the lowest index on ties; NaN never wins) as the next
-token, record it at the current position of an output buffer, and increment the position.
+SHALL write the index of the greatest logit (the lowest index on ties; NaN never wins, so negative
+infinity can; all NaN gives 0) as the next token, record it at the current position of an output
+buffer, and increment the position. A step whose token comes from the previous step SHALL need an
+embedding row for every vocabulary index.
 
 #### Scenario: Ties and NaN
 - **WHEN** the greatest logit appears twice and NaNs come before it
 - **THEN** the lower index wins, it is recorded at the position, and the position advances by one
+
+#### Scenario: NaN and negative infinity
+- **WHEN** index 0 is NaN and every other logit is negative infinity
+- **THEN** index 1 wins

@@ -53,9 +53,9 @@ pub fn upload(stream: &Arc<CudaStream>, ck: &Checkpoint, b: &Binding, admission:
 /// A dense BF16 checkpoint in GPU memory for the decode runtime: every linear (fused in kernel row
 /// order), every other tensor the step reads, and their addresses as the step takes them.
 pub struct DenseDevice {
-    pub linears: DeviceWeights,
-    pub others: HashMap<String, DeviceTensor>,
-    pub ptrs: crate::forward::WeightPtrs,
+    _linears: DeviceWeights,
+    _others: HashMap<String, DeviceTensor>,
+    ptrs: crate::forward::WeightPtrs,
     pub bytes_copied: u64,
     pub load_secs: f64,
     /// `MemAvailable` that the admission check read right before allocating.
@@ -100,7 +100,13 @@ pub fn upload_dense(stream: &Arc<CudaStream>, ck: &Checkpoint, b: &Binding, m: &
         lm_head: lin("lm_head".into())?,
         layers,
     };
-    Ok(DenseDevice { linears, others, ptrs, bytes_copied: bytes, load_secs: t0.elapsed().as_secs_f64(), mem_available_before })
+    Ok(DenseDevice { _linears: linears, _others: others, ptrs, bytes_copied: bytes, load_secs: t0.elapsed().as_secs_f64(), mem_available_before })
+}
+
+impl crate::forward::DeviceWeights for DenseDevice {
+    fn weight_ptrs(&self) -> &crate::forward::WeightPtrs {
+        &self.ptrs
+    }
 }
 
 fn copy_linear(stream: &Arc<CudaStream>, ck: &Checkpoint, l: &BoundLinear, buf: &mut [u8]) -> Result<DeviceTensor> {

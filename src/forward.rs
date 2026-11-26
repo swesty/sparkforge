@@ -60,21 +60,28 @@ impl<'a> Kernels<'a> {
 /// Device addresses of one layer's weights, row-major `[n][k]` bf16, fused as the binding packs
 /// them (q|k|v, gate|up).
 pub struct LayerPtrs {
-    pub attn_norm: u64,
-    pub qkv: u64,
-    pub o_proj: u64,
-    pub mlp_norm: u64,
-    pub gate_up: u64,
-    pub down: u64,
+    pub(crate) attn_norm: u64,
+    pub(crate) qkv: u64,
+    pub(crate) o_proj: u64,
+    pub(crate) mlp_norm: u64,
+    pub(crate) gate_up: u64,
+    pub(crate) down: u64,
 }
 
-/// Device addresses of every weight a step reads; whoever filled it keeps the memory alive.
+/// Device addresses of every weight a step reads. Only the owners of those allocations build one
+/// (`UploadedWeights`, `device_weights::DenseDevice`), and a `Runtime` borrows the owner for its
+/// whole life, so the memory can't be freed while a captured graph still holds the addresses.
 pub struct WeightPtrs {
-    pub embed: u64,
-    pub embed_rows: usize,
-    pub final_norm: u64,
-    pub lm_head: u64,
-    pub layers: Vec<LayerPtrs>,
+    pub(crate) embed: u64,
+    pub(crate) embed_rows: usize,
+    pub(crate) final_norm: u64,
+    pub(crate) lm_head: u64,
+    pub(crate) layers: Vec<LayerPtrs>,
+}
+
+/// Owns the GPU memory behind a `WeightPtrs`.
+pub trait DeviceWeights {
+    fn weight_ptrs(&self) -> &WeightPtrs;
 }
 
 fn addr<T>(s: &Arc<CudaStream>, x: &CudaSlice<T>) -> u64 {
@@ -85,7 +92,13 @@ fn addr<T>(s: &Arc<CudaStream>, x: &CudaSlice<T>) -> u64 {
 /// Random weights (`reference::DenseWeights`) copied into GPU memory.
 pub struct UploadedWeights {
     _owned: Vec<CudaSlice<u16>>,
-    pub ptrs: WeightPtrs,
+    ptrs: WeightPtrs,
+}
+
+impl DeviceWeights for UploadedWeights {
+    fn weight_ptrs(&self) -> &WeightPtrs {
+        &self.ptrs
+    }
 }
 
 impl UploadedWeights {
@@ -140,6 +153,9 @@ pub struct Runtime<'a> {
     capacity: usize,
     /// Host copy of the device position: every step is checked against `capacity` before launch.
     pos: usize,
+    /// The next step's token was set by the host (and checked against the embedding rows), not
+    /// written by the previous step's `argmax_advance`.
+    host_token: bool,
     k_cache: Vec<CudaSlice<u16>>,
     v_cache: Vec<CudaSlice<u16>>,
     d_pos: CudaSlice<i32>,
@@ -170,7 +186,8 @@ pub fn runtime_bytes(m: &ModelSpec, splits: usize, capacity: usize) -> u64 {
 
 impl<'a> Runtime<'a> {
     /// Zeroed KV caches of `capacity` positions for every layer of `w`.
-    pub fn new(s: &Arc<CudaStream>, k: Kernels<'a>, m: &'a ModelSpec, w: &'a WeightPtrs, splits: usize, capacity: usize) -> Result<Self> {
+    pub fn new(s: &Arc<CudaStream>, k: Kernels<'a>, m: &'a ModelSpec, w: &'a impl DeviceWeights, splits: usize, capacity: usize) -> Result<Self> {
+        let w = w.weight_ptrs();
         let n = capacity * m.kv_dim() as usize;
         let layers = w.layers.len();
         let k_cache = (0..layers).map(|_| s.alloc_zeros::<u16>(n)).collect::<Result<Vec<_>, _>>()?;
@@ -179,7 +196,8 @@ impl<'a> Runtime<'a> {
     }
 
     /// KV caches copied from a host cache (for example a random prefix), checked first.
-    pub fn from_host(s: &Arc<CudaStream>, k: Kernels<'a>, m: &'a ModelSpec, w: &'a WeightPtrs, splits: usize, cache: &KvCache) -> Result<Self> {
+    pub fn from_host(s: &Arc<CudaStream>, k: Kernels<'a>, m: &'a ModelSpec, w: &'a impl DeviceWeights, splits: usize, cache: &KvCache) -> Result<Self> {
+        let w = w.weight_ptrs();
         crate::reference::check_cache(m, w.layers.len(), cache)?;
         let k_cache = cache.k.iter().map(|c| s.memcpy_stod(c)).collect::<Result<Vec<_>, _>>()?;
         let v_cache = cache.v.iter().map(|c| s.memcpy_stod(c)).collect::<Result<Vec<_>, _>>()?;
@@ -201,6 +219,7 @@ impl<'a> Runtime<'a> {
             w,
             capacity,
             pos: 0,
+            host_token: false,
             k_cache,
             v_cache,
             d_pos: s.alloc_zeros(1)?,
@@ -235,6 +254,25 @@ impl<'a> Runtime<'a> {
         self.s.memcpy_htod(&[pos as i32], &mut self.d_pos)?;
         self.s.memcpy_htod(&[token as i32], &mut self.d_token)?;
         self.pos = pos;
+        self.host_token = true;
+        Ok(())
+    }
+
+    /// Zeroes every KV cache slot, so a measurement starts from the same cache whatever ran before.
+    pub fn clear_cache(&mut self) -> Result<()> {
+        for c in self.k_cache.iter_mut().chain(self.v_cache.iter_mut()) {
+            self.s.memset_zeros(c)?;
+        }
+        Ok(())
+    }
+
+    /// Checks a step can run: within the cache, and, when the token comes from the previous step's
+    /// `argmax_advance` (any vocabulary index), with an embedding row for every token.
+    fn check_step(&self) -> Result<()> {
+        ensure!(self.pos < self.capacity, "position {} is past the cache capacity {}", self.pos, self.capacity);
+        ensure!(self.host_token || self.w.embed_rows >= self.m.vocab as usize,
+            "a step after a step looks up a greedy token from the whole vocabulary, but only {} of {} embedding rows are on the GPU; set the token first",
+            self.w.embed_rows, self.m.vocab);
         Ok(())
     }
 
@@ -252,23 +290,25 @@ impl<'a> Runtime<'a> {
 
     /// Runs one step (the graph once captured), then the position advances by one.
     pub fn step(&mut self) -> Result<()> {
-        ensure!(self.pos < self.capacity, "position {} is past the cache capacity {}", self.pos, self.capacity);
+        self.check_step()?;
         match &self.graph {
             Some(g) => g.launch()?,
             None => self.enqueue(None)?,
         }
         self.pos += 1;
+        self.host_token = false;
         Ok(())
     }
 
     /// Runs one step with plain launches, copying the hidden state back after every residual add
     /// (synchronizing each time).
     pub fn step_traced(&mut self) -> Result<GpuTrace> {
-        ensure!(self.pos < self.capacity, "position {} is past the cache capacity {}", self.pos, self.capacity);
+        self.check_step()?;
         let mut t = GpuTrace { after_attn: vec![], after_mlp: vec![], logits: vec![] };
         self.enqueue(Some(&mut t))?;
         t.logits = self.s.memcpy_dtov(&self.logits)?;
         self.pos += 1;
+        self.host_token = false;
         Ok(t)
     }
 

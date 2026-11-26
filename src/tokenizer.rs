@@ -6,8 +6,14 @@ use anyhow::{Context, Result};
 use std::collections::HashMap;
 
 pub struct Decoder {
-    /// Bytes of each token id; empty for an id the file doesn't define.
-    tokens: Vec<Vec<u8>>,
+    /// Bytes of each token id the file defines. A map, not a vector indexed by id, so storage
+    /// follows the entries in the file rather than the largest id it names.
+    tokens: HashMap<u32, Vec<u8>>,
+}
+
+fn token_id(v: &serde_json::Value, what: &str) -> Result<u32> {
+    let id = v.as_u64().with_context(|| format!("{what} id is not a non-negative integer"))?;
+    u32::try_from(id).with_context(|| format!("{what} id {id} does not fit a token id"))
 }
 
 /// GPT-2's byte-to-character table, inverted: stand-in character -> byte.
@@ -32,15 +38,9 @@ impl Decoder {
         anyhow::ensure!(model.get("type").and_then(|t| t.as_str()) == Some("BPE"), "only BPE tokenizers are supported");
         let vocab = model.get("vocab").and_then(|v| v.as_object()).context("tokenizer.json has no model.vocab")?;
         let map = char_to_byte();
-        let mut tokens: Vec<Vec<u8>> = vec![];
-        let mut put = |id: usize, bytes: Vec<u8>| {
-            if tokens.len() <= id {
-                tokens.resize(id + 1, vec![]);
-            }
-            tokens[id] = bytes;
-        };
+        let mut tokens = HashMap::new();
         for (s, id) in vocab {
-            let id = id.as_u64().context("a vocabulary id is not a number")? as usize;
+            let id = token_id(id, "a vocabulary")?;
             let mut bytes = vec![];
             for c in s.chars() {
                 match map.get(&c) {
@@ -48,12 +48,12 @@ impl Decoder {
                     None => bytes.extend(c.to_string().as_bytes()),
                 }
             }
-            put(id, bytes);
+            tokens.insert(id, bytes);
         }
         for t in v.get("added_tokens").and_then(|a| a.as_array()).into_iter().flatten() {
-            let id = t.get("id").and_then(|i| i.as_u64()).context("an added token has no id")? as usize;
+            let id = token_id(t.get("id").context("an added token has no id")?, "an added token")?;
             let content = t.get("content").and_then(|c| c.as_str()).context("an added token has no content")?;
-            put(id, content.as_bytes().to_vec());
+            tokens.insert(id, content.as_bytes().to_vec());
         }
         Ok(Self { tokens })
     }
@@ -62,13 +62,17 @@ impl Decoder {
         Self::from_json(&std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?)
     }
 
-    pub fn vocab_len(&self) -> usize {
+    /// Token ids the file defines.
+    pub fn len(&self) -> usize {
         self.tokens.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.tokens.is_empty()
     }
 
     /// The text of `ids`, invalid UTF-8 (a token boundary inside a character) shown as U+FFFD.
     pub fn decode(&self, ids: &[u32]) -> String {
-        let bytes: Vec<u8> = ids.iter().flat_map(|&i| self.tokens.get(i as usize).cloned().unwrap_or_default()).collect();
+        let bytes: Vec<u8> = ids.iter().flat_map(|i| self.tokens.get(i).cloned().unwrap_or_default()).collect();
         String::from_utf8_lossy(&bytes).into_owned()
     }
 }

@@ -265,6 +265,18 @@ impl CheckpointWeights<'_> {
         self.ck.read_range(t, off, &mut buf)?;
         Ok(buf.as_chunks::<2>().0.iter().map(|c| u16::from_le_bytes(*c)).collect())
     }
+    fn norm_name(&self, n: Norm) -> String {
+        match n {
+            Norm::Attn(l) => format!("model.layers.{l}.input_layernorm.weight"),
+            Norm::Mlp(l) => format!("model.layers.{l}.post_attention_layernorm.weight"),
+            Norm::Final => "model.norm.weight".into(),
+        }
+    }
+    fn shape(&self, name: &str, want: &[usize]) -> Result<()> {
+        let t = self.ck.tensors.get(name).with_context(|| format!("{name} is not in the checkpoint"))?;
+        ensure!(t.shape == want, "{name} has shape {:?}, the model needs {want:?}", t.shape);
+        Ok(())
+    }
     fn linear(&self, l: Linear) -> Result<&crate::weights::BoundLinear> {
         let (name, layer) = match l {
             Linear::Qkv(i) => ("qkv_proj", Some(i as u32)),
@@ -284,22 +296,31 @@ impl Weights for CheckpointWeights<'_> {
     fn embed_rows(&self) -> usize {
         self.m.vocab as usize
     }
+    /// Every bound linear, norm and the embedding must have the shape `m` needs, whatever model the
+    /// checkpoint was bound for.
     fn check(&self, m: &ModelSpec) -> Result<()> {
-        // `weights::bind` checked every tensor's shape and dtype against this model.
-        ensure!(std::ptr::eq(m, self.m) || (m.hidden, m.layers, m.vocab) == (self.m.hidden, self.m.layers, self.m.vocab), "the checkpoint was bound for another model");
-        Ok(())
+        let (h, inter, q, qkv) = (m.hidden as usize, m.intermediate as usize, m.q_dim() as usize, m.qkv_dim() as usize);
+        ensure!(m.layers == self.m.layers, "the checkpoint was bound for {} layers, the model has {}", self.m.layers, m.layers);
+        for l in 0..m.layers as usize {
+            for (lin, n, k) in [(Linear::Qkv(l), qkv, h), (Linear::O(l), h, q), (Linear::GateUp(l), 2 * inter, h), (Linear::Down(l), h, inter)] {
+                let b = self.linear(lin)?;
+                ensure!((b.n, b.k) == (n, k), "{lin:?} is bound as {}x{}, the model needs {n}x{k}", b.n, b.k);
+            }
+            for norm in [Norm::Attn(l), Norm::Mlp(l)] {
+                self.shape(&self.norm_name(norm), &[h])?;
+            }
+        }
+        let lm = self.linear(Linear::LmHead)?;
+        ensure!((lm.n, lm.k) == (m.vocab as usize, h), "lm_head is bound as {}x{}, the model needs {}x{h}", lm.n, lm.k, m.vocab);
+        self.shape("model.norm.weight", &[h])?;
+        self.shape("model.embed_tokens.weight", &[m.vocab as usize, h])
     }
     fn embed_row(&self, row: usize) -> Result<Vec<u16>> {
         let h = self.m.hidden as usize;
         self.bf16("model.embed_tokens.weight", (row * h * 2) as u64, h)
     }
     fn norm(&self, n: Norm) -> Result<Vec<u16>> {
-        let name = match n {
-            Norm::Attn(l) => format!("model.layers.{l}.input_layernorm.weight"),
-            Norm::Mlp(l) => format!("model.layers.{l}.post_attention_layernorm.weight"),
-            Norm::Final => "model.norm.weight".into(),
-        };
-        self.bf16(&name, 0, self.m.hidden as usize)
+        self.bf16(&self.norm_name(n), 0, self.m.hidden as usize)
     }
     fn gemv(&self, l: Linear, x: &[u16]) -> Result<Vec<f64>> {
         let xf: Vec<f64> = x.iter().map(|&v| bf2f(v) as f64).collect();
@@ -397,15 +418,30 @@ pub fn add(h: &[u16], d: &[u16]) -> Vec<u16> {
 
 /// One decode step for the token whose embedding is row `row`, at position `pos`: appends this
 /// step's K and V to `cache` and returns the activations at each layer boundary. Every shape, the
-/// row and the position are checked before anything is written, so a refused step leaves the
-/// cache as it was.
+/// row and the position are checked before anything is written, and a step that fails partway
+/// restores the slots it wrote, so an error always leaves the cache as it was.
 pub fn decode_step(m: &ModelSpec, w: &impl Weights, cache: &mut KvCache, row: usize, pos: usize) -> Result<Trace> {
-    let (q, kv) = (m.q_dim() as usize, m.kv_dim() as usize);
-    let eps = m.rms_eps;
+    let kv = m.kv_dim() as usize;
     w.check(m)?;
     check_cache(m, w.layers(), cache)?;
     ensure!(pos < cache.capacity, "position {pos} is past the cache capacity {}", cache.capacity);
     ensure!(row < w.embed_rows(), "embedding row {row} is past the {} rows", w.embed_rows());
+    // A step writes each layer's K and V slot at `pos` before later reads that can still fail (a
+    // checkpoint read, for example); put the slots back if one does.
+    let saved: Vec<(Vec<u16>, Vec<u16>)> = (0..w.layers()).map(|l| (cache.k[l][pos * kv..(pos + 1) * kv].to_vec(), cache.v[l][pos * kv..(pos + 1) * kv].to_vec())).collect();
+    let r = step_layers(m, w, cache, row, pos);
+    if r.is_err() {
+        for (l, (k, v)) in saved.into_iter().enumerate() {
+            cache.k[l][pos * kv..(pos + 1) * kv].copy_from_slice(&k);
+            cache.v[l][pos * kv..(pos + 1) * kv].copy_from_slice(&v);
+        }
+    }
+    r
+}
+
+fn step_layers(m: &ModelSpec, w: &impl Weights, cache: &mut KvCache, row: usize, pos: usize) -> Result<Trace> {
+    let (q, kv) = (m.q_dim() as usize, m.kv_dim() as usize);
+    let eps = m.rms_eps;
     let mut x = w.embed_row(row)?;
     let mut t = Trace { after_attn: vec![], after_mlp: vec![], logits: vec![] };
     for l in 0..w.layers() {

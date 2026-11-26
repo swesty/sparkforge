@@ -50,7 +50,12 @@ otherwise fails.
 `sparkforge generate` SHALL decode a dense BF16 checkpoint greedily on a GB10 from a pre-tokenized
 prompt. A step SHALL read its token and position from device memory and end by writing the greedy
 next token and advancing the position, so one captured CUDA Graph on a non-default stream replays
-every step, prompt and generated, with no host work between tokens.
+every step, prompt and generated, with no host work between tokens. The prompt's last step gives the
+first output token, so N tokens take prompt + N - 1 replays.
+
+#### Scenario: One-token prompt, one token
+- **WHEN** `generate` runs with a one-token prompt and `--steps 1`
+- **THEN** it runs one replay with a one-position cache and returns one token
 
 #### Scenario: Llama 3.1 8B
 - **WHEN** `generate` runs Llama 3.1 8B on a 20-token prompt about general relativity for 48 steps
@@ -73,7 +78,8 @@ and every step SHALL be checked against it before launch.
 
 ### Requirement: Decode throughput is measured against the planner
 
-`generate --bench-ctx` SHALL time graph replays at each given context length and print ms per token,
+`generate --bench-ctx` SHALL time graph replays at each given context length, each from a zeroed
+cache and the same input token so the order of the lengths doesn't matter, and print ms per token,
 tok/s and the planner's ceiling at that context.
 
 #### Scenario: Llama 3.1 8B on GB10

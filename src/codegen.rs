@@ -238,22 +238,26 @@ embed_gather(const bf16* __restrict__ table, const int* __restrict__ token, bf16
   if (v >= HIDDEN / 8) return;
   reinterpret_cast<uint4*>(x)[v] = reinterpret_cast<const uint4*>(table + (size_t)*token * HIDDEN)[v];
 }
-// Greedy step end, one block: token = argmax(logits) (lowest index on ties, NaN never wins),
-// out[*pos] = token, then *pos += 1, so the next replay of the step graph decodes that token at the
-// next position with no host involvement.
+// Greedy step end, one block: token = argmax(logits) (lowest index on ties; NaN never wins, so
+// -inf can; all NaN gives 0), out[*pos] = token, then *pos += 1, so the next replay of the step
+// graph decodes that token at the next position with no host involvement. idx == VOCAB means no
+// candidate yet.
+__device__ __forceinline__ bool token_better(float v, int i, float best, int idx) {
+  return i != token_ns::VOCAB && (idx == token_ns::VOCAB || v > best || (v == best && i < idx));
+}
 extern "C" __global__ void __launch_bounds__(token_ns::THREADS)
 argmax_advance(const bf16* __restrict__ logits, int* __restrict__ token, int* __restrict__ out, int* __restrict__ pos) {
   using namespace token_ns;
   float best = NEG_INF; int idx = VOCAB;
   for (int i = threadIdx.x; i < VOCAB; i += THREADS) {
     const float v = __bfloat162float(logits[i]);
-    if (v > best) { best = v; idx = i; }
+    if (!isnan(v) && token_better(v, i, best, idx)) { best = v; idx = i; }
   }
   __shared__ float sv[THREADS / 32]; __shared__ int si[THREADS / 32];
 #pragma unroll
   for (int o = 16; o > 0; o >>= 1) {
     const float ov = __shfl_xor_sync(0xffffffffu, best, o); const int oi = __shfl_xor_sync(0xffffffffu, idx, o);
-    if (ov > best || (ov == best && oi < idx)) { best = ov; idx = oi; }
+    if (token_better(ov, oi, best, idx)) { best = ov; idx = oi; }
   }
   if ((threadIdx.x & 31) == 0) { sv[threadIdx.x >> 5] = best; si[threadIdx.x >> 5] = idx; }
   __syncthreads();
@@ -262,7 +266,7 @@ argmax_advance(const bf16* __restrict__ logits, int* __restrict__ token, int* __
 #pragma unroll
     for (int o = 16; o > 0; o >>= 1) {
       const float ov = __shfl_xor_sync(0xffffffffu, best, o); const int oi = __shfl_xor_sync(0xffffffffu, idx, o);
-      if (ov > best || (ov == best && oi < idx)) { best = ov; idx = oi; }
+      if (token_better(ov, oi, best, idx)) { best = ov; idx = oi; }
     }
     if (threadIdx.x == 0) {
       const int p = *pos, t = idx < VOCAB ? idx : 0;

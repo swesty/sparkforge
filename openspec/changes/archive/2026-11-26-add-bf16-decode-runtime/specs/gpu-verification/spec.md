@@ -38,7 +38,9 @@ SHALL give bitwise the same logits. Any other model SHALL print why the check wa
 
 `generate --check N` SHALL compare the logits of the first N steps (prompt, then generated) with the
 CPU reference, which streams the weights from the checkpoint, with the scaled layer-boundary metric
-and the 1/64 tolerance, and SHALL fail if any step exceeds it.
+and the 1/64 tolerance, and SHALL fail if any step exceeds it. The reference SHALL refuse a model
+whose tensor shapes differ from the checkpoint's binding, and a step that fails partway SHALL restore
+every cache slot it wrote.
 
 #### Scenario: Llama 3.1 8B
 - **WHEN** 24 steps of Llama 3.1 8B are checked on a GB10

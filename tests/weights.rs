@@ -1694,3 +1694,90 @@ fn an_oversized_expert_count_fails_on_the_live_experts() {
     assert!(t0.elapsed() < std::time::Duration::from_secs(5), "{:?}", t0.elapsed());
     assert!(s.resolved.is_none());
 }
+
+/// The tiny checkpoint's tensors as `reference::DenseWeights` (fused like the binding: q|k|v, gate|up).
+fn dense_from(ck: &Checkpoint) -> sparkforge::reference::DenseWeights {
+    use sparkforge::reference::{DenseWeights, LayerWeights};
+    let read = |names: &[String]| -> Vec<u16> {
+        let mut out = vec![];
+        let mut buf = vec![];
+        for n in names {
+            ck.read_into(&ck.tensors[n], &mut buf).unwrap();
+            out.extend(buf.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])));
+        }
+        out
+    };
+    let one = |n: &str| read(&[n.to_string()]);
+    let layers = (0..2)
+        .map(|l| {
+            let p = format!("model.layers.{l}");
+            LayerWeights {
+                attn_norm: one(&format!("{p}.input_layernorm.weight")),
+                qkv: read(&["q_proj", "k_proj", "v_proj"].map(|x| format!("{p}.self_attn.{x}.weight"))),
+                o_proj: one(&format!("{p}.self_attn.o_proj.weight")),
+                mlp_norm: one(&format!("{p}.post_attention_layernorm.weight")),
+                gate_up: read(&["gate_proj", "up_proj"].map(|x| format!("{p}.mlp.{x}.weight"))),
+                down: one(&format!("{p}.mlp.down_proj.weight")),
+            }
+        })
+        .collect();
+    DenseWeights { embed: one("model.embed_tokens.weight"), layers, final_norm: one("model.norm.weight"), lm_head: one("lm_head.weight") }
+}
+
+#[test]
+fn the_reference_reads_a_bound_checkpoint_like_the_same_weights_in_memory() {
+    use sparkforge::reference::{decode_step, CheckpointWeights, KvCache};
+    let d = single("ref-checkpoint", bf16(tensors(false)));
+    let ck = Checkpoint::open(&d).unwrap();
+    let m = spec(false);
+    let b = bind(&ck, &m).unwrap();
+    let cw = CheckpointWeights { ck: &ck, b: &b, m: &m };
+    let dw = dense_from(&ck);
+    let (mut c1, mut c2) = (KvCache::new(&m, 2, 3), KvCache::new(&m, 2, 3));
+    for (pos, row) in [(0usize, 5usize), (1, 9), (2, 63)] {
+        let a = decode_step(&m, &cw, &mut c1, row, pos).unwrap();
+        let w = decode_step(&m, &dw, &mut c2, row, pos).unwrap();
+        assert_eq!(a.after_attn, w.after_attn, "position {pos}");
+        assert_eq!(a.after_mlp, w.after_mlp, "position {pos}");
+        assert_eq!(a.logits.iter().map(|v| v.to_bits()).collect::<Vec<_>>(), w.logits.iter().map(|v| v.to_bits()).collect::<Vec<_>>(), "position {pos}");
+    }
+    assert_eq!((c1.k, c1.v), (c2.k, c2.v));
+}
+
+#[test]
+fn the_reference_refuses_a_model_the_checkpoint_was_not_bound_for() {
+    use sparkforge::reference::{decode_step, CheckpointWeights, KvCache};
+    let d = single("ref-mismatch", bf16(tensors(false)));
+    let ck = Checkpoint::open(&d).unwrap();
+    let bound = spec(false);
+    let b = bind(&ck, &bound).unwrap();
+    // Same hidden size, layers, vocabulary and attention, twice the MLP width.
+    let mut wide = spec(false);
+    wide.intermediate = 64;
+    let cw = CheckpointWeights { ck: &ck, b: &b, m: &bound };
+    let mut cache = KvCache::new(&wide, 2, 2);
+    let e = decode_step(&wide, &cw, &mut cache, 0, 0).err().expect("a different MLP width is refused").to_string();
+    assert!(e.contains("GateUp(0)") && e.contains("64x16") && e.contains("128x16"), "{e}");
+    assert!(cache.k.iter().chain(&cache.v).all(|c| c.iter().all(|&x| x == 0)), "nothing was written");
+}
+
+#[test]
+fn a_checkpoint_changed_after_opening_fails_the_step_without_writing() {
+    use sparkforge::reference::{decode_step, CheckpointWeights, KvCache, Rng};
+    let d = single("ref-truncated", bf16(tensors(false)));
+    let ck = Checkpoint::open(&d).unwrap();
+    let m = spec(false);
+    let b = bind(&ck, &m).unwrap();
+    let cw = CheckpointWeights { ck: &ck, b: &b, m: &m };
+    let mut cache = KvCache::new(&m, 2, 2);
+    cache.fill_random(&m, 2, &mut Rng(29));
+    let before = (cache.k.clone(), cache.v.clone());
+    // The checkpoint notices a shard that changed after opening on its first read (the embedding
+    // row), before the step writes anything. The restore after a later failure is tested in
+    // tests/reference.rs.
+    let f = d.join("model.safetensors");
+    let len = std::fs::metadata(&f).unwrap().len();
+    std::fs::OpenOptions::new().write(true).open(&f).unwrap().set_len(len - 64).unwrap();
+    assert!(decode_step(&m, &cw, &mut cache, 3, 1).is_err(), "the truncated read fails");
+    assert_eq!((cache.k.clone(), cache.v.clone()), before, "the cache is unchanged");
+}

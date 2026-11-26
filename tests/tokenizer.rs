@@ -9,7 +9,7 @@ const JSON: &str = r#"{
 #[test]
 fn byte_level_tokens_decode_to_text() {
     let d = Decoder::from_json(JSON).unwrap();
-    assert_eq!(d.vocab_len(), 6);
+    assert_eq!(d.len(), 6);
     // Ġ is a space and Ċ a newline in GPT-2's byte table; Ã© is the two UTF-8 bytes of é.
     assert_eq!(d.decode(&[5, 0, 1, 2, 3]), "<|begin_of_text|>Hello world.\n\n");
     assert_eq!(d.decode(&[4]), "é");
@@ -21,4 +21,16 @@ fn byte_level_tokens_decode_to_text() {
 fn only_bpe_tokenizers_are_read() {
     let e = Decoder::from_json(r#"{"model": {"type": "Unigram", "vocab": []}}"#).err().unwrap().to_string();
     assert!(e.contains("only BPE"), "{e}");
+}
+
+#[test]
+fn a_huge_token_id_costs_no_memory_and_an_out_of_range_one_is_refused() {
+    // One entry with id 1e9: stored as one map entry, not a billion-element table.
+    let d = Decoder::from_json(r#"{"model": {"type": "BPE", "vocab": {"x": 1000000000}}}"#).unwrap();
+    assert_eq!(d.len(), 1);
+    assert_eq!(d.decode(&[1_000_000_000]), "x");
+    let e = Decoder::from_json(r#"{"model": {"type": "BPE", "vocab": {"x": 4294967296}}}"#).err().unwrap().to_string();
+    assert!(e.contains("does not fit"), "{e}");
+    let e = Decoder::from_json(r#"{"model": {"type": "BPE", "vocab": {"x": -1}}}"#).err().unwrap().to_string();
+    assert!(e.contains("non-negative"), "{e}");
 }

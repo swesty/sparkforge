@@ -121,7 +121,7 @@ enum Cmd {
     },
 }
 
-/// Decode steps timed at each `--bench-ctx` length, after 2 warm-up steps.
+/// Decode steps timed at each `--bench-ctx` length, after 2 warm-up steps, each from a cleared cache.
 #[cfg(feature = "cuda")]
 const BENCH_STEPS: usize = 32;
 
@@ -140,8 +140,11 @@ fn generate(dir: &std::path::Path, prompt: &[u32], steps: usize, check: usize, t
     let dec = tokenizer.map(sparkforge::tokenizer::Decoder::from_file).transpose()?;
     anyhow::ensure!(!prompt.is_empty() && steps > 0, "need a prompt and at least one step");
     anyhow::ensure!(prompt.iter().all(|&t| t < m.vocab), "a prompt token is past the vocabulary of {}", m.vocab);
+    // The prompt's last step already predicts the first output token, so `steps` tokens take
+    // prompt + steps - 1 replays, at positions 0..prompt + steps - 1.
+    let replays = prompt.len() + steps - 1;
     let bench_cap = bench_ctx.iter().map(|&c| c + 2 + BENCH_STEPS).max().unwrap_or(0);
-    let capacity = (prompt.len() + steps).max(bench_cap);
+    let capacity = replays.max(bench_cap);
     anyhow::ensure!(capacity <= m.max_pos as usize, "{capacity} positions exceed max_position_embeddings {}", m.max_pos);
     let splits = p.attn.splits as usize;
     let rbytes = runtime_bytes(m, splits, capacity);
@@ -152,7 +155,7 @@ fn generate(dir: &std::path::Path, prompt: &[u32], steps: usize, check: usize, t
     // The legacy default stream cannot be captured into a graph.
     let s = e.ctx.new_stream()?;
     let dd = sparkforge::device_weights::upload_dense(&s, &ck, &b, m, &admission, rbytes)?;
-    let mut rt = Runtime::new(&s, Kernels::new(&g, &e)?, m, &dd.ptrs, splits, capacity)?;
+    let mut rt = Runtime::new(&s, Kernels::new(&g, &e)?, m, &dd, splits, capacity)?;
     s.synchronize()?;
     let mem_after = sparkforge::weights::mem_available();
     drop(admission);
@@ -166,7 +169,8 @@ fn generate(dir: &std::path::Path, prompt: &[u32], steps: usize, check: usize, t
     // Prompt, by repeated decode steps; the first `check` steps (prompt then generated) against
     // the reference, which streams the weights from the checkpoint.
     let cw = CheckpointWeights { ck: &ck, b: &b, m };
-    let mut host_cache = KvCache::new(m, m.layers as usize, check.min(capacity).max(1));
+    let check = check.min(replays);
+    let mut host_cache = KvCache::new(m, m.layers as usize, check.max(1));
     let (mut worst, mut agree) = (0f64, 0usize);
     // Runs the step at `pos` for `token` on the CPU and compares it with the GPU's logits and
     // greedy token from that step.
@@ -195,38 +199,41 @@ fn generate(dir: &std::path::Path, prompt: &[u32], steps: usize, check: usize, t
     // Generation: the graph carries the token and position from step to step on the device. Steps
     // still to be checked run first, one at a time.
     let first = prompt.len();
-    let mut checked = 0;
-    while first + checked < check.min(first + steps) {
-        let pos = first + checked;
+    let mut pos = first;
+    while pos < replays && pos < check {
         let token = rt.tokens(pos - 1, pos)?[0];
         rt.step()?;
         compare(&rt, &mut host_cache, pos, token)?;
-        checked += 1;
+        pos += 1;
     }
-    let timed = steps - checked;
+    let timed = replays - pos;
     let t0 = std::time::Instant::now();
     for _ in 0..timed {
         rt.step()?;
     }
     s.synchronize()?;
     let gen_secs = t0.elapsed().as_secs_f64();
-    let out = rt.tokens(first - 1, first - 1 + steps)?;
+    // The token predicted at position p is out[p]: the prompt's last step gives the first one.
+    let out = rt.tokens(first - 1, replays)?;
     println!("prompt: {} steps in {:.2} s{}", first, prompt_secs, if check > 0 { " (including reference checks)" } else { "" });
     if timed > 0 {
-        println!("generated {timed} tokens in {:.3} s: {:.2} ms/token, {:.1} tok/s (graph replay, positions {}..{})",
-            gen_secs, gen_secs * 1e3 / timed as f64, timed as f64 / gen_secs, first + checked, first + steps);
+        println!("generated {timed} tokens in {:.3} s: {:.2} ms/token, {:.1} tok/s (graph replays at positions {pos}..{replays}; the first output token came from the prompt's last step)",
+            gen_secs, gen_secs * 1e3 / timed as f64, timed as f64 / gen_secs);
     }
     println!("output ids: {out:?}");
     if let Some(d) = &dec {
         println!("output: {:?}", d.decode(&out));
     }
     if check > 0 {
-        let n = check.min(first + steps);
-        println!("checked {n} step(s) against the CPU reference: worst logits error {worst:.2e}, greedy token matches the reference argmax in {agree}/{n}");
+        println!("checked {check} step(s) against the CPU reference: worst logits error {worst:.2e}, greedy token matches the reference argmax in {agree}/{check}");
     }
+    // Timing at a context length: the attention span is what matters, not the values in it, so
+    // each measurement starts from a zeroed cache (a synthetic prefix) and the same input token,
+    // whatever was measured before it.
     for &c in bench_ctx {
         anyhow::ensure!(c >= 1, "a context length of 0");
-        rt.set(c, out[0] as usize)?;
+        rt.clear_cache()?;
+        rt.set(c, prompt[prompt.len() - 1] as usize)?;
         rt.step()?;
         rt.step()?;
         s.synchronize()?;
@@ -237,7 +244,7 @@ fn generate(dir: &std::path::Path, prompt: &[u32], steps: usize, check: usize, t
         s.synchronize()?;
         let ms = t0.elapsed().as_secs_f64() * 1e3 / BENCH_STEPS as f64;
         let ceiling = plan::build(&spec, &GB10, &plan::PlanOpts { prefill_tokens: 2048, ctx: c as u32 }).budget.decode_tok_s_ceiling;
-        println!("ctx {c}: {ms:.2} ms/token, {:.1} tok/s (planner ceiling {ceiling:.1}), {BENCH_STEPS} graph replays at positions {}..{}",
+        println!("ctx {c}: {ms:.2} ms/token, {:.1} tok/s (planner ceiling {ceiling:.1}), {BENCH_STEPS} graph replays at positions {}..{} over a zeroed prefix",
             1e3 / ms, c + 2, c + 2 + BENCH_STEPS);
     }
     anyhow::ensure!(worst < TOL, "logits differ from the CPU reference by {worst:.2e}, above tolerance {TOL:.4}");

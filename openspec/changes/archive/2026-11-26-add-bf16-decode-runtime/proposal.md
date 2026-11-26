@@ -23,6 +23,16 @@ Every throughput number so far was per kernel: the sum of isolated kernel times 
   - `fp:29a5f1998955`: `reference::decode_step` validates before writing, and returns errors.
   - `fp:bd3fa010f065`: `f64_to_bf16` rounds bf16 subnormals once.
 
+- **codex-review cycle 1 on this change:**
+  - `fp:b4f0ef0952f4`: the prompt's last step gives the first output token, so N tokens take prompt + N - 1 replays (a run used to make one extra replay and discard it).
+  - `fp:83bcb9e0f559`: a step whose token comes from the previous step needs a full embedding table.
+  - `fp:c7921f52e588`: `WeightPtrs` is built only by the owners of the memory, and the `Runtime` borrows the owner.
+  - `fp:96a508102cf4`: a reference step that fails partway restores the slots it wrote.
+  - `fp:207ec0ac8dbc`: each benchmark starts from a zeroed cache and the same token.
+  - `fp:dc612d7ba3fc`: the tokenizer stores entries in a map and refuses ids past `u32`.
+  - `fp:0f8e3bef027c`: argmax lets negative infinity win over NaN.
+  - `fp:36f5a8a8b697`: `CheckpointWeights` checks every bound shape against the model.
+
 **Expected GB10 effect:** Llama 3.1 8B decodes at 15.5, 15.0 and 12.1 tok/s at 1K, 4K and 32K, within 1% of the planner ceiling.
 
 ## Non-goals

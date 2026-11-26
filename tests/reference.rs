@@ -2,7 +2,7 @@
 //! mapping, KV-cache slots, RoPE at position 0, the dense-only guard and determinism. The GPU side
 //! is compared against it by `verify` on a GB10.
 use sparkforge::config::ModelSpec;
-use sparkforge::reference::{self, bf2f, f2bf, f64_to_bf16, DenseWeights, KvCache, Rng};
+use sparkforge::reference::{self, bf2f, f2bf, f64_to_bf16, DenseWeights, KvCache, Linear, Norm, Rng, Weights};
 
 /// Llama 3.1 8B's config shrunk to 2 layers of width 64: 4 query heads sharing 2 KV heads of 16.
 fn tiny() -> ModelSpec {
@@ -202,4 +202,34 @@ fn a_refused_step_leaves_the_cache_unchanged() {
     assert!(reference::decode_step(&m, &w, &mut ok, 2, 0).is_err(), "row 2 is past the 2 embedding rows");
     assert!(reference::decode_step(&m, &w, &mut ok, 0, 2).is_err(), "position 2 is past the capacity");
     assert!(ok.k.iter().chain(&ok.v).all(|c| c.iter().all(|&x| x == 0)));
+}
+
+/// `DenseWeights` whose GEMV for one linear fails, as a checkpoint read can partway through a step.
+struct FailAt<'a>(&'a DenseWeights, &'static str);
+impl Weights for FailAt<'_> {
+    fn layers(&self) -> usize { self.0.layers() }
+    fn embed_rows(&self) -> usize { self.0.embed_rows() }
+    fn check(&self, m: &ModelSpec) -> anyhow::Result<()> { self.0.check(m) }
+    fn embed_row(&self, row: usize) -> anyhow::Result<Vec<u16>> { self.0.embed_row(row) }
+    fn norm(&self, n: Norm) -> anyhow::Result<Vec<u16>> { self.0.norm(n) }
+    fn gemv(&self, l: Linear, x: &[u16]) -> anyhow::Result<Vec<f64>> {
+        anyhow::ensure!(format!("{l:?}") != self.1, "injected failure at {l:?}");
+        self.0.gemv(l, x)
+    }
+}
+
+#[test]
+fn a_step_that_fails_partway_restores_every_slot_it_wrote() {
+    let m = tiny();
+    let mut rng = Rng(31);
+    let w = DenseWeights::random(&m, 2, 2, &mut rng);
+    // Layer 1's o_proj runs after layers 0 and 1 have appended K and V; lm_head after every layer.
+    for at in ["O(1)", "LmHead"] {
+        let mut cache = KvCache::new(&m, 2, 3);
+        cache.fill_random(&m, 3, &mut rng);
+        let before = (cache.k.clone(), cache.v.clone());
+        let e = reference::decode_step(&m, &FailAt(&w, at), &mut cache, 1, 2).err().expect("the injected failure").to_string();
+        assert!(e.contains(at), "{e}");
+        assert_eq!((cache.k.clone(), cache.v.clone()), before, "failure at {at}: every slot is restored");
+    }
 }

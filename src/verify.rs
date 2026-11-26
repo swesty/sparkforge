@@ -314,7 +314,18 @@ impl Ctx<'_> {
             let (t, o, p) = (s.memcpy_dtov(&tok)?[0], s.memcpy_dtov(&out)?, s.memcpy_dtov(&dp)?[0]);
             ok &= t == a as i32 && o[pos as usize] == a as i32 && p == pos + 1 && o.iter().enumerate().all(|(i, &v)| i == pos as usize || v == -1);
         }
-        self.push("argmax_advance", format!("vocab {vocab}, ties, NaN: {}", if ok { "ok" } else { "WRONG" }), if ok { 0.0 } else { f64::INFINITY }, None, 0.0);
+        // NaN at 0 and -inf everywhere else: -inf wins at index 1. All NaN: the fallback, 0.
+        for (fill, want) in [(0xff80u16, 1i32), (0x7fc0, 0)] {
+            let mut lg = vec![fill; vocab];
+            lg[0] = 0x7fc0;
+            let dl = s.memcpy_stod(&lg)?;
+            let mut tok = s.alloc_zeros::<i32>(1)?;
+            let mut out = s.memcpy_stod(&[-1i32; 4])?;
+            let mut dp = s.memcpy_stod(&[1i32])?;
+            unsafe { s.launch_builder(fa).arg(&dl).arg(&mut tok).arg(&mut out).arg(&mut dp).launch(cfg(ka.grid, ka.block, 0))? };
+            ok &= s.memcpy_dtov(&tok)?[0] == want && s.memcpy_dtov(&out)?[1] == want && s.memcpy_dtov(&dp)?[0] == 2;
+        }
+        self.push("argmax_advance", format!("vocab {vocab}, ties, NaN, -inf: {}", if ok { "ok" } else { "WRONG" }), if ok { 0.0 } else { f64::INFINITY }, None, 0.0);
         Ok(())
     }
 
@@ -337,6 +348,7 @@ impl Ctx<'_> {
         let gs = self.e.ctx.new_stream()?;
         let splits = self.p.attn.splits as usize;
         let prefix = 1000.min(m.max_pos as usize - 2);
+        // Each case's cache has one spare slot, for the refused autonomous replay below.
         let cases = [("fresh".to_string(), 0usize, 4usize), (format!("prefix {prefix}"), prefix, 2)];
         let mut rng = Rng(self.rng.next_u64() | 1);
         let w = DenseWeights::random(m, STEP_LAYERS, cases.iter().map(|c| c.2).sum(), &mut rng);
@@ -346,10 +358,10 @@ impl Ctx<'_> {
         let argmax = |v: &[u16]| v.iter().enumerate().fold((0usize, f32::NEG_INFINITY), |b, (i, &x)| if bf2f(x) > b.1 { (i, bf2f(x)) } else { b }).0;
         let mut row = 0;
         for (name, start, steps) in cases {
-            let mut cache = KvCache::new(m, STEP_LAYERS, start + steps);
+            let mut cache = KvCache::new(m, STEP_LAYERS, start + steps + 1);
             cache.fill_random(m, start, &mut rng);
-            let mut plain = Runtime::from_host(&s, Kernels::new(self.g, self.e)?, m, &up.ptrs, splits, &cache)?;
-            let mut graph = Runtime::from_host(&gs, Kernels::new(self.g, self.e)?, m, &up.ptrs, splits, &cache)?;
+            let mut plain = Runtime::from_host(&s, Kernels::new(self.g, self.e)?, m, &up, splits, &cache)?;
+            let mut graph = Runtime::from_host(&gs, Kernels::new(self.g, self.e)?, m, &up, splits, &cache)?;
             gs.synchronize()?;
             graph.capture()?;
             // [L0 attn, L0 mlp, L1 attn, ..., logits]
@@ -375,8 +387,16 @@ impl Ctx<'_> {
                 let at = if i == 2 * STEP_LAYERS { "logits".to_string() } else { format!("L{} {}", i / 2, if i % 2 == 0 { "attn" } else { "mlp" }) };
                 self.push("decode step", format!("{name}: {at}"), *e, None, 0.0);
             }
-            let ok = replay && greedy;
-            let what = match (replay, greedy) { (true, true) => "graph bitwise, argmax ok", (false, _) => "GRAPH DIFFERS", (_, false) => "ARGMAX WRONG" };
+            // These weights upload only the embedding rows the steps use, so a replay that would look
+            // up the previous step's greedy token (any vocabulary index) must be refused.
+            let bounded = graph.pos() < graph.capacity() && graph.step().is_err();
+            let ok = replay && greedy && bounded;
+            let what = match (replay, greedy, bounded) {
+                (true, true, true) => "graph bitwise, argmax ok",
+                (false, _, _) => "GRAPH DIFFERS",
+                (_, false, _) => "ARGMAX WRONG",
+                _ => "UNBOUNDED GREEDY GATHER",
+            };
             self.push("decode step", format!("{name}: {what}"), if ok { 0.0 } else { f64::INFINITY }, None, 0.0);
         }
         Ok(())
