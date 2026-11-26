@@ -66,17 +66,22 @@ sparkforge assumes one account runs it per node.
 
 Switching a node's sparkforge version, as an upgrade or a rollback, SHALL first disable every way
 to start the outgoing version, and SHALL make the incoming version runnable only after every
-invocation of the outgoing one has exited. Two versions that lock different files can both be
-admitted before either allocates.
+invocation of the outgoing one has exited. An invocation includes a start still in progress: any
+command begun before the outgoing version was disabled that may yet run it. Two versions that lock
+different files can both be admitted before either allocates.
 
 #### Scenario: Disable before waiting
 - **WHEN** a node switches sparkforge versions in either direction
-- **THEN** the outgoing version is disabled first: every launcher (a script or scheduled job) stops dispatching it, its pending invocations are cancelled, and no copy of it is left runnable on the node, counting installed binaries and build outputs (a kept copy is non-executable or off the node); then the switch waits until no invocation of it is running; until that wait ends the incoming version isn't runnable either and nothing is run from a source checkout, since a checkout can build either version; only then is the incoming version made runnable and its launchers resumed
+- **THEN** the outgoing version is disabled first: every launcher (a script or scheduled job) stops dispatching it, its pending invocations are cancelled, and no copy of it is left runnable on the node, counting installed binaries and build outputs (a kept copy is non-executable or off the node); then the switch waits until every command begun before the disable that may run it has exited or been cancelled, not only until no loader process is visible; until that wait ends the incoming version isn't runnable either and nothing is run from a source checkout, since a checkout can build either version; only then is the incoming version made runnable, every launcher that keeps dispatching is pointed at the incoming binary, and the launchers resume
 
 #### Scenario: Start during the cutover window
-- **WHEN** the outgoing binary is started by hand after its launchers stop but before it is made non-executable
-- **THEN** that run is one of the invocations the switch waits for, since the wait begins only after every copy is disabled and removing execute permission doesn't stop a running process, so no incoming-version load starts while it runs
+- **WHEN** the outgoing binary is started by hand after its launchers stop, either before it is made non-executable or in an exec that has passed the permission check but not yet replaced the starting process
+- **THEN** that start is one of the invocations the switch waits for, since removing execute permission stops neither a running process nor an exec already past its check, so no incoming-version load starts until the command that began it has exited or been cancelled
+
+#### Scenario: Launcher naming a version-specific path
+- **WHEN** a launcher names the outgoing binary by an absolute path, and the incoming binary is installed at a different path while the outgoing file is kept non-executable
+- **THEN** the launcher is pointed at the incoming binary before it resumes, so it dispatches the incoming version instead of failing on the disabled copy
 
 #### Scenario: Rollback
 - **WHEN** a node rolls back to the version it ran before
-- **THEN** the same rule applies with the roles swapped: the newer version's launchers stop, its pending invocations are cancelled and its copies are disabled, and the switch waits for its running invocations to exit before the older copy is made runnable again and its launchers resume
+- **THEN** the same rule applies with the roles swapped: the newer version's launchers stop, its pending invocations are cancelled and its copies are disabled, and the switch waits until every command that may run it has exited or been cancelled; then the older copy is made runnable again, and every launcher that keeps dispatching is pointed back at it before it resumes
