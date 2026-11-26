@@ -69,7 +69,12 @@ Generated kernels (all compile for `sm_121a` with NVRTC 13 and match the CPU ref
   last split to finish each tile sums the partials in a fixed order in the same launch, so the result is bitwise
   reproducible. Routed experts get one launch for all active experts, with expert ids read from the GPU.
 
-Planned (configs chosen, bodies TODO): prefill `mma.sync` GEMMs per linear, grouped MoE prefill GEMM, W4A16 (AWQ/GPTQ) decode GEMVs.
+- `gemm_<linear>` — BF16 prefill GEMM (C = A · Wᵀ, f32 accumulation) with the prompt length as an argument: a
+  `cp.async` pipeline into shared memory padded 16 bytes per row, `ldmatrix`, `mma.sync m16n8k16` on 64x64 or 64x32
+  warp tiles, tiles walked down M when the activations fit in L2. `lm_head` runs once at prefill, for the last position,
+  as the decode GEMV.
+
+Planned (configs chosen, bodies TODO): grouped MoE prefill GEMM, NVFP4 and MXFP8 prefill GEMMs, W4A16 (AWQ/GPTQ) decode GEMVs.
 
 ## Usage
 
@@ -131,6 +136,19 @@ Graph per step, 32 replays timed at each context, 14.96 GiB loaded in 8 s):
 
 The first 24 steps' logits match the CPU reference on the real weights (worst 1.37e-2, tolerance 1/64), and the greedy
 tokens match its argmax in 24 of 24. The output is coherent text.
+
+**Prefill GEMMs** (`verify --bench`, spark-5, CUDA 13.0, 2026-11-26, with a vLLM engine resident and idle; M = 2048):
+
+| Llama 3.1 8B | Tile | TFLOP/s | cuBLAS (PyTorch 2.13) |
+|---|---|---|---|
+| `gemm_qkv_proj` 2048x6144x4096 | 128x256x32, 3 stages | 73.7–74.4 | 100.8 |
+| `gemm_o_proj` 2048x4096x4096 | 128x256x32, 3 stages | 66.3–69.5 | 89.4 |
+| `gemm_gate_up_proj` 2048x28672x4096 | 128x256x32, 3 stages | 75.0–75.1 | 81.3 |
+| `gemm_down_proj` 2048x4096x14336 | 128x256x32, 3 stages | 65.6–66.0 | 94.1 |
+
+Every GEMM is within 3.82e-3 of an f64 reference, at M = 2048 and at a ragged 2011. The GEMMs of a 2048-token prompt take
+about 403 ms (about 5,080 tok/s; attention, norms, RoPE and activations not included). Walking M down each weight tile
+(the activations fit in L2) measured 66–75 TFLOP/s, L2 groups of N tiles 64–72, and a plain N-major order 20–50.
 
 | NVFP4 GEMV (spark-5, CUDA 13.0, 2026-11-25) | Bytes per launch | Max error | µs | GB/s |
 |---|---|---|---|---|

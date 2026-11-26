@@ -317,7 +317,7 @@ fn print_plan(p: &plan::Plan) {
         }
     }
     println!("\nPrefill GEMM tiles (mma.sync, smem <= {} B):", p.target.smem_per_block_optin);
-    for t in &p.gemm { println!("  {:<16} M={:<5} N={:<6} K={:<6} tile {}x{}x{} stages {} warps {} smem {:>6} ctas/SM {} wave_eff {:.2}", t.linear, t.m, t.n, t.k, t.bm, t.bn, t.bk, t.stages, t.warps, t.smem_bytes, t.ctas_per_sm, t.wave_efficiency); }
+    for t in &p.gemm { println!("  {:<16} M={:<5} N={:<6} K={:<6} tile {}x{}x{} stages {} warps {} (64x{}) smem {:>6} ctas/SM {} wave_eff {:.2} L2 group {}", t.linear, t.m, t.n, t.k, t.bm, t.bn, t.bk, t.stages, t.warps, t.warp_n, t.smem_bytes, t.ctas_per_sm, t.wave_efficiency, t.group_n); }
     let a = &p.attn;
     println!("\nDecode attention: grid {}x{} (kv_heads x splits), {} warps, smem {} B, GQA group {}", a.grid[0], a.grid[1], a.warps, a.smem_bytes, a.group);
     println!("RMSNorm: {} threads x {} iters of 8 bf16", p.norm.threads, p.norm.iters);
@@ -483,6 +483,12 @@ fn main() -> Result<()> {
             if let Some(t) = verify::token_estimate_us(&p, &rows) {
                 println!("decode token, sum of isolated kernel times @ ctx {}: {:.2} ms -> {:.1} tok/s (planner ceiling {:.1})",
                     p.budget.ctx, t / 1e3, 1e6 / t, p.budget.decode_tok_s_ceiling);
+            }
+            match sparkforge::estimate::prefill_estimate_us(&p, &rows) {
+                Ok((t, tokens)) => println!("prefill, sum of isolated GEMM times for a {tokens}-token prompt: {:.1} ms -> {:.0} tok/s (GEMMs and the last position's lm_head only; attention, norms, RoPE and activations not included)",
+                    t / 1e3, tokens as f64 * 1e6 / t),
+                Err(e) if bench => println!("prefill estimate skipped: {e}"),
+                Err(_) => {}
             }
             anyhow::ensure!(fails == 0, "{fails} check(s) above tolerance {:.4}", verify::TOL);
         }

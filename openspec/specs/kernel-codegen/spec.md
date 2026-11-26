@@ -26,7 +26,7 @@ Each manifest entry SHALL carry entry name, file, grid, block, dynamic shared me
 and a status. A GEMV SHALL be `generated` when its weights are BF16 (or the linear is `lm_head` or
 `router`) and its staged activation vector (2*K bytes) fits the 101,376 B per-block shared-memory
 limit, or when its weights are NVFP4 or NVFP4 weight-only and N is a multiple of 64 and K a multiple
-of 16; otherwise it SHALL be `planned`. Every prefill GEMM SHALL be `planned`.
+of 16; otherwise it SHALL be `planned`. Prefill GEMMs follow their own rule.
 
 #### Scenario: Shape too wide to stage
 - **WHEN** a config gives `down_proj` K = 65536 (131072 B of staged activations)
@@ -185,3 +185,38 @@ embedding row for every vocabulary index.
 #### Scenario: NaN and negative infinity
 - **WHEN** index 0 is NaN and every other logit is negative infinity
 - **THEN** index 1 wins
+
+### Requirement: BF16 prefill GEMMs are generated
+
+A prefill GEMM SHALL be `generated` when its linear's weights are BF16 and its tile divides N and K,
+and `planned` otherwise.
+
+#### Scenario: Prefill GEMMs by format
+- **WHEN** Llama 3.1 8B (BF16) and Qwen3-30B-A3B with NVFP4 weights are generated
+- **THEN** Llama's four `gemm_<linear>` entries are `generated` with source in `model.cu`, and every NVFP4 linear's GEMM is `planned` with no source
+
+### Requirement: The prefill GEMM computes A times W transposed with mma.sync
+
+`gemm_<linear>(A, W, C, M)` SHALL compute C[M][N] = A[M][K] · W[N][K]ᵀ in bf16 with f32 accumulation,
+N, K and the tile `constexpr` and the prompt length M an argument: a `cp.async` pipeline of the
+planned stages into 16-byte-padded shared memory, `ldmatrix`, `mma.sync m16n8k16`, tiles in the
+planned `group_n` order, rows past M zero-filled on load and not stored.
+
+#### Scenario: Ragged prompt
+- **WHEN** a GEMM runs with M 37 rows short of the planned length
+- **THEN** the rows below M match the reference and the rows past M are left as they were
+
+### Requirement: Prefill GEMMs launch through a checked host call
+
+`prefill::gemm` SHALL launch a generated prefill GEMM for M prompt rows with a grid of
+ceil(M / BM) x N / BN, after checking that A holds M x K elements, W exactly N x K, C M x N, A and W
+are 16-byte aligned and C 4-byte aligned. A launch with a larger grid, such as the manifest's for the
+planned M, SHALL leave its extra blocks idle.
+
+#### Scenario: Misaligned activations
+- **WHEN** A is a view one element past an aligned allocation
+- **THEN** `prefill::gemm` refuses it before launching
+
+#### Scenario: Manifest grid for a shorter prompt
+- **WHEN** a Llama GEMM is launched with the manifest's grid (for M = 2048) and M = 1024
+- **THEN** the output matches the reference and rows past 1024 are untouched (without the in-kernel exit, the same launch faulted with an illegal address)

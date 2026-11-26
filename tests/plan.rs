@@ -324,3 +324,105 @@ fn the_token_estimate_counts_the_shared_expert_activation() {
     // At 4096 wide no SiLU kernel fits the shared expert, so no estimate even with every timing.
     assert_eq!(token_estimate_us(&with_shared(4096), &rows("")), None);
 }
+
+#[test]
+fn prefill_plans_no_lm_head_gemm() {
+    // Prefill needs the last position's logits only, which the decode GEMV computes.
+    for c in ["configs/llama-3.1-8b.json", "configs/qwen3-30b-a3b.json"] {
+        let p = load(c);
+        assert!(!p.gemm.iter().any(|t| t.linear == "lm_head"), "{c}");
+        assert!(p.notes.iter().any(|n| n.contains("lm_head runs once")), "{c}");
+    }
+}
+
+#[test]
+fn prefill_tiles_price_the_row_pad_and_fit_shared_memory() {
+    for c in ["configs/llama-3.1-8b.json", "configs/qwen3-30b-a3b.json"] {
+        for t in &load(c).gemm {
+            assert_eq!(t.smem_bytes, t.stages * (t.bm + t.bn) * (t.bk + plan::GEMM_ROW_PAD) * 2, "{t:?}");
+            assert!(t.smem_bytes <= GB10.smem_per_block_optin, "{t:?}");
+            assert_eq!(t.warps, (t.bm / 64) * (t.bn / t.warp_n), "{t:?}");
+            assert_eq!(t.warp_n, if t.bn >= 256 { 64 } else { 32 }, "{t:?}");
+        }
+    }
+}
+
+#[test]
+fn prefill_tiles_walk_m_when_the_activations_fit_in_l2() {
+    // Llama's A is 2048 x 4096 x 2 = 16 MiB for every GEMM but down_proj (2048 x 14336, 56 MiB).
+    let p = load("configs/llama-3.1-8b.json");
+    for t in &p.gemm {
+        let fits = (t.m as u64 * t.k as u64 * 2) as f64 <= GB10.l2_bytes as f64 * 0.75;
+        assert_eq!(t.group_n == 1, fits, "{t:?}");
+        assert!(t.group_n >= 1 && t.group_n <= t.n / t.bn, "{t:?}");
+    }
+    let down = p.gemm.iter().find(|t| t.linear == "down_proj").unwrap();
+    assert!(down.group_n > 1, "{down:?}");
+    // The large shapes take 128x256 tiles of 64x64 warps.
+    let qkv = p.gemm.iter().find(|t| t.linear == "qkv_proj").unwrap();
+    assert_eq!((qkv.bm, qkv.bn, qkv.bk, qkv.stages, qkv.warp_n), (128, 256, 32, 3, 64), "{qkv:?}");
+}
+
+#[test]
+fn bf16_prefill_gemms_are_generated_and_quantized_ones_planned() {
+    let g = codegen::generate(&load("configs/llama-3.1-8b.json"));
+    for l in ["qkv_proj", "o_proj", "gate_up_proj", "down_proj"] {
+        let k = g.kernels.iter().find(|k| k.entry == format!("gemm_{l}")).unwrap();
+        assert_eq!((k.status, k.file.as_str()), ("generated", "model.cu"), "{k:?}");
+        assert!(g.files[0].1.contains(&format!("gemm_{l}(")), "{l}");
+        assert_eq!(k.args, vec!["A", "W", "C", "M"]);
+    }
+    // NVFP4 linears keep planned GEMM entries with no CUDA source.
+    let p = qwen3_nvfp4();
+    let g = codegen::generate(&p);
+    for t in &p.gemm {
+        let fmt = p.linears.iter().find(|l| l.name == t.linear).unwrap().format;
+        let k = g.kernels.iter().find(|k| k.entry == format!("gemm_{}", t.linear)).unwrap();
+        let bf16 = matches!(fmt, sparkforge::config::WeightFormat::Bf16);
+        assert_eq!(k.status == "generated", bf16, "{k:?}");
+        assert_eq!(g.files[0].1.contains(&format!("gemm_{}(", t.linear)), bf16, "{k:?}");
+    }
+}
+
+#[test]
+fn the_prefill_estimate_sums_layers_of_gemms_and_one_lm_head() {
+    use sparkforge::estimate::{prefill_estimate_us, Row};
+    let p = load("configs/llama-3.1-8b.json");
+    let us = [("gemm_qkv_proj", 1500.0), ("gemm_o_proj", 1000.0), ("gemm_gate_up_proj", 6700.0), ("gemm_down_proj", 3700.0), ("gemv_lm_head", 4400.0)];
+    let rows = |skip: &str| us.iter().filter(|(k, _)| *k != skip).map(|&(k, t)| Row { kernel: k.into(), case: String::new(), err: 0.0, us: Some(t), gbs: None }).collect::<Vec<_>>();
+    let (t, tokens) = prefill_estimate_us(&p, &rows("")).unwrap();
+    assert_eq!(tokens, 2048);
+    assert!((t - (32.0 * 12900.0 + 4400.0)).abs() < 1e-6, "{t}");
+    let e = prefill_estimate_us(&p, &rows("gemm_down_proj")).unwrap_err();
+    assert!(e.contains("gemm_down_proj"), "an untimed GEMM gives no estimate and names it: {e}");
+}
+
+#[test]
+fn a_bf16_shape_gets_a_tile_that_divides_it_when_one_exists() {
+    // N = 2 x 14400 = 28800: 128 divides it, 256 doesn't. The 128x256 tile scores higher, but only a
+    // dividing tile has a generated kernel.
+    let mut v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string("configs/llama-3.1-8b.json").unwrap()).unwrap();
+    v["intermediate_size"] = 14400.into();
+    let p = plan::build(&ModelSpec::from_json(&v.to_string(), None).unwrap(), &GB10, &plan::PlanOpts { prefill_tokens: 2048, ctx: 4096 });
+    let t = p.gemm.iter().find(|t| t.linear == "gate_up_proj").unwrap();
+    assert_eq!(t.n, 28800);
+    assert_eq!(t.n % t.bn, 0, "{t:?}");
+    let g = codegen::generate(&p);
+    assert_eq!(g.kernels.iter().find(|k| k.entry == "gemm_gate_up_proj").unwrap().status, "generated");
+}
+
+#[test]
+fn the_prefill_estimate_counts_a_shared_experts_gemms() {
+    use sparkforge::estimate::{prefill_estimate_us, Row};
+    let mut p = load("configs/qwen3-30b-a3b.json");
+    p.model.moe.as_mut().unwrap().shared_experts = 1;
+    let experts = p.model.moe.as_ref().unwrap().num_experts as f64;
+    let mut us = vec![("gemm_qkv_proj", 600.0), ("gemm_o_proj", 500.0), ("gemm_router", 40.0), ("gemm_expert_gate_up", 25.0), ("gemm_expert_down", 16.0), ("gemv_lm_head", 4000.0)];
+    let row = |&(k, t): &(&str, f64)| Row { kernel: k.into(), case: String::new(), err: 0.0, us: Some(t), gbs: None };
+    let e = prefill_estimate_us(&p, &us.iter().map(row).collect::<Vec<_>>()).unwrap_err();
+    assert!(e.contains("gemm_shared_gate_up"), "{e}");
+    us.extend([("gemm_shared_gate_up", 30.0), ("gemm_shared_down", 20.0)]);
+    let (t, _) = prefill_estimate_us(&p, &us.iter().map(row).collect::<Vec<_>>()).unwrap();
+    let layer = 600.0 + 500.0 + 40.0 + experts * (25.0 + 16.0) + 30.0 + 20.0;
+    assert!((t - (p.model.layers as f64 * layer + 4000.0)).abs() < 1e-6, "{t}");
+}

@@ -150,14 +150,16 @@
       "n": 5120,
       "k": 2048,
       "bm": 128,
-      "bn": 128,
+      "bn": 256,
       "bk": 32,
       "stages": 3,
       "warps": 8,
-      "smem_bytes": 49152,
+      "warp_n": 64,
+      "smem_bytes": 92160,
       "ctas_per_sm": 1,
       "wave_efficiency": 0.9523809523809523,
-      "score": 0.6734350297014738
+      "score": 0.8979133729352985,
+      "group_n": 1
     },
     {
       "linear": "o_proj",
@@ -165,14 +167,16 @@
       "n": 2048,
       "k": 4096,
       "bm": 128,
-      "bn": 128,
+      "bn": 256,
       "bk": 32,
       "stages": 3,
       "warps": 8,
-      "smem_bytes": 49152,
+      "warp_n": 64,
+      "smem_bytes": 92160,
       "ctas_per_sm": 1,
       "wave_efficiency": 0.8888888888888888,
-      "score": 0.6285393610547089
+      "score": 0.8380524814062785,
+      "group_n": 1
     },
     {
       "linear": "router",
@@ -181,28 +185,15 @@
       "k": 2048,
       "bm": 64,
       "bn": 64,
-      "bk": 64,
-      "stages": 3,
+      "bk": 32,
+      "stages": 4,
       "warps": 2,
-      "smem_bytes": 49152,
+      "warp_n": 32,
+      "smem_bytes": 40960,
       "ctas_per_sm": 2,
       "wave_efficiency": 0.6666666666666666,
-      "score": 0.3333333333333333
-    },
-    {
-      "linear": "lm_head",
-      "m": 2048,
-      "n": 151936,
-      "k": 2048,
-      "bm": 128,
-      "bn": 128,
-      "bk": 32,
-      "stages": 3,
-      "warps": 8,
-      "smem_bytes": 49152,
-      "ctas_per_sm": 1,
-      "wave_efficiency": 0.9991582491582491,
-      "score": 0.7065115734582761
+      "score": 0.3333333333333333,
+      "group_n": 1
     },
     {
       "linear": "expert_gate_up",
@@ -212,12 +203,14 @@
       "bm": 64,
       "bn": 64,
       "bk": 64,
-      "stages": 4,
+      "stages": 3,
       "warps": 2,
-      "smem_bytes": 65536,
+      "warp_n": 32,
+      "smem_bytes": 55296,
       "ctas_per_sm": 1,
       "wave_efficiency": 1.0,
-      "score": 0.3535533905932738
+      "score": 0.3535533905932738,
+      "group_n": 1
     },
     {
       "linear": "expert_down",
@@ -226,13 +219,15 @@
       "k": 768,
       "bm": 64,
       "bn": 64,
-      "bk": 64,
-      "stages": 3,
+      "bk": 32,
+      "stages": 4,
       "warps": 2,
-      "smem_bytes": 49152,
+      "warp_n": 32,
+      "smem_bytes": 40960,
       "ctas_per_sm": 2,
       "wave_efficiency": 0.6666666666666666,
-      "score": 0.3333333333333333
+      "score": 0.3333333333333333,
+      "group_n": 1
     }
   ],
   "attn": {
@@ -265,6 +260,7 @@
   },
   "notes": [
     "q/k per-head RMSNorm (q_norm/k_norm) is not generated yet: decode output is wrong for this model until it is",
+    "prefill: lm_head runs once, for the last prompt position, with gemv_lm_head (a 2048x151936 GEMM is not planned)",
     "MoE prefill: ~128 tokens/expert at 2048 prompt tokens -> grouped GEMM tiles chosen for that M"
   ]
 }
