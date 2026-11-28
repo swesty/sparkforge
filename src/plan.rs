@@ -744,8 +744,8 @@ const GEMM_BK: [u32; 2] = [32, 64];
 
 /// The best legal tile for `l`, preferring one whose BN divides N (the only kind the BF16 GEMM is
 /// generated for); a shape no BN divides still gets its best tile, which stays planned. `None` when
-/// no tile is legal, which on GB10 means no BK divides K; `build` then notes it instead of planning
-/// the GEMM.
+/// no tile is legal: no BK divides K, or (on a target smaller than GB10) no candidate fits its
+/// shared-memory, thread or register limits; `build` then notes which instead of planning the GEMM.
 fn plan_gemm(l: &Linear, m: u32, t: &Target) -> Option<GemmTile> {
     plan_gemm_where(l, m, t, true).or_else(|| plan_gemm_where(l, m, t, false))
 }
@@ -755,7 +755,11 @@ fn plan_gemms<'a>(ls: impl Iterator<Item = &'a Linear>, m: u32, t: &Target, note
     ls.filter_map(|l| {
         let tile = plan_gemm(l, m, t);
         if tile.is_none() {
-            notes.push(format!("prefill GEMM for {} is not planned: no legal tile for K={} (a tile's BK, {} or {}, must divide K); prefill for this model needs a K-tail GEMM", l.name, l.k, GEMM_BK[0], GEMM_BK[1]));
+            notes.push(if GEMM_BK.iter().any(|&bk| l.k.is_multiple_of(bk)) {
+                format!("prefill GEMM for {} is not planned: no tile for K={} fits {}'s shared-memory, thread and register limits", l.name, l.k, t.name)
+            } else {
+                format!("prefill GEMM for {} is not planned: no legal tile for K={} (a tile's BK, {} or {}, must divide K); prefill for this model needs a K-tail GEMM", l.name, l.k, GEMM_BK[0], GEMM_BK[1])
+            });
         }
         tile
     }).collect()

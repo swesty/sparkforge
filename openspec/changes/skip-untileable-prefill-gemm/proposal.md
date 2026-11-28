@@ -8,7 +8,7 @@ The code that reads the tiles already handles a missing one. `forward::Prefill::
 
 ## What Changes
 
-- A linear with no legal prefill tile gets no `GemmTile`. The planner adds a note that names the linear, its K and the BK rule, and plans everything else as before.
+- A linear with no legal prefill tile gets no `GemmTile`. The planner adds a note that names the linear and its K, and plans everything else as before. The note blames the BK rule (and calls for a K-tail GEMM) only when neither BK divides K; when the target's shared-memory, thread or register limits emptied the search, it says so instead.
 - A new kernel-planning requirement with two scenarios: K = 1000 is left unplanned with a note, and K = 1056 (a multiple of 32 but not 64) still plans with BK 32.
 - `cargo test` covers both scenarios in `tests/plan.rs`.
 

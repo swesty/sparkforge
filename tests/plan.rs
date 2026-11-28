@@ -482,3 +482,15 @@ fn a_k_no_tile_divides_leaves_that_prefill_gemm_unplanned_and_says_why() {
     let t = qwen3(1056).gemm.into_iter().find(|t| t.linear == "expert_down").expect("1056 tiles");
     assert_eq!((t.k, t.bk), (1056, 32), "{t:?}");
 }
+
+#[test]
+fn a_tile_search_emptied_by_target_limits_is_not_blamed_on_k() {
+    // BK 32 divides K = 1056, so when no tile fits a 16 KiB block (the smallest candidate, 64x64x32
+    // in 2 stages with row pads, is 20,480 B) the note blames the target's limits, not K.
+    let mut v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string("configs/qwen3-30b-a3b.json").unwrap()).unwrap();
+    v["moe_intermediate_size"] = 1056.into();
+    let small = sparkforge::target::Target { smem_per_block_optin: 16 * 1024, ..GB10 };
+    let p = plan::build(&ModelSpec::from_json(&v.to_string(), None).unwrap(), &small, &plan::PlanOpts { prefill_tokens: 2048, ctx: 4096 });
+    let note = p.notes.iter().find(|n| n.contains("prefill GEMM for expert_down")).expect("a note names the unplanned GEMM");
+    assert!(note.contains("K=1056") && note.contains("limits") && !note.contains("K-tail"), "{note}");
+}
