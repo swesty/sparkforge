@@ -160,16 +160,22 @@ fn generate(dir: &std::path::Path, prompt: &[u32], steps: usize, check: usize, t
     // Prefill chunks of the planned prompt length (the GEMM tiles' M), or less for shorter prompts.
     let planned = p.gemm.iter().find(|t| t.linear == "qkv_proj").map_or(2048, |t| t.m as usize);
     let chunk = planned.min(bench_prefill.iter().copied().chain([prompt.len()]).max().unwrap_or(1));
-    let rbytes = runtime_bytes(m, splits, capacity) + prefill_bytes(m, chunk);
-    // Before any CUDA call: every tensor plus the KV caches and activations.
+    // The host reference cache `--check` keeps for the whole prompt shares the same unified memory.
+    let check = check.min(steps);
+    let ref_bytes = sparkforge::reference::check_cache_bytes(m, prompt.len(), check);
+    let rbytes = runtime_bytes(m, splits, capacity) + prefill_bytes(m, chunk) + ref_bytes;
+    // Before any CUDA call: every tensor plus the KV caches, activations and reference cache.
     let admission = sparkforge::weights::admit_runtime(&ck, &b, rbytes)?;
     let e = sparkforge::runtime::Engine::load(&g, cuda_include)?;
     unsafe { e.ctx.disable_event_tracking() };
     // The legacy default stream cannot be captured into a graph.
     let s = e.ctx.new_stream()?;
     let dd = sparkforge::device_weights::upload_dense(&s, &ck, &b, m, &admission, rbytes)?;
-    let mut rt = Runtime::new(&s, Kernels::new(&g, &e)?, m, &dd, splits, capacity)?;
+    let mut rt = Runtime::new(&s, Kernels::new(&p, &g, &e)?, m, &dd, capacity)?;
     rt.enable_prefill(PrefillKernels::new(&p, &g, &e)?, chunk)?;
+    // Allocated, and made resident, while admission still holds the lock it was counted under.
+    let mut host_cache = KvCache::new(m, m.layers as usize, if check > 0 { prompt.len() + check } else { 1 });
+    host_cache.make_resident();
     s.synchronize()?;
     let mem_after = sparkforge::weights::mem_available();
     drop(admission);
@@ -177,15 +183,20 @@ fn generate(dir: &std::path::Path, prompt: &[u32], steps: usize, check: usize, t
         m.arch, m.layers, gib(dd.bytes_copied), dd.load_secs, capacity, gib(2 * m.layers as u64 * capacity as u64 * m.kv_dim() as u64 * 2),
         gib(dd.mem_available_before), mem_after.map_or("-".into(), |v| format!("{:.1} GiB", gib(v))));
     rt.capture()?;
+    if check > 0 {
+        println!("reference KV cache for --check: {:.1} MiB on the host, counted in admission", ref_bytes as f64 / (1u64 << 20) as f64);
+    }
     if let Some(d) = &dec {
         println!("prompt ({} tokens): {:?}", prompt.len(), d.decode(prompt));
+        let unknown = d.unknown(prompt);
+        if !unknown.is_empty() {
+            println!("warning: the tokenizer does not define prompt ids {unknown:?} (shown as <unknown token ID>); is it this model's?");
+        }
     }
     // The CPU reference streams the weights from the checkpoint; it runs every prompt position to
     // build its KV cache, and its logits are compared with the prefill's and then with the next
     // `check - 1` steps'.
     let cw = CheckpointWeights { ck: &ck, b: &b, m };
-    let check = check.min(steps);
-    let mut host_cache = KvCache::new(m, m.layers as usize, if check > 0 { prompt.len() + check } else { 1 });
     let (mut worst, mut agree) = (0f64, 0usize);
     // Compares the GPU's logits and greedy token from the step at `pos` with the reference's
     // logits `r` there.
@@ -239,6 +250,10 @@ fn generate(dir: &std::path::Path, prompt: &[u32], steps: usize, check: usize, t
     println!("output ids: {out:?}");
     if let Some(d) = &dec {
         println!("output: {:?}", d.decode(&out));
+        let unknown = d.unknown(&out);
+        if !unknown.is_empty() {
+            println!("warning: the tokenizer does not define output ids {unknown:?} (shown as <unknown token ID>); is it this model's?");
+        }
     }
     if check > 0 {
         println!("checked {check} position(s) against the CPU reference: worst logits error {worst:.2e}, greedy token matches the reference argmax in {agree}/{check}");
@@ -274,9 +289,11 @@ fn generate(dir: &std::path::Path, prompt: &[u32], steps: usize, check: usize, t
         }
         s.synchronize()?;
         let ms = t0.elapsed().as_secs_f64() * 1e3 / BENCH_STEPS as f64;
-        let ceiling = plan::build(&spec, &GB10, &plan::PlanOpts { prefill_tokens: 2048, ctx: c as u32 }).budget.decode_tok_s_ceiling;
-        println!("ctx {c}: {ms:.2} ms/token, {:.1} tok/s (planner ceiling {ceiling:.1}), {BENCH_STEPS} graph replays at positions {}..{} over a zeroed prefix",
-            1e3 / ms, c + 2, c + 2 + BENCH_STEPS);
+        // The timed steps are at positions c + 2 .. c + 2 + BENCH_STEPS, after the two warm-ups.
+        let (from, to) = (c + 2, c + 2 + BENCH_STEPS);
+        let ceiling = plan::decode_ceiling_over(&spec, &GB10, 2048, from, to);
+        println!("ctx {c}: {ms:.2} ms/token, {:.1} tok/s (planner ceiling {ceiling:.1} over the same positions), {BENCH_STEPS} graph replays at positions {from}..{to} over a zeroed prefix",
+            1e3 / ms);
     }
     anyhow::ensure!(worst < TOL, "logits differ from the CPU reference by {worst:.2e}, above tolerance {TOL:.4}");
     Ok(())

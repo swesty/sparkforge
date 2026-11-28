@@ -346,7 +346,6 @@ impl Ctx<'_> {
         let s = self.e.stream.clone();
         // The default stream cannot be captured; the graph runs on its own stream.
         let gs = self.e.ctx.new_stream()?;
-        let splits = self.p.attn.splits as usize;
         let prefix = 1000.min(m.max_pos as usize - 2);
         // Each case's cache has one spare slot, for the refused autonomous replay below.
         let cases = [("fresh".to_string(), 0usize, 4usize), (format!("prefix {prefix}"), prefix, 2)];
@@ -360,8 +359,8 @@ impl Ctx<'_> {
         for (name, start, steps) in cases {
             let mut cache = KvCache::new(m, STEP_LAYERS, start + steps + 1);
             cache.fill_random(m, start, &mut rng);
-            let mut plain = Runtime::from_host(&s, Kernels::new(self.g, self.e)?, m, &up, splits, &cache)?;
-            let mut graph = Runtime::from_host(&gs, Kernels::new(self.g, self.e)?, m, &up, splits, &cache)?;
+            let mut plain = Runtime::from_host(&s, Kernels::new(self.p, self.g, self.e)?, m, &up, &cache)?;
+            let mut graph = Runtime::from_host(&gs, Kernels::new(self.p, self.g, self.e)?, m, &up, &cache)?;
             gs.synchronize()?;
             graph.capture()?;
             // [L0 attn, L0 mlp, L1 attn, ..., logits]
@@ -410,6 +409,7 @@ impl Ctx<'_> {
     /// rewriting the cache past a row's position must not change that row. With `--bench`, TFLOP/s
     /// at 2048 and 8192.
     fn prefill_attention(&mut self) -> Result<()> {
+        // Not planned: nothing to check. Planned but missing: already failed in `run`.
         let (Some(pa), Some((k, f))) = (self.p.prefill_attn.clone(), kernel(self.g, self.e, "attn_prefill")) else { return Ok(()) };
         let s = self.e.stream.clone();
         let m = &self.p.model;
@@ -499,6 +499,32 @@ impl Ctx<'_> {
         let same = s.memcpy_dtov(&dout.slice(..(keep + 1) * heads * hd))? == before;
         self.push("attn_prefill", format!("causal: rows 0..={keep} of {len} {}", if same { "unchanged by later keys" } else { "CHANGED BY LATER KEYS" }),
             if same { 0.0 } else { f64::INFINITY }, None, 0.0);
+        // NaN past row `keep` (in V, then in K and V): a masked key's P is 0, and 0 x NaN is NaN, so
+        // rows 0..=keep must still be bitwise what they are with finite values there, and every later
+        // row, which attends a NaN value, must be NaN. Two rows (keep 0) is the smallest case.
+        let mut nan_ok = true;
+        let mut cases = vec![];
+        for (len, keep, k_too) in [(512.min(cap), 300.min(cap - 1), false), (512.min(cap), 300.min(cap - 1), true), (2.min(cap), 0, false)] {
+            if keep + 1 >= len {
+                continue;
+            }
+            launch(&dk, &dv, &mut dout, len, 0)?;
+            let before = s.memcpy_dtov(&dout.slice(..(keep + 1) * heads * hd))?;
+            let (mut k3, mut v3) = (kc.clone(), vc.clone());
+            v3[(keep + 1) * kvd..len * kvd].fill(0x7fc0);
+            if k_too {
+                k3[(keep + 1) * kvd..len * kvd].fill(0x7fc0);
+            }
+            let (dk3, dv3) = (s.memcpy_stod(&k3)?, s.memcpy_stod(&v3)?);
+            launch(&dk3, &dv3, &mut dout, len, 0)?;
+            let out = s.memcpy_dtov(&dout.slice(..len * heads * hd))?;
+            let (head, tail) = out.split_at((keep + 1) * heads * hd);
+            let ok = head == before.as_slice() && tail.iter().all(|&x| bf2f(x).is_nan());
+            nan_ok &= ok;
+            cases.push(format!("{len}/{keep}{}", if k_too { " K+V" } else { "" }));
+        }
+        self.push("attn_prefill", format!("NaN past row (rows/keep {}): {}", cases.join(", "), if nan_ok { "earlier rows bitwise, later rows NaN" } else { "NaN REACHED AN EARLIER ROW OR WAS LOST" }),
+            if nan_ok { 0.0 } else { f64::INFINITY }, None, 0.0);
         Ok(())
     }
 
@@ -514,12 +540,20 @@ impl Ctx<'_> {
         use crate::forward::{Kernels, PrefillKernels, Runtime, UploadedWeights};
         use crate::reference::DenseWeights;
         let m = &self.p.model;
-        if crate::reference::require_dense(m).is_err() || PrefillKernels::new(self.p, self.g, self.e).is_err() {
+        // Skipped for a plan without dense prefill, or one whose prefill kernels are planned but not
+        // generated yet (listed as skipped). A planned kernel missing from the manifest already failed
+        // in `run`; any other reason `PrefillKernels` refuses the bundle fails here.
+        let not_generated = crate::forward::PREFILL_KERNELS.iter().any(|n| self.g.kernels.iter().any(|k| k.entry == *n && k.status != "generated"));
+        if crate::reference::require_dense(m).is_err() || self.p.prefill_attn.is_none() || not_generated
+            || !crate::codegen::missing_prefill_kernels(self.p, self.g).is_empty() {
+            return Ok(());
+        }
+        if let Err(e) = PrefillKernels::new(self.p, self.g, self.e) {
+            self.push("prefill step", format!("BUNDLE REFUSED: {e}"), f64::INFINITY, None, 0.0);
             return Ok(());
         }
         let s = self.e.stream.clone();
         let gs = self.e.ctx.new_stream()?;
-        let splits = self.p.attn.splits as usize;
         // Every embedding row: the graph replay after the prefill looks up its greedy token, which
         // can be any vocabulary index.
         let (prompt, rows_emb) = (100usize, m.vocab as usize);
@@ -533,7 +567,17 @@ impl Ctx<'_> {
         let to_f32v = |v: &[u16]| v.iter().map(|&x| bf2f(x)).collect::<Vec<f32>>();
         let to_f64v = |v: &[u16]| v.iter().map(|&x| bf2f(x) as f64).collect::<Vec<f64>>();
         // The token-by-token reference: one decode step per prompt position.
-        let mut dec = Runtime::new(&s, Kernels::new(self.g, self.e)?, m, &up, splits, prompt + 1)?;
+        // Kernels generated for another model with the same fused projection widths (half the heads,
+        // twice the head dimension), which the GEMM size checks alone can't tell apart, are refused
+        // before anything is allocated or written.
+        let mut other = self.p.clone();
+        (other.model.heads, other.model.kv_heads, other.model.head_dim) = (m.heads / 2, (m.kv_heads / 2).max(1), m.head_dim * 2);
+        let foreign_decode = Runtime::new(&s, Kernels::new(&other, self.g, self.e)?, m, &up, 1).is_err();
+        let foreign_prefill = Runtime::new(&s, Kernels::new(self.p, self.g, self.e)?, m, &up, 1)?.enable_prefill(PrefillKernels::new(&other, self.g, self.e)?, 8).is_err();
+        let foreign = foreign_decode && foreign_prefill;
+        self.push("prefill step", format!("kernels for {}x{} heads: {}", other.model.heads, other.model.head_dim, if foreign { "refused" } else { "ACCEPTED" }),
+            if foreign { 0.0 } else { f64::INFINITY }, None, 0.0);
+        let mut dec = Runtime::new(&s, Kernels::new(self.p, self.g, self.e)?, m, &up, prompt + 1)?;
         for (pos, &t) in tokens.iter().enumerate() {
             dec.set(pos, t as usize)?;
             dec.step()?;
@@ -542,7 +586,7 @@ impl Ctx<'_> {
         let dec_kv: Vec<(Vec<u16>, Vec<u16>)> = (0..STEP_LAYERS).map(|l| dec.kv(l, prompt)).collect::<Result<_>>()?;
         let mut first: Option<Vec<u16>> = None;
         for chunk in [128usize, 48] {
-            let mut pre = Runtime::new(&gs, Kernels::new(self.g, self.e)?, m, &up, splits, prompt + 1)?;
+            let mut pre = Runtime::new(&gs, Kernels::new(self.p, self.g, self.e)?, m, &up, prompt + 1)?;
             pre.enable_prefill(PrefillKernels::new(self.p, self.g, self.e)?, chunk)?;
             gs.synchronize()?;
             pre.capture()?;
@@ -755,13 +799,18 @@ impl Ctx<'_> {
 
     /// Every generated prefill GEMM against an f64 reference, at the planned M and at a ragged M
     /// (37 rows fewer), on 8 sampled rows across all columns and on every row across 16 sampled
-    /// columns, so each warp and lane mapping is covered; rows past M must stay untouched. With
-    /// `--bench`, TFLOP/s at the planned M.
+    /// columns, so each warp and lane mapping is covered; rows past M must stay untouched. A
+    /// misaligned A of one row is refused by the alignment check. The largest GEMM also runs with
+    /// cudarc's event tracking on, and a download on another stream with no synchronize must see its
+    /// finished output. With `--bench`, TFLOP/s at the planned M.
     fn gemms(&mut self) -> Result<()> {
         let s = self.e.stream.clone();
+        let largest = self.p.gemm.iter().filter(|t| kernel(self.g, self.e, &format!("gemm_{}", t.linear)).is_some()).max_by_key(|t| t.n as u64 * t.k as u64).map(|t| t.linear.clone());
         for t in self.p.gemm.clone() {
             let entry = format!("gemm_{}", t.linear);
+            // A planned GEMM missing from the manifest already failed in `run`.
             let Some((k, f)) = kernel(self.g, self.e, &entry) else { continue };
+            let gm = crate::prefill::Gemm::new(self.p, self.g, self.e, &t.linear)?;
             let (m, n, kk, bm, bn) = (t.m as usize, t.n as usize, t.k as usize, t.bm as usize, t.bn as usize);
             let a = self.rng.bf16(m * kk);
             let w = self.rng.bf16(n * kk);
@@ -777,7 +826,7 @@ impl Ctx<'_> {
                     let m32 = mr as i32;
                     unsafe { s.launch_builder(f).arg(&da).arg(&dw).arg(&mut dc).arg(&m32).launch(cfg(k.grid, k.block, k.dyn_smem))? };
                 } else {
-                    crate::prefill::gemm(&s, &t, k, f, &da.slice(..), &dw.slice(..), &mut dc.slice_mut(..), mr)?;
+                    crate::prefill::gemm(&s, &gm, &da.slice(..), &dw.slice(..), &mut dc.slice_mut(..), mr)?;
                 }
                 let c = s.memcpy_dtov(&dc)?;
                 untouched &= c[mr * n..].iter().all(|&v| v == 0xffff);
@@ -799,12 +848,37 @@ impl Ctx<'_> {
                     err = err.max(max_err(&got, &want));
                 }
             }
-            // An A view one element (2 bytes) past an aligned base is refused before launch.
+            // One row of A one element (2 bytes) past an aligned base, with room for the row, is refused
+            // by the A alignment check (not by the row count or a length), whatever the planned M.
             let refused = {
-                let mut dc = s.alloc_zeros::<u16>(m * n)?;
-                crate::prefill::gemm(&s, &t, k, f, &da.slice(1..), &dw.slice(..), &mut dc.slice_mut(..), m - 1).is_err()
+                let probe = s.alloc_zeros::<u16>(2 * kk)?;
+                let mut dc = s.alloc_zeros::<u16>(n)?;
+                crate::prefill::gemm(&s, &gm, &probe.slice(1..), &dw.slice(..), &mut dc.slice_mut(..), 1)
+                    .is_err_and(|e| e.to_string().starts_with("A at ") && e.to_string().contains("16-byte aligned"))
             };
-            if !untouched || !refused {
+            // Event tracking is off for the rest of `verify` (one stream); it is on only for these
+            // buffers, allocated while it is.
+            let tracked = if largest.as_deref() == Some(t.linear.as_str()) {
+                unsafe { self.e.ctx.enable_event_tracking() };
+                let r = (|| -> Result<bool> {
+                    let (s1, s2) = (self.e.ctx.new_stream()?, self.e.ctx.new_stream()?);
+                    let (ta, tw) = (s1.memcpy_stod(&a)?, s1.memcpy_stod(&w)?);
+                    let mut tc = s1.memcpy_stod(&vec![0xffffu16; m * n])?;
+                    let mut copy = s2.alloc_zeros::<u16>(m * n)?;
+                    s2.synchronize()?;
+                    crate::prefill::gemm(&s1, &gm, &ta.slice(..), &tw.slice(..), &mut tc.slice_mut(..), m)?;
+                    // A device-to-device copy on the second stream, queued at once: it runs while the
+                    // GEMM does unless it waits for the GEMM's recorded write.
+                    s2.memcpy_dtod(&tc, &mut copy)?;
+                    let early = s2.memcpy_dtov(&copy)?;
+                    s1.synchronize()?;
+                    let late = s1.memcpy_dtov(&tc)?;
+                    Ok(early == late && late.iter().any(|&v| v != 0xffff))
+                })();
+                unsafe { self.e.ctx.disable_event_tracking() };
+                Some(r?)
+            } else { None };
+            if !untouched || !refused || tracked == Some(false) {
                 err = f64::INFINITY;
             }
             let flop = 2.0 * (m * n * kk) as f64;
@@ -817,7 +891,8 @@ impl Ctx<'_> {
                 })?)
             } else { None };
             let tf = us.map_or(String::new(), |u| format!(", {:.1} TFLOP/s", flop / (u * 1e-6) / 1e12));
-            let case = format!("{m}x{n}x{kk}{}{}{tf}", if untouched { "" } else { ", ROWS PAST M WRITTEN" }, if refused { "" } else { ", MISALIGNED A LAUNCHED" });
+            let stream2 = match tracked { None => "", Some(true) => ", 2nd stream waits", Some(false) => ", 2ND STREAM READ STALE OUTPUT" };
+            let case = format!("{m}x{n}x{kk}{}{}{stream2}{tf}", if untouched { "" } else { ", ROWS PAST M WRITTEN" }, if refused { "" } else { ", MISALIGNED A NOT REFUSED BY ITS CHECK" });
             self.push(&entry, case, err, us, ((m * kk + n * kk + m * n) * 2) as f64);
         }
         Ok(())
@@ -886,6 +961,11 @@ pub fn run(p: &Plan, g: &Generated, e: &Engine, o: &Opts) -> Result<Vec<Row>> {
     // One stream, no cross-stream hazards: skip cudarc's per-argument event bookkeeping.
     unsafe { e.ctx.disable_event_tracking() };
     let mut c = Ctx { p, g, e, o, rng: Rng(o.seed | 1), rows: vec![] };
+    // A prefill kernel the plan schedules but the manifest lacks would otherwise be skipped silently,
+    // while `generate` needs it.
+    for name in crate::codegen::missing_prefill_kernels(p, g) {
+        c.push(&name, "planned, but missing from the manifest".into(), f64::INFINITY, None, 0.0);
+    }
     c.rmsnorm().context("rmsnorm")?;
     c.rope().context("rope_kv_append")?;
     c.attention().context("attention")?;

@@ -133,6 +133,18 @@ impl KvCache {
         let n = capacity * m.kv_dim() as usize;
         Self { k: vec![vec![0; n]; layers], v: vec![vec![0; n]; layers], capacity }
     }
+    /// Writes one element of every 4 KiB page of every buffer, so the whole cache is resident (and
+    /// counted by `MemAvailable`) now rather than when a later step first touches it: zeroed
+    /// allocations are mapped lazily.
+    pub fn make_resident(&mut self) {
+        for c in self.k.iter_mut().chain(self.v.iter_mut()) {
+            let p = c.as_mut_ptr();
+            for i in (0..c.len()).step_by(2048) {
+                // SAFETY: i < c.len(), and `p` is the start of `c`'s live buffer.
+                unsafe { std::ptr::write_volatile(p.add(i), 0) };
+            }
+        }
+    }
     /// Fills positions `0..len` of every layer with random bf16 in [-1, 1), standing in for a prompt.
     pub fn fill_random(&mut self, m: &ModelSpec, len: usize, rng: &mut Rng) {
         let n = len * m.kv_dim() as usize;
@@ -140,6 +152,17 @@ impl KvCache {
             c[..n].copy_from_slice(&rng.bf16(n));
         }
     }
+}
+
+/// Bytes of a `KvCache::new(m, layers, capacity)`.
+pub fn kv_cache_bytes(m: &ModelSpec, layers: usize, capacity: usize) -> u64 {
+    2 * layers as u64 * capacity as u64 * m.kv_dim() as u64 * 2
+}
+
+/// Bytes of the host reference KV cache `generate --check N` keeps for a prompt of `prompt` tokens:
+/// every layer, the prompt plus the N checked steps (one position when nothing is checked).
+pub fn check_cache_bytes(m: &ModelSpec, prompt: usize, check: usize) -> u64 {
+    kv_cache_bytes(m, m.layers as usize, if check > 0 { prompt + check } else { 1 })
 }
 
 fn len(what: String, got: usize, want: usize) -> Result<()> {
@@ -296,11 +319,14 @@ impl Weights for CheckpointWeights<'_> {
     fn embed_rows(&self) -> usize {
         self.m.vocab as usize
     }
-    /// Every bound linear, norm and the embedding must have the shape `m` needs, whatever model the
+    /// The reads index with `self.m`, so it must have the dimensions of `m`, the step's model; then
+    /// every bound linear, norm and the embedding must have the shape `m` needs, whatever model the
     /// checkpoint was bound for.
     fn check(&self, m: &ModelSpec) -> Result<()> {
         let (h, inter, q, qkv) = (m.hidden as usize, m.intermediate as usize, m.q_dim() as usize, m.qkv_dim() as usize);
-        ensure!(m.layers == self.m.layers, "the checkpoint was bound for {} layers, the model has {}", self.m.layers, m.layers);
+        let dims = |m: &ModelSpec| [m.hidden, m.intermediate, m.layers, m.heads, m.kv_heads, m.head_dim, m.vocab];
+        ensure!(dims(self.m) == dims(m), "the checkpoint weights read with a model of {:?}, the step's model is {:?} (hidden, intermediate, layers, heads, kv_heads, head_dim, vocab)",
+            dims(self.m), dims(m));
         for l in 0..m.layers as usize {
             for (lin, n, k) in [(Linear::Qkv(l), qkv, h), (Linear::O(l), h, q), (Linear::GateUp(l), 2 * inter, h), (Linear::Down(l), h, inter)] {
                 let b = self.linear(lin)?;

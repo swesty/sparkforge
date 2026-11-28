@@ -831,7 +831,9 @@ fn plan_prefill_attn(m: &ModelSpec, t: &Target, tokens: u32) -> Option<PrefillAt
     for &bm in &[64u32, 128] {
         for &bn in &[32u32, 64, 128] {
             for &stages in &[2u32, 3] {
-                let smem = (bm * lds).max(2 * stages * bn * lds) * 2;
+                // The Q tile and the K/V stages share one region; then one int per head dimension
+                // (the first key whose V value there isn't finite, for the NaN guard).
+                let smem = (bm * lds).max(2 * stages * bn * lds) * 2 + hd * 4;
                 let warps = bm / 16;
                 let threads = warps * t.warp_size;
                 let regs = prefill_attn_regs(hd, bn);
@@ -980,4 +982,13 @@ pub fn build(m: &ModelSpec, t: &Target, o: &PlanOpts) -> Plan {
         ops,
         notes,
     }
+}
+
+/// The decode ceiling (tokens/s) over steps at positions `from..to`, where the step at position p
+/// reads p + 1 cache positions: the harmonic mean of each step's ceiling, which is what the mean
+/// time of those steps measures. Panics on an empty span.
+pub fn decode_ceiling_over(m: &ModelSpec, t: &Target, prefill_tokens: u32, from: usize, to: usize) -> f64 {
+    assert!(from < to, "an empty span of positions {from}..{to}");
+    let secs: f64 = (from..to).map(|p| 1.0 / build(m, t, &PlanOpts { prefill_tokens, ctx: (p + 1) as u32 }).budget.decode_tok_s_ceiling).sum();
+    (to - from) as f64 / secs
 }

@@ -70,9 +70,28 @@ impl Decoder {
         self.tokens.is_empty()
     }
 
-    /// The text of `ids`, invalid UTF-8 (a token boundary inside a character) shown as U+FFFD.
+    /// The text of `ids`, invalid UTF-8 (a token boundary inside a character) shown as U+FFFD. An
+    /// id the file doesn't define shows as `<unknown token ID>`, so a mismatched tokenizer can't
+    /// print plausible but incomplete text.
     pub fn decode(&self, ids: &[u32]) -> String {
-        let bytes: Vec<u8> = ids.iter().flat_map(|i| self.tokens.get(i).cloned().unwrap_or_default()).collect();
+        let mut bytes = vec![];
+        for i in ids {
+            match self.tokens.get(i) {
+                Some(b) => bytes.extend_from_slice(b),
+                None => bytes.extend_from_slice(format!("<unknown token {i}>").as_bytes()),
+            }
+        }
         String::from_utf8_lossy(&bytes).into_owned()
+    }
+
+    /// The ids in `ids` the file doesn't define, in order of first appearance.
+    pub fn unknown(&self, ids: &[u32]) -> Vec<u32> {
+        let mut out: Vec<u32> = vec![];
+        for &i in ids {
+            if !self.tokens.contains_key(&i) && !out.contains(&i) {
+                out.push(i);
+            }
+        }
+        out
     }
 }

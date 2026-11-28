@@ -12,14 +12,15 @@
 //! split attention; it fills the KV cache and leaves the token and position where the next step
 //! expects them, so the captured graph continues decoding from the prompt.
 use crate::codegen::{Generated, KernelEntry};
-use crate::plan::{GemmTile, Plan};
-use crate::prefill::{gemm_at, Buf};
+use crate::cursor::Cursor;
+use crate::plan::Plan;
+use crate::prefill::{gemm_raw, Buf, Gemm};
 use crate::config::ModelSpec;
 use crate::reference::{DenseWeights, KvCache};
 use crate::runtime::Engine;
 use anyhow::{ensure, Context, Result};
 use cudarc::driver::sys::{CUgraphInstantiate_flags, CUstreamCaptureMode};
-use cudarc::driver::{CudaFunction, CudaGraph, CudaSlice, CudaStream, DevicePtr, LaunchConfig, PushKernelArg};
+use cudarc::driver::{CudaContext, CudaFunction, CudaGraph, CudaSlice, CudaStream, DevicePtr, LaunchConfig, PushKernelArg};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -41,11 +42,32 @@ impl Kernel<'_> {
     }
 }
 
-pub struct Kernels<'a>(HashMap<&'static str, Kernel<'a>>);
+/// True when two specs describe the same model: generated kernels are specialized on every field
+/// (head layout, widths, RoPE), so a runtime only accepts kernels generated for its own model.
+fn same_model(a: &ModelSpec, b: &ModelSpec) -> bool {
+    std::ptr::eq(a, b) || matches!((serde_json::to_value(a), serde_json::to_value(b)), (Ok(x), Ok(y)) if x == y)
+}
+
+/// Fails unless kernels generated for `kernels_for` and loaded in `ctx` can run for `m` on `s`.
+fn check_binding(what: &str, kernels_for: &ModelSpec, ctx: &Arc<CudaContext>, m: &ModelSpec, s: &CudaStream) -> Result<()> {
+    ensure!(same_model(kernels_for, m), "{what} were generated for {} ({} heads, {} kv heads, head_dim {}, hidden {}), not this runtime's {} ({} heads, {} kv heads, head_dim {}, hidden {})",
+        kernels_for.arch, kernels_for.heads, kernels_for.kv_heads, kernels_for.head_dim, kernels_for.hidden, m.arch, m.heads, m.kv_heads, m.head_dim, m.hidden);
+    ensure!(Arc::ptr_eq(ctx, s.context()), "{what} were loaded in another CUDA context than the runtime's stream");
+    Ok(())
+}
+
+/// The dense decode step's kernels, bound to the model they were generated for and the context they
+/// were loaded in.
+pub struct Kernels<'a> {
+    map: HashMap<&'static str, Kernel<'a>>,
+    model: &'a ModelSpec,
+    ctx: &'a Arc<CudaContext>,
+}
 
 impl<'a> Kernels<'a> {
-    /// Looks up every kernel in `KERNELS`; fails naming the ones that were not generated.
-    pub fn new(g: &'a Generated, e: &'a Engine) -> Result<Self> {
+    /// Looks up every kernel in `KERNELS` for `p`'s model; fails naming the ones that were not
+    /// generated.
+    pub fn new(p: &'a Plan, g: &'a Generated, e: &'a Engine) -> Result<Self> {
         let mut map = HashMap::new();
         let mut missing = vec![];
         for name in KERNELS {
@@ -57,21 +79,29 @@ impl<'a> Kernels<'a> {
             }
         }
         ensure!(missing.is_empty(), "the dense decode step needs kernels that were not generated: {}", missing.join(", "));
-        Ok(Self(map))
+        Ok(Self { map, model: &p.model, ctx: &e.ctx })
     }
     fn get(&self, name: &str) -> &Kernel<'a> {
-        &self.0[name]
+        &self.map[name]
+    }
+    /// Splits the generated `attn_decode_split` was compiled for (its grid is kv heads x splits),
+    /// which size its scratch: taken from the kernel, never from the caller.
+    pub fn splits(&self) -> usize {
+        self.get("attn_decode_split").entry.grid[1] as usize
     }
 }
 
 /// Every prefill-only kernel: the prefill GEMMs (with their tiles) and `attn_prefill`.
 pub const PREFILL_KERNELS: [&str; 5] = ["gemm_qkv_proj", "gemm_o_proj", "gemm_gate_up_proj", "gemm_down_proj", "attn_prefill"];
 
-/// The prefill GEMMs and attention of a dense plan, each with its plan entry.
+/// The prefill GEMMs and attention of a dense plan, each with its plan entry, bound to the model
+/// they were generated for and the context they were loaded in.
 pub struct PrefillKernels<'a> {
-    gemm: HashMap<&'static str, (&'a GemmTile, Kernel<'a>)>,
+    gemm: HashMap<&'static str, Gemm<'a>>,
     attn: Kernel<'a>,
     block_m: u32,
+    model: &'a ModelSpec,
+    ctx: &'a Arc<CudaContext>,
 }
 
 impl<'a> PrefillKernels<'a> {
@@ -85,17 +115,16 @@ impl<'a> PrefillKernels<'a> {
         let mut gemm = HashMap::new();
         let mut missing = vec![];
         for name in &PREFILL_KERNELS[..4] {
-            let tile = p.gemm.iter().find(|t| format!("gemm_{}", t.linear) == *name);
-            match (tile, found(name)) {
-                (Some(t), Some(k)) => { gemm.insert(*name, (t, k)); }
-                _ => missing.push(*name),
+            match Gemm::new(p, g, e, &name["gemm_".len()..]) {
+                Ok(k) => { gemm.insert(*name, k); }
+                Err(_) => missing.push(*name),
             }
         }
         let attn = found("attn_prefill");
         let pa = p.prefill_attn.as_ref();
         if attn.is_none() || pa.is_none() { missing.push("attn_prefill"); }
         ensure!(missing.is_empty(), "prefill needs kernels that were not generated: {}", missing.join(", "));
-        Ok(Self { gemm, attn: attn.expect("checked"), block_m: pa.expect("checked").block_m })
+        Ok(Self { gemm, attn: attn.expect("checked"), block_m: pa.expect("checked").block_m, model: &p.model, ctx: &e.ctx })
     }
 }
 
@@ -213,12 +242,8 @@ pub struct Runtime<'a> {
     k: Kernels<'a>,
     m: &'a ModelSpec,
     w: &'a WeightPtrs,
-    capacity: usize,
-    /// Host copy of the device position: every step is checked against `capacity` before launch.
-    pos: usize,
-    /// The next step's token was set by the host (and checked against the embedding rows), not
-    /// written by the previous step's `argmax_advance`.
-    host_token: bool,
+    /// Host copy of the device position and token state: every step is checked before launch.
+    cur: Cursor,
     k_cache: Vec<CudaSlice<u16>>,
     v_cache: Vec<CudaSlice<u16>>,
     d_pos: CudaSlice<i32>,
@@ -239,7 +264,8 @@ pub struct Runtime<'a> {
     prefill: Option<PrefillBufs<'a>>,
 }
 
-/// Bytes a `Runtime` allocates besides the weights: KV caches, activations and token state.
+/// Bytes a `Runtime` allocates besides the weights: KV caches, activations and token state, with
+/// `splits` the generated decode attention's (`Kernels::splits`, the plan's `attn.splits`).
 pub fn runtime_bytes(m: &ModelSpec, splits: usize, capacity: usize) -> u64 {
     let (h, inter, q, qkv, kv) = (m.hidden as u64, m.intermediate as u64, m.q_dim() as u64, m.qkv_dim() as u64, m.kv_dim() as u64);
     let kv_bytes = 2 * m.layers as u64 * capacity as u64 * kv * 2;
@@ -249,30 +275,32 @@ pub fn runtime_bytes(m: &ModelSpec, splits: usize, capacity: usize) -> u64 {
 }
 
 impl<'a> Runtime<'a> {
-    /// Zeroed KV caches of `capacity` positions for every layer of `w`.
-    pub fn new(s: &Arc<CudaStream>, k: Kernels<'a>, m: &'a ModelSpec, w: &'a impl DeviceWeights, splits: usize, capacity: usize) -> Result<Self> {
+    /// Zeroed KV caches of `capacity` positions for every layer of `w`. `k` must be generated for
+    /// `m` and loaded in `s`'s context; the attention scratch is sized from its compiled splits.
+    pub fn new(s: &Arc<CudaStream>, k: Kernels<'a>, m: &'a ModelSpec, w: &'a impl DeviceWeights, capacity: usize) -> Result<Self> {
+        check_binding("the decode kernels", k.model, k.ctx, m, s)?;
         let w = w.weight_ptrs();
         let n = capacity * m.kv_dim() as usize;
         let layers = w.layers.len();
         let k_cache = (0..layers).map(|_| s.alloc_zeros::<u16>(n)).collect::<Result<Vec<_>, _>>()?;
         let v_cache = (0..layers).map(|_| s.alloc_zeros::<u16>(n)).collect::<Result<Vec<_>, _>>()?;
-        Self::with_caches(s, k, m, w, splits, capacity, k_cache, v_cache)
+        Self::with_caches(s, k, m, w, capacity, k_cache, v_cache)
     }
 
     /// KV caches copied from a host cache (for example a random prefix), checked first.
-    pub fn from_host(s: &Arc<CudaStream>, k: Kernels<'a>, m: &'a ModelSpec, w: &'a impl DeviceWeights, splits: usize, cache: &KvCache) -> Result<Self> {
+    pub fn from_host(s: &Arc<CudaStream>, k: Kernels<'a>, m: &'a ModelSpec, w: &'a impl DeviceWeights, cache: &KvCache) -> Result<Self> {
+        check_binding("the decode kernels", k.model, k.ctx, m, s)?;
         let w = w.weight_ptrs();
         crate::reference::check_cache(m, w.layers.len(), cache)?;
         let k_cache = cache.k.iter().map(|c| s.memcpy_stod(c)).collect::<Result<Vec<_>, _>>()?;
         let v_cache = cache.v.iter().map(|c| s.memcpy_stod(c)).collect::<Result<Vec<_>, _>>()?;
-        Self::with_caches(s, k, m, w, splits, cache.capacity, k_cache, v_cache)
+        Self::with_caches(s, k, m, w, cache.capacity, k_cache, v_cache)
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn with_caches(s: &Arc<CudaStream>, k: Kernels<'a>, m: &'a ModelSpec, w: &'a WeightPtrs, splits: usize, capacity: usize,
+    fn with_caches(s: &Arc<CudaStream>, k: Kernels<'a>, m: &'a ModelSpec, w: &'a WeightPtrs, capacity: usize,
         k_cache: Vec<CudaSlice<u16>>, v_cache: Vec<CudaSlice<u16>>) -> Result<Self> {
         let (h, inter, q, qkv) = (m.hidden as usize, m.intermediate as usize, m.q_dim() as usize, m.qkv_dim() as usize);
-        let heads = m.heads as usize;
+        let (heads, splits) = (m.heads as usize, k.splits());
         ensure!(capacity > 0, "a KV cache of zero positions");
         ensure!(!w.layers.is_empty(), "no layers to run");
         Ok(Self {
@@ -281,9 +309,7 @@ impl<'a> Runtime<'a> {
             k,
             m,
             w,
-            capacity,
-            pos: 0,
-            host_token: false,
+            cur: Cursor::new(capacity),
             k_cache,
             v_cache,
             d_pos: s.alloc_zeros(1)?,
@@ -305,7 +331,10 @@ impl<'a> Runtime<'a> {
     }
 
     /// Allocates prefill activations for chunks of up to `rows` prompt tokens (`prefill_bytes`).
+    /// `k` must be generated for this runtime's model and loaded in its stream's context: the
+    /// attention launch runs one block per query head of this model against code compiled for `k`'s.
     pub fn enable_prefill(&mut self, k: PrefillKernels<'a>, rows: usize) -> Result<()> {
+        check_binding("the prefill kernels", k.model, k.ctx, self.m, &self.s)?;
         // grid.y carries the row of the row-wise kernels.
         ensure!((1..=65_535).contains(&rows), "a prefill chunk of {rows} rows (1 to 65535)");
         let m = self.m;
@@ -335,10 +364,13 @@ impl<'a> Runtime<'a> {
         let rows = self.prefill.as_ref().map(|p| p.rows).context("prefill was not enabled")?;
         ensure!(!tokens.is_empty(), "an empty prompt");
         let end = start.checked_add(tokens.len()).context("prompt positions overflow")?;
-        ensure!(end <= self.capacity, "positions {start}..{end} are past the cache capacity {}", self.capacity);
+        let capacity = self.cur.capacity();
+        ensure!(end <= capacity, "positions {start}..{end} are past the cache capacity {capacity}");
         ensure!(end <= i32::MAX as usize, "positions {start}..{end} overflow the kernels' int positions");
         let rows_m = self.w.embed_rows;
         ensure!(tokens.iter().all(|&t| (t as usize) < rows_m), "a prompt token is past the {rows_m} embedding rows");
+        // Every launch below writes the device position; until the last one succeeds it is unknown.
+        self.cur.begin();
         for (i, chunk) in tokens.chunks(rows).enumerate() {
             self.prefill_chunk(chunk, start + i * rows)?;
         }
@@ -356,8 +388,7 @@ impl<'a> Runtime<'a> {
             self.s.launch_builder(g_lm.func).arg(&self.w.lm_head).arg(&self.xn).arg(&mut self.logits).launch(g_lm.cfg())?;
             self.s.launch_builder(argmax.func).arg(&self.logits).arg(&mut self.d_token).arg(&mut self.out).arg(&mut self.d_pos).launch(argmax.cfg())?;
         }
-        self.pos = end;
-        self.host_token = false;
+        self.cur.finish_at(end);
         Ok(())
     }
 
@@ -382,8 +413,11 @@ impl<'a> Runtime<'a> {
         let at = |x: &CudaSlice<u16>| Buf { ptr: addr(&s, x), len: x.len() };
         let (bx, bxn, bqkv, batt, bo, bgu, bact, bdown) = (at(&pb.x), at(&pb.xn), at(&pb.qkv), at(&pb.att), at(&pb.o), at(&pb.gate_up), at(&pb.act), at(&pb.down));
         let gemm = |name: &str, a: Buf, wp: u64, c: Buf| -> Result<()> {
-            let (t, kn) = &pb.k.gemm[name];
-            gemm_at(&s, t, kn.entry, kn.func, a, Buf { ptr: wp, len: (t.n * t.k) as usize }, c, n)
+            let gm = &pb.k.gemm[name];
+            let t = gm.tile();
+            // SAFETY: the activations are this runtime's own buffers and the weights belong to the
+            // `DeviceWeights` it borrows for its whole life; every launch is on `s`, in order.
+            unsafe { gemm_raw(&s, gm, a, Buf { ptr: wp, len: (t.n * t.k) as usize }, c, n) }
         };
         unsafe { s.launch_builder(embed.func).arg(&w.embed).arg(&pb.tokens).arg(&bx.ptr).launch(rows(embed))? };
         for (l, lw) in w.layers.iter().enumerate() {
@@ -409,27 +443,25 @@ impl<'a> Runtime<'a> {
 
     /// Layer `layer`'s K and V cache, positions `0..to`.
     pub fn kv(&self, layer: usize, to: usize) -> Result<(Vec<u16>, Vec<u16>)> {
-        ensure!(layer < self.k_cache.len() && to <= self.capacity, "layer {layer} positions ..{to} are outside the cache");
+        ensure!(layer < self.k_cache.len() && to <= self.cur.capacity(), "layer {layer} positions ..{to} are outside the cache");
         let n = to * self.m.kv_dim() as usize;
         Ok((self.s.memcpy_dtov(&self.k_cache[layer].slice(..n))?, self.s.memcpy_dtov(&self.v_cache[layer].slice(..n))?))
     }
 
     pub fn capacity(&self) -> usize {
-        self.capacity
+        self.cur.capacity()
     }
     /// The position the next step decodes at.
     pub fn pos(&self) -> usize {
-        self.pos
+        self.cur.pos()
     }
 
-    /// Sets the next step's input token and position.
+    /// Sets the next step's input token and position (the way back after a failed step).
     pub fn set(&mut self, pos: usize, token: usize) -> Result<()> {
-        ensure!(pos < self.capacity, "position {pos} is past the cache capacity {}", self.capacity);
-        ensure!(token < self.w.embed_rows, "token {token} is past the {} embedding rows", self.w.embed_rows);
+        self.cur.check_set(pos, token, self.w.embed_rows)?;
         self.s.memcpy_htod(&[pos as i32], &mut self.d_pos)?;
         self.s.memcpy_htod(&[token as i32], &mut self.d_token)?;
-        self.pos = pos;
-        self.host_token = true;
+        self.cur.set(pos);
         Ok(())
     }
 
@@ -441,14 +473,9 @@ impl<'a> Runtime<'a> {
         Ok(())
     }
 
-    /// Checks a step can run: within the cache, and, when the token comes from the previous step's
-    /// `argmax_advance` (any vocabulary index), with an embedding row for every token.
+    /// Checks a step can run (`Cursor::check_step`).
     fn check_step(&self) -> Result<()> {
-        ensure!(self.pos < self.capacity, "position {} is past the cache capacity {}", self.pos, self.capacity);
-        ensure!(self.host_token || self.w.embed_rows >= self.m.vocab as usize,
-            "a step after a step looks up a greedy token from the whole vocabulary, but only {} of {} embedding rows are on the GPU; set the token first",
-            self.w.embed_rows, self.m.vocab);
-        Ok(())
+        self.cur.check_step(self.w.embed_rows, self.m.vocab as usize)
     }
 
     /// Captures one step as a CUDA Graph; later `step` calls replay it. The stream must not be the
@@ -463,27 +490,31 @@ impl<'a> Runtime<'a> {
         Ok(())
     }
 
-    /// Runs one step (the graph once captured), then the position advances by one.
+    /// Runs one step (the graph once captured), then the position advances by one. If the launch
+    /// fails, the runtime refuses further steps until `set`.
     pub fn step(&mut self) -> Result<()> {
         self.check_step()?;
+        let next = self.cur.pos() + 1;
+        self.cur.begin();
         match &self.graph {
             Some(g) => g.launch()?,
             None => self.enqueue(None)?,
         }
-        self.pos += 1;
-        self.host_token = false;
+        self.cur.finish_at(next);
         Ok(())
     }
 
     /// Runs one step with plain launches, copying the hidden state back after every residual add
-    /// (synchronizing each time).
+    /// (synchronizing each time). If a launch or a readback fails (the device may already have
+    /// advanced its position), the runtime refuses further steps until `set`.
     pub fn step_traced(&mut self) -> Result<GpuTrace> {
         self.check_step()?;
+        let next = self.cur.pos() + 1;
+        self.cur.begin();
         let mut t = GpuTrace { after_attn: vec![], after_mlp: vec![], logits: vec![] };
         self.enqueue(Some(&mut t))?;
         t.logits = self.s.memcpy_dtov(&self.logits)?;
-        self.pos += 1;
-        self.host_token = false;
+        self.cur.finish_at(next);
         Ok(t)
     }
 
@@ -494,7 +525,7 @@ impl<'a> Runtime<'a> {
 
     /// Greedy tokens produced by the steps at positions `from..to`.
     pub fn tokens(&self, from: usize, to: usize) -> Result<Vec<u32>> {
-        ensure!(from <= to && to <= self.capacity, "positions {from}..{to} are outside the cache capacity {}", self.capacity);
+        ensure!(from <= to && to <= self.cur.capacity(), "positions {from}..{to} are outside the cache capacity {}", self.cur.capacity());
         Ok(self.s.memcpy_dtov(&self.out.slice(from..to))?.into_iter().map(|t| t as u32).collect())
     }
 

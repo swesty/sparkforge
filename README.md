@@ -79,8 +79,10 @@ Generated kernels (all compile for `sm_121a` with NVRTC 13 and match the CPU ref
 - `attn_prefill` — causal prefill attention, FlashAttention-2 style: each warp owns 16 query rows with its Q fragments in
   registers, K/V tiles stream from the decode KV cache through a `cp.async` pipeline that reuses the Q tile's shared
   memory, `mma.sync m16n8k16` for Q·Kᵀ and P·V (`ldmatrix.trans` for V), fp32 online softmax in exp2. Prompt rows start
-  at any cache position, so long prompts run in chunks. Tiles (128 query rows × 64 keys, 2 stages, 68 KB for
-  `head_dim` 128) are planned for resident warps per SM, then K/V reuse.
+  at any cache position, so long prompts run in chunks. Tiles (128 query rows × 64 keys, 2 stages, 70,144 B for
+  `head_dim` 128) are planned for resident warps per SM, then K/V reuse. A masked key's probability is 0, but
+  0 × NaN is NaN, so a tile holding keys some row doesn't attend checks its V values at the barrier it already
+  has; the rare tile with one that isn't finite zeroes it and marks NaN only in the rows that attend it.
 
 Planned (configs chosen, bodies TODO): grouped MoE prefill GEMM, NVFP4 and MXFP8 prefill GEMMs, W4A16 (AWQ/GPTQ) decode GEMVs.
 
@@ -160,9 +162,12 @@ Before prefill, `generate` ran the prompt as decode steps at about 65 ms per tok
 prompt costs about one pass over the 15 GB of weights. The prefill's logits match the CPU reference on the real weights
 (8.5e-3), and so do the next three steps'.
 
-`attn_prefill` (`verify --bench`, 32 heads, 8 KV heads, `head_dim` 128): 69.4–70.4 TFLOP/s for a 2048-token prompt and
-79.3–82.2 TFLOP/s at 8192, within 3.68e-3 of f64 causal attention (scaled by the output's largest value, since P is
-rounded to bf16 for the P·V product). Tile sweep at 2048 / 8192 tokens (TFLOP/s):
+`attn_prefill` (`verify --bench`, 32 heads, 8 KV heads, `head_dim` 128): 67.7–68.5 TFLOP/s for a 2048-token prompt and
+78.1–79.6 TFLOP/s at 8192, within 3.68e-3 of f64 causal attention (scaled by the output's largest value, since P is
+rounded to bf16 for the P·V product). The NaN guard (harden-decode-prefill-runtime) costs about 2–3%: the same
+binary without it measured 68.7–70.9 and 80.3–81.7 in runs alternated with it on spark-5 (2026-11-28); a first
+version that checked every V fragment in the product loop cost 25%. Tile sweep at 2048 / 8192 tokens (TFLOP/s),
+measured before the guard:
 
 | Query rows × keys, stages | 2048 | 8192 |
 |---|---|---|

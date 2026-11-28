@@ -13,8 +13,10 @@ fn byte_level_tokens_decode_to_text() {
     // Ġ is a space and Ċ a newline in GPT-2's byte table; Ã© is the two UTF-8 bytes of é.
     assert_eq!(d.decode(&[5, 0, 1, 2, 3]), "<|begin_of_text|>Hello world.\n\n");
     assert_eq!(d.decode(&[4]), "é");
-    // An id the file doesn't define decodes to nothing.
-    assert_eq!(d.decode(&[0, 99]), "Hello");
+    // An id the file doesn't define is shown, not dropped, and listed.
+    assert_eq!(d.decode(&[0, 99, 1, 99, 7]), "Hello<unknown token 99> world<unknown token 99><unknown token 7>");
+    assert_eq!(d.unknown(&[0, 99, 1, 99, 7]), vec![99, 7]);
+    assert!(d.unknown(&[5, 0, 1]).is_empty());
 }
 
 #[test]

@@ -5,6 +5,7 @@
 //!            -> NVRTC (sm_121a) -> cubin cache -> runtime.
 
 pub mod codegen;
+pub mod cursor;
 pub mod config;
 pub mod inventory;
 pub mod modules;

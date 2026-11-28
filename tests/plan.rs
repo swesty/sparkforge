@@ -443,9 +443,10 @@ fn dense_plans_tile_prefill_attention_within_gb10_limits() {
         assert!(a.smem_bytes <= GB10.smem_per_block_optin, "{c}: {a:?}");
         assert_eq!(a.warps * 16, a.block_m, "{c}: one warp per 16 query rows");
         assert_eq!(a.grid, [p.model.heads, 2048u32.div_ceil(a.block_m)], "{c}");
-        // The K/V stages reuse the Q tile's shared memory, rows padded by 16 bytes.
+        // The K/V stages reuse the Q tile's shared memory, rows padded by 16 bytes, then one int per
+        // head dimension for the NaN guard.
         let lds = p.model.head_dim + 8;
-        assert_eq!(a.smem_bytes, (a.block_m * lds).max(2 * a.stages * a.block_n * lds) * 2, "{c}");
+        assert_eq!(a.smem_bytes, (a.block_m * lds).max(2 * a.stages * a.block_n * lds) * 2 + p.model.head_dim * 4, "{c}");
         assert!(plan::prefill_attn_regs(a.head_dim, a.block_n) * a.warps * 32 * a.ctas_per_sm <= GB10.regs_per_sm, "{c}");
         let g = sparkforge::codegen::generate(&p);
         let k = g.kernels.iter().find(|k| k.entry == "attn_prefill").unwrap();
@@ -459,4 +460,58 @@ fn hybrid_plans_have_no_dense_prefill_attention() {
     let p = load("configs/qwen3.8-flash-next-nvfp4.json");
     assert!(p.prefill_attn.is_none());
     assert!(!sparkforge::codegen::generate(&p).kernels.iter().any(|k| k.entry == "attn_prefill"));
+}
+
+#[test]
+fn a_short_moe_prompt_charges_only_the_experts_it_can_reach() {
+    use sparkforge::estimate::{prefill_estimate_us, Row};
+    let spec = ModelSpec::from_json(&std::fs::read_to_string("configs/qwen3-30b-a3b.json").unwrap(), None).unwrap();
+    let e = spec.moe.clone().unwrap();
+    let us = [("gemm_qkv_proj", 6.0), ("gemm_o_proj", 5.0), ("gemm_router", 4.0), ("gemm_expert_gate_up", 3.0), ("gemm_expert_down", 2.0), ("gemv_lm_head", 400.0)];
+    let est = |tokens: u32| {
+        let p = plan::build(&spec, &GB10, &plan::PlanOpts { prefill_tokens: tokens, ctx: 4096 });
+        let attn = Row { kernel: "attn_prefill".into(), case: format!("{tokens} rows from position 0, {tokens} sampled"), err: 0.0, us: Some(1.0), gbs: None };
+        let rows: Vec<Row> = us.iter().map(|&(k, t)| Row { kernel: k.into(), case: String::new(), err: 0.0, us: Some(t), gbs: None }).chain([attn]).collect();
+        prefill_estimate_us(&p, &rows).unwrap()
+    };
+    let layer = |experts: f64| 6.0 + 1.0 + 5.0 + 4.0 + experts * (3.0 + 2.0);
+    // One token reaches experts_per_tok experts (8 of 128): 16 times fewer than every expert.
+    let (t, tokens) = est(1);
+    assert_eq!(tokens, 1);
+    assert_eq!(e.num_experts / e.experts_per_tok, 16);
+    assert!((t - (spec.layers as f64 * layer(e.experts_per_tok as f64) + 400.0)).abs() < 1e-6, "{t}");
+    // 2048 tokens can reach every expert, and no more.
+    let (t, _) = est(2048);
+    assert!((t - (spec.layers as f64 * layer(e.num_experts as f64) + 400.0)).abs() < 1e-6, "{t}");
+}
+
+#[test]
+fn the_decode_ceiling_over_a_span_is_the_harmonic_mean_of_its_steps() {
+    let spec = ModelSpec::from_json(&std::fs::read_to_string("configs/llama-3.1-8b.json").unwrap(), None).unwrap();
+    let at = |ctx: u32| plan::build(&spec, &GB10, &plan::PlanOpts { prefill_tokens: 2048, ctx }).budget.decode_tok_s_ceiling;
+    // `generate --bench-ctx 1` times the steps at positions 3..35, which read 4 to 35 positions.
+    let span = plan::decode_ceiling_over(&spec, &GB10, 2048, 3, 35);
+    let want = 32.0 / (4..=35).map(|c| 1.0 / at(c)).sum::<f64>();
+    assert!((span - want).abs() < 1e-9 * want, "{span} vs {want}");
+    assert!(at(35) < span && span < at(4) && span < at(1), "{} {span} {}", at(35), at(4));
+    assert_eq!(plan::decode_ceiling_over(&spec, &GB10, 2048, 99, 100), at(100));
+}
+
+#[test]
+fn a_planned_prefill_kernel_missing_from_the_manifest_is_named() {
+    let p = load("configs/llama-3.1-8b.json");
+    let g = codegen::generate(&p);
+    assert!(codegen::missing_prefill_kernels(&p, &g).is_empty());
+    let mut cut = codegen::generate(&p);
+    cut.kernels.retain(|k| k.entry != "attn_prefill" && k.entry != "gemm_o_proj");
+    assert_eq!(codegen::missing_prefill_kernels(&p, &cut), vec!["gemm_o_proj".to_string(), "attn_prefill".to_string()]);
+    // A planned-but-not-generated entry (here a W4A16 GEMM) is not a gap.
+    let s = ModelSpec::from_json(&std::fs::read_to_string("configs/llama-3.1-8b.json").unwrap(), Some(sparkforge::config::WeightFormat::W4A16 { group: 128 })).unwrap();
+    let q = plan::build(&s, &GB10, &plan::PlanOpts { prefill_tokens: 2048, ctx: 4096 });
+    let gq = codegen::generate(&q);
+    assert!(gq.kernels.iter().any(|k| k.entry == "gemm_qkv_proj" && k.status != "generated"));
+    assert!(codegen::missing_prefill_kernels(&q, &gq).is_empty());
+    // A hybrid plan schedules no prefill kernels.
+    let h = load("configs/qwen3.8-flash-next-nvfp4.json");
+    assert!(codegen::missing_prefill_kernels(&h, &codegen::generate(&h)).is_empty());
 }

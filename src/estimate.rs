@@ -47,8 +47,8 @@ pub fn token_estimate_us(p: &Plan, rows: &[Row]) -> Option<f64> {
 }
 
 /// Prefill time for the planned prompt length from isolated kernel times: per layer the q/k/v,
-/// o_proj and MLP GEMMs (for MoE, the router, one expert GEMM pair per expert at the planned tokens
-/// per expert, and the shared expert's pair) and `attn_prefill` over the whole prompt from position
+/// o_proj and MLP GEMMs (for MoE, the router, one expert GEMM pair per expert the prompt can reach
+/// at the planned tokens per expert, and the shared expert's pair) and `attn_prefill` over the whole prompt from position
 /// 0, then `gemv_lm_head` once for the last position. Norms, RoPE and activations are not included.
 /// Returns (microseconds, prompt tokens), or the name of the kernel that has no timing.
 pub fn prefill_estimate_us(p: &Plan, rows: &[Row]) -> Result<(f64, u32), String> {
@@ -63,7 +63,10 @@ pub fn prefill_estimate_us(p: &Plan, rows: &[Row]) -> Result<(f64, u32), String>
     match &p.model.moe {
         None => layer += g("gemm_gate_up_proj")? + g("gemm_down_proj")?,
         Some(e) => {
-            layer += g("gemm_router")? + e.num_experts as f64 * (g("gemm_expert_gate_up")? + g("gemm_expert_down")?);
+            // A prompt of T tokens routes each to `experts_per_tok` experts, so it reaches at most
+            // T x experts_per_tok of them.
+            let reached = (tokens as u64 * e.experts_per_tok as u64).min(e.num_experts as u64);
+            layer += g("gemm_router")? + reached as f64 * (g("gemm_expert_gate_up")? + g("gemm_expert_down")?);
             if e.shared_experts > 0 {
                 layer += g("gemm_shared_gate_up")? + g("gemm_shared_down")?;
             }

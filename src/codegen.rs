@@ -221,6 +221,8 @@ constexpr int BM = @BM@, BN = @BN@, STAGES = @STAGES@, WARPS = BM / 16, THREADS 
 constexpr int LDS = HD + @PAD@;                // smem row stride (bf16): 16-byte pad
 constexpr int KV_STAGE = BN * LDS, CHUNKS = HD / 8;
 constexpr int KS = HD / 16, NS = BN / 8, DS = HD / 8;  // k-steps over HD; S and O n-tiles of 8
+// The Q tile and the K/V stages share one region (bf16 elements); `vbad_key` (HD ints) follows it.
+constexpr int TILES = BM * LDS > 2 * STAGES * KV_STAGE ? BM * LDS : 2 * STAGES * KV_STAGE;
 static_assert(HD % 16 == 0 && BN % 16 == 0 && BM % 16 == 0 && STAGES >= 2 && HEADS % KVH == 0, "attn_prefill shape");
 }
 // Causal prefill attention, FlashAttention-2 style on mma.sync m16n8k16. Prompt row r (of M) is at
@@ -232,6 +234,18 @@ static_assert(HD % 16 == 0 && BN % 16 == 0 && BM % 16 == 0 && STAGES >= 2 && HEA
 // keeps an fp32 online softmax (scale_log2 = log2(e) / sqrt(HD), exp2). P is rounded to bf16 for
 // the P.V product. K/V tiles stream through a STAGES-deep cp.async pipeline that reuses the Q
 // tile's shared memory.
+//
+// A masked key's P is exactly 0, but 0 x NaN is NaN, so a V value that isn't finite at a key some
+// row doesn't attend would reach that row through the product. In a tile holding such keys (one
+// past this block's first row) the barrier that makes the tile resident also asks whether any of
+// its V values isn't finite. Almost never: then nothing else changes. If one is, the block zeroes
+// those values in place and records per dimension the first key that had one (`vbad_key`, a running
+// minimum over the tile positions); at the end each warp sets a row's output to NaN at the
+// dimensions where it attends such a key. A future value never reaches an earlier row, and a row
+// that attends a value that isn't finite still gets NaN there.
+__device__ __forceinline__ unsigned bf16x2_nonfinite(unsigned b) {  // 0xffff in each half that is inf or NaN
+  return ((b & 0x7f80u) == 0x7f80u ? 0xffffu : 0u) | ((b & 0x7f800000u) == 0x7f800000u ? 0xffff0000u : 0u);
+}
 extern "C" __global__ void __launch_bounds__(attn_prefill_ns::THREADS)
 attn_prefill(const bf16* __restrict__ qkv, const bf16* __restrict__ k_cache, const bf16* __restrict__ v_cache,
              bf16* __restrict__ out, int M, int start, float scale_log2) {
@@ -242,6 +256,8 @@ attn_prefill(const bf16* __restrict__ qkv, const bf16* __restrict__ k_cache, con
   if (M <= 0 || (int)blockIdx.y >= nt_m) return;
   const int h = blockIdx.x, kvh = h / GROUP, r0 = (nt_m - 1 - (int)blockIdx.y) * BM;
   const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
+  int* const vbad_key = reinterpret_cast<int*>(sm + TILES);
+  for (int i = tid; i < HD; i += THREADS) vbad_key[i] = 0x7fffffff;  // ordered by the barrier below
   // Q tile (rows past M zero-filled) into shared memory, then into registers.
   for (int i = tid; i < BM * CHUNKS; i += THREADS) {
     const int r = i / CHUNKS, c = i % CHUNKS, gr = r0 + r;
@@ -289,9 +305,40 @@ attn_prefill(const bf16* __restrict__ qkv, const bf16* __restrict__ k_cache, con
     if (s < n_tiles) load(s, s);
     asm volatile("cp.async.commit_group;");
   }
+  // Each thread checks, then zeroes, the V chunks it copied itself: they are visible to it after its
+  // cp.async wait, before any barrier.
+  auto own_v_nonfinite = [&](int stage) -> bool {
+    unsigned bad = 0;
+    for (int i = tid; i < BN * CHUNKS; i += THREADS) {
+      const uint4 x = *reinterpret_cast<const uint4*>(sV + stage * KV_STAGE + (i / CHUNKS) * LDS + (i % CHUNKS) * 8);
+      bad |= bf16x2_nonfinite(x.x) | bf16x2_nonfinite(x.y) | bf16x2_nonfinite(x.z) | bf16x2_nonfinite(x.w);
+    }
+    return bad != 0u;
+  };
+  auto zero_own_v_nonfinite = [&](int stage, int j) {
+    for (int i = tid; i < BN * CHUNKS; i += THREADS) {
+      const int r = i / CHUNKS, c = i % CHUNKS;
+      unsigned* x = reinterpret_cast<unsigned*>(sV + stage * KV_STAGE + r * LDS + c * 8);
+      for (int w = 0; w < 4; ++w) {
+        const unsigned f = bf16x2_nonfinite(x[w]);
+        if (f & 0xffffu) atomicMin(&vbad_key[c * 8 + 2 * w], j * BN + r);
+        if (f >> 16) atomicMin(&vbad_key[c * 8 + 2 * w + 1], j * BN + r);
+        x[w] &= ~f;
+      }
+    }
+  };
   for (int j = 0; j < n_tiles; ++j) {
     asm volatile("cp.async.wait_group %0;" :: "n"(STAGES - 2));
-    __syncthreads();  // tile j is resident, and every warp is done with the stage refilled below
+    // Tile j is resident, and every warp is done with the stage refilled below. The condition is
+    // the same for the whole block, so every thread takes the same barriers.
+    if (j * BN + BN - 1 > start + r0) {
+      if (__syncthreads_or(own_v_nonfinite(j % STAGES))) {
+        zero_own_v_nonfinite(j % STAGES, j);
+        __syncthreads();
+      }
+    } else {
+      __syncthreads();
+    }
     if (j + STAGES - 1 < n_tiles) load((j + STAGES - 1) % STAGES, j + STAGES - 1);
     asm volatile("cp.async.commit_group;");
     // Keys past this warp's last row are masked for all its rows: skip the tile's math.
@@ -371,6 +418,14 @@ attn_prefill(const bf16* __restrict__ qkv, const bf16* __restrict__ k_cache, con
     }
   }
   asm volatile("cp.async.wait_group 0;");
+  // NaN where the row attends a key whose value at that dimension was zeroed (every atomicMin above
+  // was followed by a barrier). Nothing to do unless a tile held such a value: then the row's
+  // product left that key out.
+#pragma unroll
+  for (int d = 0; d < DS; ++d)
+#pragma unroll
+    for (int e = 0; e < 4; ++e)
+      if (vbad_key[d * 8 + (lane & 3) * 2 + (e & 1)] <= (e < 2 ? qp0 : qp1)) o[d][e] = __int_as_float(0x7fc00000);
   // Each row's sum is spread over the 4 lanes that share it.
 #pragma unroll
   for (int i = 0; i < 2; ++i) {
@@ -850,6 +905,18 @@ pub fn require_generated(g: &Generated, arch: &str) -> anyhow::Result<()> {
     anyhow::ensure!(g.kernels.iter().any(|k| k.status == "generated"),
         "{arch}: no kernels are generated for this model yet (its op classes are planned; see `sparkforge plan`)");
     Ok(())
+}
+
+/// The prefill kernels `p` schedules that `g` has no entry for: `gemm_<linear>` for each planned
+/// GEMM tile, and `attn_prefill` (generated) when the plan has prefill attention. An entry that is
+/// present but planned (a format whose kernel isn't written yet) is an honest skip, not a gap;
+/// a missing one is a code-generation omission `verify` fails on.
+pub fn missing_prefill_kernels(p: &Plan, g: &Generated) -> Vec<String> {
+    let mut out: Vec<String> = p.gemm.iter().map(|t| format!("gemm_{}", t.linear)).filter(|n| !g.kernels.iter().any(|k| &k.entry == n)).collect();
+    if p.prefill_attn.is_some() && !g.kernels.iter().any(|k| k.entry == "attn_prefill" && k.status == "generated") {
+        out.push("attn_prefill".into());
+    }
+    out
 }
 
 pub fn generate(p: &Plan) -> Generated {

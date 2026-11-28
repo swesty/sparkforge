@@ -250,7 +250,7 @@
     "block_n": 64,
     "stages": 2,
     "warps": 8,
-    "smem_bytes": 69632,
+    "smem_bytes": 70144,
     "ctas_per_sm": 1,
     "grid": [
       32,

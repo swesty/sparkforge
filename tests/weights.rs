@@ -1754,7 +1754,8 @@ fn the_reference_refuses_a_model_the_checkpoint_was_not_bound_for() {
     // Same hidden size, layers, vocabulary and attention, twice the MLP width.
     let mut wide = spec(false);
     wide.intermediate = 64;
-    let cw = CheckpointWeights { ck: &ck, b: &b, m: &bound };
+    // The reads use the step's model; the binding is for the narrower one.
+    let cw = CheckpointWeights { ck: &ck, b: &b, m: &wide };
     let mut cache = KvCache::new(&wide, 2, 2);
     let e = decode_step(&wide, &cw, &mut cache, 0, 0).err().expect("a different MLP width is refused").to_string();
     assert!(e.contains("GateUp(0)") && e.contains("64x16") && e.contains("128x16"), "{e}");
@@ -1780,4 +1781,23 @@ fn a_checkpoint_changed_after_opening_fails_the_step_without_writing() {
     std::fs::OpenOptions::new().write(true).open(&f).unwrap().set_len(len - 64).unwrap();
     assert!(decode_step(&m, &cw, &mut cache, 3, 1).is_err(), "the truncated read fails");
     assert_eq!((cache.k.clone(), cache.v.clone()), before, "the cache is unchanged");
+}
+
+#[test]
+fn checkpoint_weights_read_with_the_steps_model_or_refuse() {
+    use sparkforge::reference::{decode_step, CheckpointWeights, KvCache, Weights};
+    let d = single("ref-model", bf16(tensors(false)));
+    let ck = Checkpoint::open(&d).unwrap();
+    let m = spec(false);
+    let b = bind(&ck, &m).unwrap();
+    CheckpointWeights { ck: &ck, b: &b, m: &m }.check(&m).unwrap();
+    // The tensors match the step's model, but the reads would slice the embedding and norms 8 wide.
+    let mut narrow = m.clone();
+    narrow.hidden = 8;
+    let cw = CheckpointWeights { ck: &ck, b: &b, m: &narrow };
+    let e = cw.check(&m).unwrap_err().to_string();
+    assert!(e.contains("the step's model is [16,"), "{e}");
+    let mut cache = KvCache::new(&m, 2, 1);
+    assert!(decode_step(&m, &cw, &mut cache, 0, 0).is_err(), "refused before the first read");
+    assert!(cache.k.iter().chain(&cache.v).all(|c| c.iter().all(|&v| v == 0)));
 }

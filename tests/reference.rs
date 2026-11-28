@@ -233,3 +233,19 @@ fn a_step_that_fails_partway_restores_every_slot_it_wrote() {
         assert_eq!((cache.k.clone(), cache.v.clone()), before, "failure at {at}: every slot is restored");
     }
 }
+
+#[test]
+fn the_checked_reference_cache_is_priced_for_the_whole_prompt() {
+    let m = ModelSpec::from_json(&std::fs::read_to_string("configs/llama-3.1-8b.json").unwrap(), None).unwrap();
+    // Llama 3.1 8B, an 8192-token prompt and `--check 1`: 32 layers x 8193 positions x 1024 x K and V.
+    assert_eq!(reference::check_cache_bytes(&m, 8192, 1), 2 * 32 * 8193 * 1024 * 2);
+    assert!(reference::check_cache_bytes(&m, 8192, 1) > 1 << 30);
+    assert_eq!(reference::check_cache_bytes(&m, 8192, 0), reference::kv_cache_bytes(&m, 32, 1));
+    // The price is what the cache allocates.
+    let t = tiny();
+    let mut c = KvCache::new(&t, 2, 37);
+    c.make_resident();
+    let elems: usize = c.k.iter().chain(&c.v).map(|b| b.len()).sum();
+    assert_eq!(reference::kv_cache_bytes(&t, 2, 37), elems as u64 * 2);
+    assert!(c.k.iter().chain(&c.v).all(|b| b.iter().all(|&x| x == 0)));
+}
