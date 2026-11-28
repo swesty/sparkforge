@@ -975,8 +975,14 @@ pub fn build(m: &ModelSpec, t: &Target, o: &PlanOpts) -> Plan {
         if let Some(e) = &m.moe {
             // Average tokens per expert during prefill drives the grouped-GEMM tile choice.
             let per_expert = (o.prefill_tokens as u64 * e.experts_per_tok as u64 / e.num_experts as u64).max(1) as u32;
-            gemm.extend(plan_gemms(ls.iter().filter(|l| l.copies > 1), per_expert, t, &mut notes));
-            notes.push(format!("MoE prefill: ~{} tokens/expert at {} prompt tokens -> grouped GEMM tiles chosen for that M", per_expert, o.prefill_tokens));
+            let grouped = ls.iter().filter(|l| l.copies > 1).count();
+            let tiles = plan_gemms(ls.iter().filter(|l| l.copies > 1), per_expert, t, &mut notes);
+            notes.push(if tiles.len() == grouped {
+                format!("MoE prefill: ~{} tokens/expert at {} prompt tokens -> grouped GEMM tiles chosen for that M", per_expert, o.prefill_tokens)
+            } else {
+                format!("MoE prefill: ~{} tokens/expert at {} prompt tokens -> {} of {} grouped GEMMs have a tile for that M", per_expert, o.prefill_tokens, tiles.len(), grouped)
+            });
+            gemm.extend(tiles);
         }
     }
     // Sparse attention reads at most the selected positions, so its splits are sized for those.

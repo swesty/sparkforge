@@ -477,6 +477,8 @@ fn a_k_no_tile_divides_leaves_that_prefill_gemm_unplanned_and_says_why() {
     let note = p.notes.iter().find(|n| n.contains("expert_down")).expect("a note names the unplanned GEMM");
     assert!(note.contains("K=1000") && note.contains("32"), "{note}");
     assert!(!codegen::generate(&p).kernels.iter().any(|k| k.entry == "gemm_expert_down"));
+    let moe = p.notes.iter().find(|n| n.starts_with("MoE prefill")).unwrap();
+    assert!(moe.contains("1 of 2 grouped GEMMs"), "{moe}");
 
     // 1056 is a multiple of 32 but not 64: BK 32 is the only legal depth.
     let t = qwen3(1056).gemm.into_iter().find(|t| t.linear == "expert_down").expect("1056 tiles");
@@ -493,4 +495,7 @@ fn a_tile_search_emptied_by_target_limits_is_not_blamed_on_k() {
     let p = plan::build(&ModelSpec::from_json(&v.to_string(), None).unwrap(), &small, &plan::PlanOpts { prefill_tokens: 2048, ctx: 4096 });
     let note = p.notes.iter().find(|n| n.contains("prefill GEMM for expert_down")).expect("a note names the unplanned GEMM");
     assert!(note.contains("K=1056") && note.contains("limits") && !note.contains("K-tail"), "{note}");
+    // The MoE summary counts the grouped tiles it chose rather than claiming it chose them.
+    let moe = p.notes.iter().find(|n| n.starts_with("MoE prefill")).unwrap();
+    assert!(moe.contains("0 of 2 grouped GEMMs") && !moe.contains("tiles chosen"), "{moe}");
 }
