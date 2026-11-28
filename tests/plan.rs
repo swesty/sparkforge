@@ -460,3 +460,42 @@ fn hybrid_plans_have_no_dense_prefill_attention() {
     assert!(p.prefill_attn.is_none());
     assert!(!sparkforge::codegen::generate(&p).kernels.iter().any(|k| k.entry == "attn_prefill"));
 }
+
+#[test]
+fn a_k_no_tile_divides_leaves_that_prefill_gemm_unplanned_and_says_why() {
+    // K = 1000 is not a multiple of BK 32 or 64. Planning used to panic; now the rest of the plan,
+    // decode included, stays planned and a note names the linear and its K.
+    let qwen3 = |inter: u32| {
+        let mut v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string("configs/qwen3-30b-a3b.json").unwrap()).unwrap();
+        v["moe_intermediate_size"] = inter.into();
+        plan::build(&ModelSpec::from_json(&v.to_string(), None).unwrap(), &GB10, &plan::PlanOpts { prefill_tokens: 2048, ctx: 4096 })
+    };
+    let p = qwen3(1000);
+    assert!(!p.gemm.iter().any(|t| t.linear == "expert_down"), "{:?}", p.gemm);
+    assert!(p.gemm.iter().any(|t| t.linear == "expert_gate_up"), "a K that divides still gets its tile");
+    assert!(p.gemv.iter().any(|g| g.linear == "expert_down" && g.k == 1000), "decode is still planned");
+    let note = p.notes.iter().find(|n| n.contains("expert_down")).expect("a note names the unplanned GEMM");
+    assert!(note.contains("K=1000") && note.contains("32"), "{note}");
+    assert!(!codegen::generate(&p).kernels.iter().any(|k| k.entry == "gemm_expert_down"));
+    let moe = p.notes.iter().find(|n| n.starts_with("MoE prefill")).unwrap();
+    assert!(moe.contains("1 of 2 grouped GEMMs"), "{moe}");
+
+    // 1056 is a multiple of 32 but not 64: BK 32 is the only legal depth.
+    let t = qwen3(1056).gemm.into_iter().find(|t| t.linear == "expert_down").expect("1056 tiles");
+    assert_eq!((t.k, t.bk), (1056, 32), "{t:?}");
+}
+
+#[test]
+fn a_tile_search_emptied_by_target_limits_is_not_blamed_on_k() {
+    // BK 32 divides K = 1056, so when no tile fits a 16 KiB block (the smallest candidate, 64x64x32
+    // in 2 stages with row pads, is 20,480 B) the note blames the target's limits, not K.
+    let mut v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string("configs/qwen3-30b-a3b.json").unwrap()).unwrap();
+    v["moe_intermediate_size"] = 1056.into();
+    let small = sparkforge::target::Target { smem_per_block_optin: 16 * 1024, ..GB10 };
+    let p = plan::build(&ModelSpec::from_json(&v.to_string(), None).unwrap(), &small, &plan::PlanOpts { prefill_tokens: 2048, ctx: 4096 });
+    let note = p.notes.iter().find(|n| n.contains("prefill GEMM for expert_down")).expect("a note names the unplanned GEMM");
+    assert!(note.contains("K=1056") && note.contains("limits") && !note.contains("K-tail"), "{note}");
+    // The MoE summary counts the grouped tiles it chose rather than claiming it chose them.
+    let moe = p.notes.iter().find(|n| n.starts_with("MoE prefill")).unwrap();
+    assert!(moe.contains("0 of 2 grouped GEMMs") && !moe.contains("tiles chosen"), "{moe}");
+}

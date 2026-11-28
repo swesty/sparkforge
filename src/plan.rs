@@ -739,17 +739,37 @@ pub fn plan_gemv_fp4(l: &Linear, m: &ModelSpec, t: &Target) -> GemvPlan {
     }
 }
 
+/// Prefill GEMM tile depths along K; a tile is legal only when its BK divides K.
+const GEMM_BK: [u32; 2] = [32, 64];
+
 /// The best legal tile for `l`, preferring one whose BN divides N (the only kind the BF16 GEMM is
-/// generated for); a shape no BN divides still gets its best tile, which stays planned.
-fn plan_gemm(l: &Linear, m: u32, t: &Target) -> GemmTile {
-    plan_gemm_where(l, m, t, true).or_else(|| plan_gemm_where(l, m, t, false)).expect("no legal GEMM tile for this shape")
+/// generated for); a shape no BN divides still gets its best tile, which stays planned. `None` when
+/// no tile is legal: no BK divides K, or (on a target smaller than GB10) no candidate fits its
+/// shared-memory, thread or register limits; `build` then notes which instead of planning the GEMM.
+fn plan_gemm(l: &Linear, m: u32, t: &Target) -> Option<GemmTile> {
+    plan_gemm_where(l, m, t, true).or_else(|| plan_gemm_where(l, m, t, false))
+}
+
+/// `plan_gemm` for each of `ls`, with a note for each linear that gets no tile.
+fn plan_gemms<'a>(ls: impl Iterator<Item = &'a Linear>, m: u32, t: &Target, notes: &mut Vec<String>) -> Vec<GemmTile> {
+    ls.filter_map(|l| {
+        let tile = plan_gemm(l, m, t);
+        if tile.is_none() {
+            notes.push(if GEMM_BK.iter().any(|&bk| l.k.is_multiple_of(bk)) {
+                format!("prefill GEMM for {} is not planned: no tile for K={} fits {}'s shared-memory, thread and register limits", l.name, l.k, t.name)
+            } else {
+                format!("prefill GEMM for {} is not planned: no legal tile for K={} (a tile's BK, {} or {}, must divide K); prefill for this model needs a K-tail GEMM", l.name, l.k, GEMM_BK[0], GEMM_BK[1])
+            });
+        }
+        tile
+    }).collect()
 }
 
 fn plan_gemm_where(l: &Linear, m: u32, t: &Target, n_divides: bool) -> Option<GemmTile> {
     let mut best: Option<GemmTile> = None;
     for &bm in &[64u32, 128] {
         for &bn in &[64u32, 128, 256] {
-            for &bk in &[32u32, 64] {
+            for &bk in &GEMM_BK {
                 for &stages in &[2u32, 3, 4] {
                     // bf16 A and B tiles, multi-buffered (cp.async pipeline), rows padded by 16 bytes.
                     let smem = stages * (bm + bn) * (bk + GEMM_ROW_PAD) * 2;
@@ -948,17 +968,21 @@ pub fn build(m: &ModelSpec, t: &Target, o: &PlanOpts) -> Plan {
     if m.hybrid.is_some() {
         notes.push("prefill GEMM tiles are not planned for this model yet (MXFP8 and NVFP4 prefill arrive with milestone M7)".into());
     } else {
-        gemm = ls.iter().filter(|l| l.copies == 1).map(|l| plan_gemm(l, o.prefill_tokens, t)).collect();
+        gemm = plan_gemms(ls.iter().filter(|l| l.copies == 1), o.prefill_tokens, t, &mut notes);
         // Prefill needs logits for the last prompt position only: that is the decode GEMV, not a
         // prompt-by-vocabulary GEMM.
         notes.push(format!("prefill: lm_head runs once, for the last prompt position, with gemv_lm_head (a {}x{} GEMM is not planned)", o.prefill_tokens, lm.n));
         if let Some(e) = &m.moe {
             // Average tokens per expert during prefill drives the grouped-GEMM tile choice.
             let per_expert = (o.prefill_tokens as u64 * e.experts_per_tok as u64 / e.num_experts as u64).max(1) as u32;
-            for l in ls.iter().filter(|l| l.copies > 1) {
-                gemm.push(plan_gemm(l, per_expert, t));
-            }
-            notes.push(format!("MoE prefill: ~{} tokens/expert at {} prompt tokens -> grouped GEMM tiles chosen for that M", per_expert, o.prefill_tokens));
+            let grouped = ls.iter().filter(|l| l.copies > 1).count();
+            let tiles = plan_gemms(ls.iter().filter(|l| l.copies > 1), per_expert, t, &mut notes);
+            notes.push(if tiles.len() == grouped {
+                format!("MoE prefill: ~{} tokens/expert at {} prompt tokens -> grouped GEMM tiles chosen for that M", per_expert, o.prefill_tokens)
+            } else {
+                format!("MoE prefill: ~{} tokens/expert at {} prompt tokens -> {} of {} grouped GEMMs have a tile for that M", per_expert, o.prefill_tokens, tiles.len(), grouped)
+            });
+            gemm.extend(tiles);
         }
     }
     // Sparse attention reads at most the selected positions, so its splits are sized for those.
